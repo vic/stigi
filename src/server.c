@@ -719,7 +719,7 @@ static Status handle_query_frame(StigiServerCtx *ctx, const char *arg, size_t ar
 
   StigiFactSet fs;
   stigi_facts_init(&fs);
-  Status st = stigi_extract_image(&ctx->door->image, &fs, diag);
+  Status st = stigi_door_extract_image(ctx->door, &fs, diag);
   if (st != STIGI_OK) {
     stigi_facts_free(&fs);
     return st;
@@ -789,8 +789,13 @@ static Status handle_query_frame(StigiServerCtx *ctx, const char *arg, size_t ar
       rb_fmt(rb, "%s(", rname);
       for (int c = 0; c < fs.rows[i].ncols; c++) {
         if (c > 0) rb_cstr(rb, ", ");
-        if (fs.rows[i].cols[c].is_num) rb_fmt(rb, "%lld", (long long)fs.rows[i].cols[c].num);
-        else rb_cstr(rb, fs.rows[i].cols[c].sym);
+        if (fs.rows[i].cols[c].is_num) {
+          char nbuf[48];
+          (void)stigi_i128_format(fs.rows[i].cols[c].num, nbuf);
+          rb_cstr(rb, nbuf);
+        } else {
+          rb_cstr(rb, fs.rows[i].cols[c].sym);
+        }
       }
       rb_cstr(rb, ")\n");
     }

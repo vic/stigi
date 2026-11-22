@@ -66,6 +66,10 @@ typedef enum {
   STIGI_TY_ENUM,
   STIGI_TY_TYPEDEF,
   STIGI_TY_VAR,
+  STIGI_TY_INT_LIT,
+  STIGI_TY_FILL_RESULT,
+  STIGI_TY_GROW_RESULT,
+  STIGI_TY_MAKE_RESULT,
   STIGI_TY_TEST_RESULT,
   STIGI_TY_ERROR,
   STIGI_TY_UNKNOWN
@@ -76,9 +80,13 @@ typedef struct StigiTy StigiTy;
 struct StigiTy {
   StigiTyKind kind;
   uint32_t unit_idx; /* for ENUM / TYPEDEF */
-  StigiTy *elem;     /* for ARRAY / CELL / PTR / TYPEDEF underlying */
-  StigiLinear len;   /* for ARRAY / PTR */
+  StigiTy *elem;     /* for ARRAY / CELL / PTR / TYPEDEF / FILL/GROW/MAKE_RESULT */
+  StigiLinear len;   /* for ARRAY / PTR / FILL_RESULT / GROW_RESULT new cap */
   bool has_len;
+  StigiLinear old_len; /* for GROW_RESULT GrowFailed(kept) old cap */
+  bool has_old_len;
+  uint64_t lit_val;  /* for INT_LIT */
+  bool lit_neg;
   uint32_t var_id;   /* for VAR */
   StigiTy **type_args;
   uint32_t type_arg_count;

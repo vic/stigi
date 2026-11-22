@@ -1859,14 +1859,18 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
     d->u.val_decl.body = parse_block_or_expr(p, decl_col);
     if (p->failed) { p_leave_depth(p); return NULL; }
 
-    /* Detect Test and NegTest (language.md 6) */
-    if (d->u.val_decl.cap_count == 1 && d->u.val_decl.caps[0].name.len == 0 &&
-        d->u.val_decl.type != NULL) {
-      if (str_eq(d->u.val_decl.caps[0].cap_type->name, "Stigi.Test") &&
-          str_eq(d->u.val_decl.type->name, "Stigi.Test.Result")) {
+    /* Detect Test and NegTest (language.md 6); allow extra caps so door/tests.dl catches test-leaks-capability */
+    if (d->u.val_decl.cap_count >= 1 && d->u.val_decl.type != NULL) {
+      bool has_test = false;
+      bool has_negtest = false;
+      for (uint32_t ci = 0; ci < d->u.val_decl.cap_count; ci++) {
+        if (d->u.val_decl.caps[ci].cap_type == NULL) continue;
+        if (str_eq(d->u.val_decl.caps[ci].cap_type->name, "Stigi.Test")) has_test = true;
+        if (str_eq(d->u.val_decl.caps[ci].cap_type->name, "Stigi.NegTest")) has_negtest = true;
+      }
+      if (has_test && str_eq(d->u.val_decl.type->name, "Stigi.Test.Result")) {
         d->kind = STIGI_DECL_TEST;
-      } else if (str_eq(d->u.val_decl.caps[0].cap_type->name, "Stigi.NegTest") &&
-                 str_eq(d->u.val_decl.type->name, "Never")) {
+      } else if (has_negtest && str_eq(d->u.val_decl.type->name, "Never")) {
         d->kind = STIGI_DECL_NEG_TEST;
       }
     }

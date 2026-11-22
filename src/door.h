@@ -49,6 +49,8 @@ typedef struct {
   uint32_t src_cap;
 
   StigiDl dl;
+  char *base_rules_dl;
+  size_t base_rules_dl_len;
   char *rules_dl;
   size_t rules_dl_len;
   uint8_t base_rules_hash[32];
@@ -88,7 +90,10 @@ Status stigi_door_cache_add_test(StigiDoor *door, const uint8_t key[32], Diag *d
 Status stigi_door_set_budget(StigiDoor *door, uint64_t new_budget,
                              StigiDoorResult *out, Diag *diag);
 
-/* C7: export active R0 rules to out_dl_path and all image facts to out_facts_dir */
+/* Extract full image facts including door metadata (imageMode, Test/NegTest verdicts) */
+Status stigi_door_extract_image(const StigiDoor *door, StigiFactSet *fs, Diag *diag);
+
+/* C7: export active rules to out_dl_path and all image facts to out_facts_dir */
 Status stigi_door_export(const StigiDoor *door, const char *out_dl_path,
                          const char *out_facts_dir, Diag *diag);
 

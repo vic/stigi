@@ -236,7 +236,7 @@ static int test_store_load_roundtrip(void) {
   CHECK(res.accepted, "fresh load_dir accepted");
   CHECK(res.verdicts_computed == 0 && res.tests_computed == 0,
         "fresh door reload hits persisted cache: 0 verdicts/tests recomputed");
-  CHECK(res.verdicts_cached + res.tests_cached == orig_count,
+  CHECK(res.verdicts_cached == orig_count && res.tests_cached == 1,
         "all verdicts and tests cached on fresh door reload");
   stigi_door_result_free(&res);
 
@@ -267,7 +267,8 @@ static int test_store_load_roundtrip(void) {
   CHECK(stigi_load_dir(&fresh_door2, store_dir, &res, &diag) == STIGI_OK, "load_dir modified ok");
   CHECK(res.accepted, "load_dir modified accepted");
   CHECK(res.verdicts_computed == 1, "exactly 1 edited root unit recomputed");
-  CHECK(res.verdicts_cached + res.tests_cached == 3, "3 unchanged units stayed cached");
+  CHECK(res.verdicts_cached == 3 && res.tests_cached == 1,
+        "3 unchanged units and 1 test stayed cached");
   stigi_door_result_free(&res);
 
   /* Negative control: corrupt cache file MUST be rejected */

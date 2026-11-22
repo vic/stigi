@@ -33,25 +33,29 @@ static void dump_rejects(const char *label, const StigiDoorResult *r) {
   }
 }
 
-/* Count non-header/non-border data rows in `tupu -D -` output for `reject` */
+/* Count data rows in `tupu -D -` output for `relation reject` (also handles Souffle borders) */
 static int count_tupu_reject_rows(const char *out_buf) {
-  const char *p = strstr(out_buf, "reject");
-  if (p == NULL) return 0;
-  /* Advance to first '===' separator line */
-  p = strstr(p, "===");
-  if (p == NULL) return 0;
-  while (*p != '\0' && *p != '\n') p++;
-  if (*p == '\n') p++;
-  int rows = 0;
+  if (out_buf == NULL) return -1;
+  const char *p = out_buf;
   while (*p != '\0') {
     const char *line = p;
     while (*p != '\0' && *p != '\n') p++;
     size_t len = (size_t)(p - line);
     if (*p == '\n') p++;
-    if (len >= 3 && strncmp(line, "===", 3) == 0) break;
-    if (len > 0 && line[0] != '-') rows++;
+    if (len == 15 && memcmp(line, "relation reject", 15) == 0) {
+      int rows = 0;
+      while (*p != '\0') {
+        const char *rline = p;
+        while (*p != '\0' && *p != '\n') p++;
+        size_t rlen = (size_t)(p - rline);
+        if (*p == '\n') p++;
+        if (rlen >= 9 && memcmp(rline, "relation ", 9) == 0) break;
+        if (rlen > 0) rows++;
+      }
+      return rows;
+    }
   }
-  return rows;
+  return -1; /* Missing `relation reject` header: fail closed! */
 }
 
 int main(void) {
@@ -294,13 +298,314 @@ int main(void) {
     stigi_door_result_free(&r);
   }
 
-  /* 9. C7 export parity: export to /tmp/stigi-c7-export, run tupu CLI, assert 0 reject rows */
+  /* 9. Wave 3 hardening: 128-bit U64/I64, SSA/while/D1 units, stack, boundaries, custom rules */
+  {
+    /* Armed self-test of count_tupu_reject_rows */
+    CHECK(count_tupu_reject_rows("relation reject\nrelation freeEdge\n") == 0,
+          "count_tupu_reject_rows 0 rows");
+    CHECK(count_tupu_reject_rows("relation reject\nfoo\tindex-unproved\nrelation freeEdge\n") == 1,
+          "count_tupu_reject_rows armed 1 row");
+    CHECK(count_tupu_reject_rows("no header here") == -1,
+          "count_tupu_reject_rows fail-closed on missing header");
+
+    /* 9a. Exact 128-bit U64 max & guarded addition + I64 min */
+    const char *u64_max_ok =
+        "// prompt: U64 literal 2^64-1 and guarded increment.\n"
+        "pub def main(value: U64) <below(value, 18446744073709551615)>: U64 =\n"
+        "  value + 1\n";
+    const char *srcs[6];
+    size_t lens[6];
+    srcs[0] = u64_max_ok;
+    lens[0] = strlen(u64_max_ok);
+    StigiDoorResult r;
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check u64_max_ok");
+    if (!r.accepted) dump_rejects("u64_max_ok", &r);
+    CHECK(r.accepted, "Wave 3: U64 value < 2^64-1 allows value + 1");
+    stigi_door_result_free(&r);
+
+    const char *u64_unproved_sub =
+        "// prompt: unproved U64 subtraction underflow.\n"
+        "pub def main(left: U64, right: U64) <lessOrEqual(0, left)>: U64 =\n"
+        "  left - right\n";
+    srcs[0] = u64_unproved_sub;
+    lens[0] = strlen(u64_unproved_sub);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check u64_sub");
+    CHECK(!r.accepted && has_reject_code(&r, "overflow-unproved"),
+          "Wave 3: unproved U64 subtraction rejected with overflow-unproved");
+    stigi_door_result_free(&r);
+
+    const char *i64_min_ok =
+        "// prompt: exact I64 minimum literal.\n"
+        "pub def main(value: I64) <lessOrEqual(0, 1)>: I64 =\n"
+        "  if value < 0 then -9223372036854775808 else value\n";
+    srcs[0] = i64_min_ok;
+    lens[0] = strlen(i64_min_ok);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check i64_min_ok");
+    if (!r.accepted) dump_rejects("i64_min_ok", &r);
+    CHECK(r.accepted, "Wave 3: exact I64 minimum literal -9223372036854775808 accepted");
+    stigi_door_result_free(&r);
+
+    /* 9b. Local val alias array read: unguarded MUST fail index-unproved, guarded passes */
+    const char *local_arr_bad =
+        "// prompt: unguarded read through local val array alias.\n"
+        "pub def main(count: U64, items: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 =\n"
+        "  val copy: Array[U64](count) = items\n"
+        "  copy(index)\n";
+    srcs[0] = local_arr_bad;
+    lens[0] = strlen(local_arr_bad);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check local_arr_bad");
+    CHECK(!r.accepted && has_reject_code(&r, "index-unproved"),
+          "Wave 3: unguarded read on local val array rejected with index-unproved");
+    stigi_door_result_free(&r);
+
+    /* 9c. While invariant back-edge check: pos = pos + 2 violates pos <= len */
+    const char *while_bad_inv =
+        "// prompt: while loop whose step breaks invariant pos <= len.\n"
+        "pub def main(len: U64, start: U64) <lessOrEqual(start, len)>: U64 =\n"
+        "  var pos: U64 = start\n"
+        "  while pos < len do\n"
+        "    @<lessOrEqual(start, pos), lessOrEqual(pos, len)>\n"
+        "    pos = pos + 2\n"
+        "  pos\n";
+    srcs[0] = while_bad_inv;
+    lens[0] = strlen(while_bad_inv);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check while_bad_inv");
+    CHECK(!r.accepted && (has_reject_code(&r, "invariant-unproved") ||
+                          has_reject_code(&r, "overflow-unproved")),
+          "Wave 3: while loop violating invariant on back edge rejected");
+    stigi_door_result_free(&r);
+
+    /* 9d. Real D1 unit: Stigi.Lex.step (while + && + invariant + decreases(len - pos)) */
+    const char *d1_is_ident =
+        "// prompt: return true when byte is ASCII identifier byte.\n"
+        "def Stigi.Lex.isIdentByte(byte: U8) <lessOrEqual(byte, byte)>: Bool =\n"
+        "  (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '_' || byte == '.'\n";
+    const char *d1_lex_step =
+        "// prompt: scan one identifier span forward in source starting at start.\n"
+        "pub def Stigi.Lex.step(len: U64, start: U64, source: Array[U8](len)) <lessOrEqual(start, len)>: U64 <lessOrEqual(start, result), lessOrEqual(result, len)> =\n"
+        "  var pos: U64 = start\n"
+        "  while pos < len && Stigi.Lex.isIdentByte(source(pos)) do\n"
+        "    @<lessOrEqual(start, pos), lessOrEqual(pos, len), decreases(len - pos)>\n"
+        "    pos = pos + 1\n"
+        "  pos\n";
+    const char *d1_lex_main =
+        "// prompt: caller root for Stigi.Lex.step.\n"
+        "pub def main(len: U64, source: Array[U8](len)) <lessOrEqual(0, len)>: U64 =\n"
+        "  Stigi.Lex.step(len, 0, source)\n";
+    srcs[0] = d1_is_ident; lens[0] = strlen(d1_is_ident);
+    srcs[1] = d1_lex_step; lens[1] = strlen(d1_lex_step);
+    srcs[2] = d1_lex_main; lens[2] = strlen(d1_lex_main);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 3, &r, &d) == STIGI_OK, "check D1 Lex.step");
+    if (!r.accepted) dump_rejects("D1_Lex_step", &r);
+    CHECK(r.accepted, "Wave 3: real D1 unit Stigi.Lex.step accepted with 0 rejects");
+    stigi_door_result_free(&r);
+
+    /* 9e. Real D1 unit: Stigi.Arena.tryAllocate (mod/sub/add + phi + Array.tryFill) */
+    const char *d1_max_chunk =
+        "// prompt: maximum arena chunk size.\n"
+        "pub val Stigi.Arena.maxChunk: U64 = 0x4000000000000000\n";
+    const char *d1_alloc_res =
+        "// prompt: outcome of aligned arena bump allocation.\n"
+        "pub enum Stigi.Arena.AllocResult:\n"
+        "  case Allocated(offset: U64, nextPos: U64, cap: U64, chunk: Array[U8](cap)) <lessOrEqual(offset, nextPos), lessOrEqual(nextPos, cap)>\n"
+        "  case FillFailed\n";
+    const char *d1_arena_try =
+        "// prompt: allocate bytes with 8-byte alignment from an arena chunk.\n"
+        "pub def Stigi.Arena.tryAllocate {region: Stigi.Region} (cap: U64, pos: U64, bytes: U64, chunk: Array[U8](cap)) <lessOrEqual(pos, cap), below(cap, Stigi.Arena.maxChunk), below(bytes, Stigi.Arena.maxChunk)>: Stigi.Arena.AllocResult =\n"
+        "  val rem: U64 = bytes % 8\n"
+        "  val pad: U64 = (8 - rem) % 8\n"
+        "  val aligned: U64 = bytes + pad\n"
+        "  val nextPos: U64 = pos + aligned\n"
+        "  if nextPos <= cap then\n"
+        "    AllocResult.Allocated(pos, nextPos, cap, chunk)\n"
+        "  else\n"
+        "    val chunkCap: U64 = if aligned < 65536 then 65536 else aligned\n"
+        "    Array.tryFill{region}(chunkCap, 0) match\n"
+        "      case Filled(freshChunk) => AllocResult.Allocated(0, aligned, chunkCap, freshChunk)\n"
+        "      case FillFailed => AllocResult.FillFailed\n";
+    const char *d1_arena_main =
+        "// prompt: caller root for Stigi.Arena.tryAllocate.\n"
+        "pub def main {region: Stigi.Region} (cap: U64, chunk: Array[U8](cap)) <below(cap, Stigi.Arena.maxChunk)>: Stigi.Arena.AllocResult =\n"
+        "  Stigi.Arena.tryAllocate(cap, 0, 24, chunk)\n";
+    srcs[0] = d1_max_chunk; lens[0] = strlen(d1_max_chunk);
+    srcs[1] = d1_alloc_res; lens[1] = strlen(d1_alloc_res);
+    srcs[2] = d1_arena_try; lens[2] = strlen(d1_arena_try);
+    srcs[3] = d1_arena_main; lens[3] = strlen(d1_arena_main);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 4, &r, &d) == STIGI_OK, "check D1 Arena.tryAllocate");
+    if (!r.accepted) dump_rejects("D1_Arena", &r);
+    CHECK(r.accepted, "Wave 3: real D1 unit Stigi.Arena.tryAllocate accepted with 0 rejects");
+    stigi_door_result_free(&r);
+
+    /* 9e2. Real D1 unit: Stigi.Table.append (generic [A: Type], maxCap, items(count) := row, Array.tryGrow) */
+    const char *d1_tbl_max =
+        "// prompt: maximum table capacity that doubles without overflowing U64.\n"
+        "pub val Stigi.Table.maxCap: U64 = 0x4000000000000000\n";
+    const char *d1_tbl_res =
+        "// prompt: outcome of appending one row into a heap-backed table.\n"
+        "pub enum Stigi.Table.AppendResult[A: Type]:\n"
+        "  case Appended(cap: U64, count: U64, items: Array[A](cap)) <lessOrEqual(count, cap), below(0, cap)>\n"
+        "  case AppendFailed(cap: U64, count: U64, items: Array[A](cap)) <lessOrEqual(count, cap), below(0, cap)>\n";
+    const char *d1_tbl_append =
+        "// prompt: append one row into a heap-backed table, growing by doubling via Array.tryGrow.\n"
+        "pub def Stigi.Table.append [A: Type] {region: Stigi.Region, Stigi.Mut} (\n"
+        "    cap: U64, count: U64, items: Array[A](cap), row: A\n"
+        ") <lessOrEqual(count, cap), below(0, cap), below(cap, Stigi.Table.maxCap)>: Stigi.Table.AppendResult[A] =\n"
+        "  if count < cap then\n"
+        "    items(count) := row\n"
+        "    AppendResult.Appended(cap, count + 1, items)\n"
+        "  else\n"
+        "    val nextCap: U64 = cap + cap\n"
+        "    Array.tryGrow{region}(items, nextCap, row) match\n"
+        "      case Grown(grown) =>\n"
+        "        grown(count) := row\n"
+        "        AppendResult.Appended(nextCap, count + 1, grown)\n"
+        "      case GrowFailed(kept) =>\n"
+        "        AppendResult.AppendFailed(cap, count, kept)\n";
+    const char *d1_tbl_main =
+        "// prompt: caller root for Stigi.Table.append.\n"
+        "pub def main {region: Stigi.Region, Stigi.Mut} (cap: U64, items: Array[U64](cap)) <below(0, cap), below(cap, Stigi.Table.maxCap)>: Stigi.Table.AppendResult[U64] =\n"
+        "  Stigi.Table.append(cap, 0, items, 42)\n";
+    srcs[0] = d1_tbl_max; lens[0] = strlen(d1_tbl_max);
+    srcs[1] = d1_tbl_res; lens[1] = strlen(d1_tbl_res);
+    srcs[2] = d1_tbl_append; lens[2] = strlen(d1_tbl_append);
+    srcs[3] = d1_tbl_main; lens[3] = strlen(d1_tbl_main);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 4, &r, &d) == STIGI_OK, "check D1 Table.append");
+    if (!r.accepted) dump_rejects("D1_Table", &r);
+    CHECK(r.accepted, "Wave 3: real D1 unit Stigi.Table.append accepted with 0 rejects");
+    stigi_door_result_free(&r);
+
+    /* 9f. Non-tail recursion rejected with stack-unbounded; bounded recursion accepted */
+    const char *nontail_rec =
+        "// prompt: non-tail recursion without depth bound.\n"
+        "pub def main(limit: U64) <lessOrEqual(0, limit), below(limit, 1000)>: U64 =\n"
+        "  if limit < 1 then 0 else 1 + main(limit - 1)\n";
+    srcs[0] = nontail_rec;
+    lens[0] = strlen(nontail_rec);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nontail_rec");
+    CHECK(!r.accepted && has_reject_code(&r, "stack-unbounded"),
+          "Wave 3: non-tail recursion without depth bound rejected with stack-unbounded");
+    stigi_door_result_free(&r);
+
+    const char *bounded_rec =
+        "// prompt: bounded non-tail recursion with decreases and upper limit.\n"
+        "pub def main(limit: U64) <lessOrEqual(0, limit), below(limit, 16), decreases(limit)>: U64 <lessOrEqual(result, limit)> =\n"
+        "  if limit < 1 then 0 else 1 + main(limit - 1)\n";
+    srcs[0] = bounded_rec;
+    lens[0] = strlen(bounded_rec);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check bounded_rec");
+    if (!r.accepted) dump_rejects("bounded_rec", &r);
+    CHECK(r.accepted, "Wave 3: bounded non-tail recursion with decreases+below accepted");
+    stigi_door_result_free(&r);
+
+    /* 9g. Boundary checks: user-mode top-level-name & test-leaks-capability */
+    StigiDoor udoor;
+    CHECK(stigi_door_init(&udoor, "vic/spec/datalog/all.dl",
+                          STIGI_DEFAULT_ROW_BUDGET, false, &d) == STIGI_OK,
+          "init udoor");
+    const char *top_name_u =
+        "// prompt: illegal top-level non-main unit in user mode.\n"
+        "val helper {Stigi.Test}: Stigi.Test.Result =\n"
+        "  Stigi.Test.expect(1, 1, \"ok\")\n";
+    srcs[0] = top_name_u;
+    lens[0] = strlen(top_name_u);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&udoor, srcs, lens, 1, &r, &d) == STIGI_OK, "check top-level-name");
+    CHECK(!r.accepted && has_reject_code(&r, "top-level-name"),
+          "Wave 3: user-mode non-main top-level unit rejected with top-level-name");
+    stigi_door_result_free(&r);
+    stigi_door_free(&udoor);
+
+    const char *leak_cap_test =
+        "// prompt: test leaking Stigi.File capability.\n"
+        "val Demo.Tests.leakCap {Stigi.Test, Stigi.File}: Stigi.Test.Result =\n"
+        "  Stigi.Test.expect(1, 1, \"ok\")\n";
+    const char *cap_file_u =
+        "// prompt: file capability.\n"
+        "pub capability Stigi.File:\n"
+        "  def read(count: U64): U64\n";
+    srcs[0] = cap_file_u; lens[0] = strlen(cap_file_u);
+    srcs[1] = leak_cap_test; lens[1] = strlen(leak_cap_test);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 2, &r, &d) == STIGI_OK, "check leak_cap_test");
+    CHECK(!r.accepted && has_reject_code(&r, "test-leaks-capability"),
+          "Wave 3: Test with extra capability rejected with test-leaks-capability");
+    stigi_door_result_free(&r);
+
+    /* 9h. In-image custom relation & rule: valid accepted, safety-reads-user rejected */
+    const char *user_rel =
+        "// prompt: user relation for custom rule test.\n"
+        "pub relation Demo.tagged(item: Stigi.Id.Value)\n";
+    const char *user_rel2 =
+        "// prompt: derived user relation.\n"
+        "relation Demo.marked(item: Stigi.Id.Value)\n";
+    const char *user_rule =
+        "// prompt: derive marked from tagged.\n"
+        "rule def Demo.markRule: Demo.marked(item) = Demo.tagged(item)\n";
+    const char *user_rule_bad =
+        "// prompt: illegal kernel rule reading user relation.\n"
+        "rule def Stigi.badRule: Stigi.Gate.cleared(item, \"index-unproved\") = Demo.tagged(item)\n";
+    srcs[0] = user_rel; lens[0] = strlen(user_rel);
+    srcs[1] = user_rel2; lens[1] = strlen(user_rel2);
+    srcs[2] = user_rule; lens[2] = strlen(user_rule);
+    srcs[3] = user_rule_bad; lens[3] = strlen(user_rule_bad);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 4, &r, &d) == STIGI_OK, "check safety-reads-user");
+    CHECK(!r.accepted && has_reject_code(&r, "safety-reads-user"),
+          "Wave 3: kernel rule reading user relation rejected with safety-reads-user");
+    stigi_door_result_free(&r);
+
+    /* 9i. Pure drop tree-shakes private helper */
+    StigiDoor ddoor;
+    CHECK(stigi_door_init(&ddoor, "vic/spec/datalog/all.dl",
+                          STIGI_DEFAULT_ROW_BUDGET, true, &d) == STIGI_OK,
+          "init ddoor");
+    const char *drop_h =
+        "// prompt: private helper.\n"
+        "def Demo.dropHelper(value: U64) <lessOrEqual(0, value)>: U64 = value\n";
+    const char *drop_root =
+        "// prompt: test root using helper.\n"
+        "val Demo.Tests.dropRoot {Stigi.Test}: Stigi.Test.Result =\n"
+        "  Stigi.Test.expect(Demo.dropHelper(7), 7, \"7 == 7\")\n";
+    srcs[0] = drop_h; lens[0] = strlen(drop_h);
+    srcs[1] = drop_root; lens[1] = strlen(drop_root);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_submit(&ddoor, srcs, lens, 2, &r, &d) == STIGI_OK && r.accepted,
+          "submit root + private helper");
+    stigi_door_result_free(&r);
+    const char *drops[1] = {"Demo.Tests.dropRoot"};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_drop(&ddoor, drops, 1, &r, &d) == STIGI_OK, "drop root");
+    if (!r.accepted) dump_rejects("drop_tree_shake", &r);
+    CHECK(r.accepted && ddoor.image.unit_count == 0,
+          "Wave 3: dropping root tree-shakes orphaned private helper");
+    stigi_door_result_free(&r);
+    stigi_door_free(&ddoor);
+  }
+
+  /* 10. C7 export parity: export to /tmp/stigi-c7-export, run tupu CLI, assert EXACTLY 0 reject rows */
   {
     (void)mkdir("/tmp/stigi-c7-export", 0755);
     CHECK(stigi_door_export(&door, "/tmp/stigi-c7-export/all.dl",
                             "/tmp/stigi-c7-export", &d) == STIGI_OK,
           "stigi_door_export");
-    FILE *fp = popen("/home/vic/hk/tupu/result/bin/tupu -F /tmp/stigi-c7-export -D - /tmp/stigi-c7-export/all.dl", "r");
+    const char *tupu_bin = getenv("TUPU_BIN");
+    if (tupu_bin == NULL || tupu_bin[0] == '\0') {
+      tupu_bin = "/home/vic/hk/tupu/result/bin/tupu";
+    }
+    char cmd[512];
+    (void)snprintf(cmd, sizeof cmd, "%s -F /tmp/stigi-c7-export -D - /tmp/stigi-c7-export/all.dl",
+                   tupu_bin);
+    FILE *fp = popen(cmd, "r");
     CHECK(fp != NULL, "popen tupu CLI on exported facts");
     if (fp != NULL) {
       char out_buf[8192];
@@ -312,7 +617,7 @@ int main(void) {
       if (rej_rows != 0) {
         fprintf(stderr, "FAIL tupu export had %d reject rows:\n%s\n", rej_rows, out_buf);
       }
-      CHECK(rej_rows == 0, "Fix #8: tupu CLI reject relation has exactly 0 rows");
+      CHECK(rej_rows == 0, "Wave 3: tupu CLI reject relation has EXACTLY 0 rows");
     }
   }
 

@@ -272,7 +272,24 @@ static bool str_eq_ss(StigiStr a, StigiStr b) {
 static bool is_int_ty(const StigiTy *t) {
   if (t == NULL) return false;
   return t->kind == STIGI_TY_U8 || t->kind == STIGI_TY_U32 || t->kind == STIGI_TY_U64 ||
-         t->kind == STIGI_TY_I32 || t->kind == STIGI_TY_I64;
+         t->kind == STIGI_TY_I32 || t->kind == STIGI_TY_I64 || t->kind == STIGI_TY_INT_LIT;
+}
+
+static bool int_lit_fits_ty(uint64_t val, bool is_neg, const StigiTy *u) {
+  if (u == NULL) return false;
+  switch (u->kind) {
+    case STIGI_TY_U8: return !is_neg && val <= 255ULL;
+    case STIGI_TY_U32: return !is_neg && val <= 4294967295ULL;
+    case STIGI_TY_U64: return !is_neg;
+    case STIGI_TY_I32:
+      return is_neg ? (val <= 2147483648ULL) : (val <= 2147483647ULL);
+    case STIGI_TY_I64:
+      return is_neg ? (val <= 9223372036854775808ULL) : (val <= 9223372036854775807ULL);
+    case STIGI_TY_INT_LIT:
+      return true;
+    default:
+      return false;
+  }
 }
 
 static bool is_unsigned_int_ty(const StigiTy *t) {
@@ -344,6 +361,15 @@ bool stigi_ty_assignable(const StigiTy *expected, const StigiTy *actual) {
   if (actual->kind == STIGI_TY_TYPEDEF && actual->elem != NULL &&
       expected->kind != STIGI_TY_TYPEDEF) {
     return stigi_ty_assignable(expected, actual->elem);
+  }
+  if (actual->kind == STIGI_TY_INT_LIT && is_int_ty(expected)) {
+    return int_lit_fits_ty(actual->lit_val, actual->lit_neg, expected);
+  }
+  if (expected->kind == STIGI_TY_INT_LIT && is_int_ty(actual)) {
+    return int_lit_fits_ty(expected->lit_val, expected->lit_neg, actual);
+  }
+  if (expected->kind == STIGI_TY_CELL && actual->kind == STIGI_TY_CELL) {
+    return stigi_ty_assignable(expected->elem, actual->elem);
   }
   if (expected->kind == STIGI_TY_ARRAY && actual->kind == STIGI_TY_ARRAY) {
     if (!stigi_ty_assignable(expected->elem, actual->elem)) return false;
@@ -497,7 +523,12 @@ static StigiLayout ty_layout_rec(const StigiImage *img, const StigiTy *ty, int d
     case STIGI_TY_PTR:
     case STIGI_TY_CELL:
     case STIGI_TY_ARRAY:
+    case STIGI_TY_INT_LIT:
+    case STIGI_TY_FILL_RESULT:
+    case STIGI_TY_MAKE_RESULT:
       return (StigiLayout){8, 8};
+    case STIGI_TY_GROW_RESULT:
+      return (StigiLayout){16, 8};
     case STIGI_TY_UNIT:
     case STIGI_TY_NEVER:
     case STIGI_TY_TYPE:
@@ -1196,22 +1227,8 @@ static bool unify_ty(const StigiTy *pat, const StigiTy *actual,
 static void check_int_lit_range(TyCtx *ctx, uint64_t val, bool is_neg,
                                 const StigiTy *expected, StigiSpan sp) {
   const StigiTy *u = unwrap_ty_underlying(expected);
-  if (u == NULL) return;
-  bool oob = false;
-  switch (u->kind) {
-    case STIGI_TY_U8: oob = is_neg || val > 255ULL; break;
-    case STIGI_TY_U32: oob = is_neg || val > 4294967295ULL; break;
-    case STIGI_TY_U64: oob = is_neg; break;
-    case STIGI_TY_I32:
-      oob = is_neg ? (val > 2147483648ULL) : (val > 2147483647ULL);
-      break;
-    case STIGI_TY_I64:
-      oob = is_neg ? (val > 9223372036854775808ULL) : (val > 9223372036854775807ULL);
-      break;
-    default:
-      break;
-  }
-  if (oob) {
+  if (u == NULL || !is_int_ty(u)) return;
+  if (!int_lit_fits_ty(val, is_neg, u)) {
     (void)add_tdiag(ctx->diags, STIGI_TYPE_LITERAL_OUT_OF_RANGE, sp, ctx->diag,
                     "integer literal out of range");
   }
@@ -1840,6 +1857,135 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           }
           return u64;
         }
+        /* Builtin region allocation calls: Array.tryFill, Array.tryGrow, Cell.tryMake */
+        if (str_eq_c(cn, "Array.tryFill")) {
+          StigiTy *res = alloc_ty(ctx->arena, STIGI_TY_FILL_RESULT);
+          if (e->u.call.arg_count != 2) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_ARITY, e->span, ctx->diag,
+                            "Array.tryFill expects 2 arguments (cap, init), got %u",
+                            e->u.call.arg_count);
+            for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+              (void)check_expr(ctx, e->u.call.args[i], NULL);
+            }
+            return res;
+          }
+          StigiTy *u64 = alloc_ty(ctx->arena, STIGI_TY_U64);
+          StigiTy *ct = check_expr(ctx, e->u.call.args[0], u64);
+          if (!stigi_ty_assignable(u64, ct)) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[0]->span,
+                            ctx->diag, "Array.tryFill capacity must have type U64");
+          }
+          if (linear_from_expr_ctx(e->u.call.args[0], ctx, ctx->lin_intern, &res->len) == STIGI_OK) {
+            res->has_len = true;
+          }
+          StigiTy *elem_hint = NULL;
+          if (e->u.call.type_arg_count == 1) {
+            elem_hint = resolve_ast_type_ctx(ctx->img, ctx->uidx, e->u.call.type_args[0],
+                                             ctx->arena, ctx->lin_intern, ctx,
+                                             ctx->diags, ctx->diag, 0);
+          } else if (e->u.call.type_arg_count > 1) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_TYPE_ARITY, e->span, ctx->diag,
+                            "Array.tryFill expects at most 1 type argument");
+          }
+          const StigiExpr *init_e = e->u.call.args[1];
+          if (elem_hint == NULL && init_e->kind == STIGI_EXPR_LIT_INT &&
+              !init_e->u.lit_int.overflow) {
+            StigiTy *lt = alloc_ty(ctx->arena, STIGI_TY_INT_LIT);
+            lt->lit_val = init_e->u.lit_int.value;
+            lt->lit_neg = false;
+            res->elem = lt;
+          } else if (elem_hint == NULL && init_e->kind == STIGI_EXPR_UNOP &&
+                     init_e->u.unop.op == STIGI_OP_NEG &&
+                     init_e->u.unop.operand != NULL &&
+                     init_e->u.unop.operand->kind == STIGI_EXPR_LIT_INT &&
+                     !init_e->u.unop.operand->u.lit_int.overflow) {
+            StigiTy *lt = alloc_ty(ctx->arena, STIGI_TY_INT_LIT);
+            lt->lit_val = init_e->u.unop.operand->u.lit_int.value;
+            lt->lit_neg = true;
+            res->elem = lt;
+          } else {
+            StigiTy *it = check_expr(ctx, init_e, elem_hint);
+            if (elem_hint != NULL && !stigi_ty_assignable(elem_hint, it)) {
+              (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, init_e->span, ctx->diag,
+                              "Array.tryFill initializer does not match element type");
+            }
+            res->elem = elem_hint != NULL ? elem_hint : it;
+          }
+          return res;
+        }
+        if (str_eq_c(cn, "Array.tryGrow")) {
+          StigiTy *res = alloc_ty(ctx->arena, STIGI_TY_GROW_RESULT);
+          if (e->u.call.arg_count != 3) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_ARITY, e->span, ctx->diag,
+                            "Array.tryGrow expects 3 arguments (arr, nextCap, fill), got %u",
+                            e->u.call.arg_count);
+            for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+              (void)check_expr(ctx, e->u.call.args[i], NULL);
+            }
+            return res;
+          }
+          StigiTy *at = check_expr(ctx, e->u.call.args[0], NULL);
+          const StigiTy *ua = unwrap_ty_underlying(at);
+          StigiTy *elem_ty = alloc_ty(ctx->arena, STIGI_TY_ERROR);
+          if (ua != NULL && ua->kind == STIGI_TY_ARRAY) {
+            elem_ty = ua->elem != NULL ? ua->elem : alloc_ty(ctx->arena, STIGI_TY_ERROR);
+            res->old_len = ua->len;
+            res->has_old_len = ua->has_len;
+          } else if (at->kind != STIGI_TY_ERROR) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[0]->span,
+                            ctx->diag, "Array.tryGrow first argument must be an Array");
+          }
+          StigiTy *u64 = alloc_ty(ctx->arena, STIGI_TY_U64);
+          StigiTy *ct = check_expr(ctx, e->u.call.args[1], u64);
+          if (!stigi_ty_assignable(u64, ct)) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[1]->span,
+                            ctx->diag, "Array.tryGrow new capacity must have type U64");
+          }
+          if (linear_from_expr_ctx(e->u.call.args[1], ctx, ctx->lin_intern, &res->len) == STIGI_OK) {
+            res->has_len = true;
+          }
+          StigiTy *ft = check_expr(ctx, e->u.call.args[2], elem_ty);
+          if (!stigi_ty_assignable(elem_ty, ft)) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[2]->span,
+                            ctx->diag, "Array.tryGrow fill value does not match element type");
+          }
+          res->elem = elem_ty;
+          return res;
+        }
+        if (str_eq_c(cn, "Cell.tryMake")) {
+          StigiTy *res = alloc_ty(ctx->arena, STIGI_TY_MAKE_RESULT);
+          if (e->u.call.arg_count != 1) {
+            (void)add_tdiag(ctx->diags, STIGI_TYPE_ARITY, e->span, ctx->diag,
+                            "Cell.tryMake expects 1 argument (init), got %u",
+                            e->u.call.arg_count);
+            for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+              (void)check_expr(ctx, e->u.call.args[i], NULL);
+            }
+            return res;
+          }
+          StigiTy *elem_hint = NULL;
+          if (e->u.call.type_arg_count == 1) {
+            elem_hint = resolve_ast_type_ctx(ctx->img, ctx->uidx, e->u.call.type_args[0],
+                                             ctx->arena, ctx->lin_intern, ctx,
+                                             ctx->diags, ctx->diag, 0);
+          }
+          const StigiExpr *init_e = e->u.call.args[0];
+          if (elem_hint == NULL && init_e->kind == STIGI_EXPR_LIT_INT &&
+              !init_e->u.lit_int.overflow) {
+            StigiTy *lt = alloc_ty(ctx->arena, STIGI_TY_INT_LIT);
+            lt->lit_val = init_e->u.lit_int.value;
+            lt->lit_neg = false;
+            res->elem = lt;
+          } else {
+            StigiTy *it = check_expr(ctx, init_e, elem_hint);
+            if (elem_hint != NULL && !stigi_ty_assignable(elem_hint, it)) {
+              (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, init_e->span, ctx->diag,
+                              "Cell.tryMake initializer does not match element type");
+            }
+            res->elem = elem_hint != NULL ? elem_hint : it;
+          }
+          return res;
+        }
 
         /* Capability operation call `binder.op(...)` */
         const char *dot = memchr(cn.ptr, '.', cn.len);
@@ -1912,13 +2058,19 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
         }
       }
 
+      bool is_alloc_res = (usc != NULL &&
+                           (usc->kind == STIGI_TY_FILL_RESULT ||
+                            usc->kind == STIGI_TY_GROW_RESULT ||
+                            usc->kind == STIGI_TY_MAKE_RESULT));
+      bool alloc_cov[2] = { false, false };
+
       StigiTy *res_ty = NULL;
       for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
         const StigiPat *pat = &e->u.match_expr.arms[i].pat;
         uint32_t saved = ctx->local_count;
         if (pat->kind == STIGI_PAT_WILD) {
           has_wild = true;
-          if (enum_d != NULL) {
+          if (enum_d != NULL || is_alloc_res) {
             (void)add_tdiag(ctx->diags, STIGI_TYPE_WILDCARD_ARM, pat->span, ctx->diag,
                             "wildcard '_' arm is not allowed in enum match");
           }
@@ -2019,6 +2171,108 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
               }
               ty_ctx_free(&fctx);
             }
+          } else if (is_alloc_res) {
+            if (usc->kind == STIGI_TY_FILL_RESULT) {
+              if (str_eq_c(pat->name, "Filled")) {
+                if (alloc_cov[0]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'Filled'");
+                }
+                alloc_cov[0] = true;
+                if (pat->field_count != 1) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'Filled' expects 1 field, got %u", pat->field_count);
+                } else {
+                  StigiTy *arr = alloc_ty(ctx->arena, STIGI_TY_ARRAY);
+                  arr->elem = usc->elem != NULL ? usc->elem : alloc_ty(ctx->arena, STIGI_TY_ERROR);
+                  arr->len = usc->len;
+                  arr->has_len = usc->has_len;
+                  push_ty_local(ctx, pat->fields[0], arr, false);
+                }
+              } else if (str_eq_c(pat->name, "FillFailed")) {
+                if (alloc_cov[1]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'FillFailed'");
+                }
+                alloc_cov[1] = true;
+                if (pat->field_count != 0) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'FillFailed' expects 0 fields, got %u", pat->field_count);
+                }
+              } else {
+                (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                "case '%.*s' does not belong to Array.tryFill result",
+                                (int)pat->name.len, pat->name.ptr);
+              }
+            } else if (usc->kind == STIGI_TY_GROW_RESULT) {
+              if (str_eq_c(pat->name, "Grown")) {
+                if (alloc_cov[0]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'Grown'");
+                }
+                alloc_cov[0] = true;
+                if (pat->field_count != 1) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'Grown' expects 1 field, got %u", pat->field_count);
+                } else {
+                  StigiTy *arr = alloc_ty(ctx->arena, STIGI_TY_ARRAY);
+                  arr->elem = usc->elem != NULL ? usc->elem : alloc_ty(ctx->arena, STIGI_TY_ERROR);
+                  arr->len = usc->len;
+                  arr->has_len = usc->has_len;
+                  push_ty_local(ctx, pat->fields[0], arr, false);
+                }
+              } else if (str_eq_c(pat->name, "GrowFailed")) {
+                if (alloc_cov[1]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'GrowFailed'");
+                }
+                alloc_cov[1] = true;
+                if (pat->field_count != 1) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'GrowFailed' expects 1 field, got %u", pat->field_count);
+                } else {
+                  StigiTy *arr = alloc_ty(ctx->arena, STIGI_TY_ARRAY);
+                  arr->elem = usc->elem != NULL ? usc->elem : alloc_ty(ctx->arena, STIGI_TY_ERROR);
+                  arr->len = usc->old_len;
+                  arr->has_len = usc->has_old_len;
+                  push_ty_local(ctx, pat->fields[0], arr, false);
+                }
+              } else {
+                (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                "case '%.*s' does not belong to Array.tryGrow result",
+                                (int)pat->name.len, pat->name.ptr);
+              }
+            } else if (usc->kind == STIGI_TY_MAKE_RESULT) {
+              if (str_eq_c(pat->name, "Filled")) {
+                if (alloc_cov[0]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'Filled'");
+                }
+                alloc_cov[0] = true;
+                if (pat->field_count != 1) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'Filled' expects 1 field, got %u", pat->field_count);
+                } else {
+                  StigiTy *cell = alloc_ty(ctx->arena, STIGI_TY_CELL);
+                  cell->elem = usc->elem != NULL ? usc->elem : alloc_ty(ctx->arena, STIGI_TY_ERROR);
+                  push_ty_local(ctx, pat->fields[0], cell, false);
+                }
+              } else if (str_eq_c(pat->name, "FillFailed")) {
+                if (alloc_cov[1]) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                  "duplicate match arm for case 'FillFailed'");
+                }
+                alloc_cov[1] = true;
+                if (pat->field_count != 0) {
+                  (void)add_tdiag(ctx->diags, STIGI_TYPE_PATTERN_ARITY, pat->span, ctx->diag,
+                                  "case 'FillFailed' expects 0 fields, got %u", pat->field_count);
+                }
+              } else {
+                (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
+                                "case '%.*s' does not belong to Cell.tryMake result",
+                                (int)pat->name.len, pat->name.ptr);
+              }
+            }
           }
         }
         StigiTy *at = check_expr(ctx, e->u.match_expr.arms[i].body, expected);
@@ -2030,7 +2284,12 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
                           ctx->diag, "match arm type mismatch");
         }
       }
-      if (enum_d != NULL && covered != NULL) {
+      if (is_alloc_res) {
+        if (!alloc_cov[0] || !alloc_cov[1]) {
+          (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,
+                          "allocation result match must cover both success and failure cases");
+        }
+      } else if (enum_d != NULL && covered != NULL) {
         for (uint32_t c = 0; c < case_count; c++) {
           if (!covered[c]) {
             (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,
