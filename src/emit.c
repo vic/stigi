@@ -2050,9 +2050,16 @@ static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var
     EmitBuf cond_buf;
     emit_expr_with_pre(ctx, e->u.if_expr.cond, ETY_BOOL, &cond_buf);
     eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
-    eb_cstr(ctx->b, "  if (");
-    eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
-    eb_cstr(ctx->b, ") {\n");
+    if (e->u.if_expr.cond->kind == STIGI_EXPR_BINOP && cond_buf.len >= 2U &&
+        cond_buf.buf[0] == '(' && cond_buf.buf[cond_buf.len - 1U] == ')') {
+      eb_cstr(ctx->b, "  if ");
+      eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
+      eb_cstr(ctx->b, " {\n");
+    } else {
+      eb_cstr(ctx->b, "  if (");
+      eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
+      eb_cstr(ctx->b, ") {\n");
+    }
     free(cond_buf.buf);
     uint32_t saved = ctx->var_count;
     emit_assign_to(ctx, e->u.if_expr.then_br, lhs_var, hint);
@@ -2168,9 +2175,16 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     EmitBuf cond_buf;
     emit_expr_with_pre(ctx, e->u.if_expr.cond, ETY_BOOL, &cond_buf);
     eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
-    eb_cstr(ctx->b, "  if (");
-    eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
-    eb_cstr(ctx->b, ") {\n");
+    if (e->u.if_expr.cond->kind == STIGI_EXPR_BINOP && cond_buf.len >= 2U &&
+        cond_buf.buf[0] == '(' && cond_buf.buf[cond_buf.len - 1U] == ')') {
+      eb_cstr(ctx->b, "  if ");
+      eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
+      eb_cstr(ctx->b, " {\n");
+    } else {
+      eb_cstr(ctx->b, "  if (");
+      eb_mem(ctx->b, cond_buf.buf, cond_buf.len);
+      eb_cstr(ctx->b, ") {\n");
+    }
     free(cond_buf.buf);
     uint32_t saved = ctx->var_count;
     emit_stmt_or_ret(ctx, e->u.if_expr.then_br, is_tail, is_void);
@@ -2222,7 +2236,7 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       (void)snprintf(tname, sizeof tname, "_ds%u", tid);
       eb_cstr(ctx->b, "  ");
       eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
-      eb_fmt(ctx->b, " %s;\n", tname);
+      eb_fmt(ctx->b, " %s = {0};\n", tname);
       emit_assign_to(ctx, e->u.val_stmt.init, tname, ETY_UNKNOWN);
       if (eidx >= 0) {
         const StigiDecl *ed = ctx->img->units[eidx].ast->decl;
@@ -2234,9 +2248,9 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
           if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
           EmitVar *v = emit_register_var(ctx, fn, ec->fields[f].type, (uint32_t)eidx, false);
           if (v != NULL) {
-            eb_cstr(ctx->b, "  const ");
+            eb_cstr(ctx->b, "  ");
             emit_c_type(ctx->b, ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
-            eb_cstr(ctx->b, " ");
+            eb_cstr(ctx->b, " const ");
             emit_var_cname(ctx->b, v);
             if (eli.is_nullable_ptr) {
               eb_fmt(ctx->b, " = %s;\n", tname);
@@ -2267,16 +2281,16 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       (void)snprintf(tname, sizeof tname, "_v%u", tid);
       eb_cstr(ctx->b, "  ");
       eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
-      eb_fmt(ctx->b, " %s;\n", tname);
+      eb_fmt(ctx->b, " %s = {0};\n", tname);
       emit_assign_to(ctx, e->u.val_stmt.init, tname, vhint);
       EmitVar *v = emit_register_var(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.type,
                                      ctx->uidx, false);
       if (v != NULL) {
         if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
         if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
-        eb_cstr(ctx->b, "  const ");
+        eb_cstr(ctx->b, "  ");
         eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
-        eb_cstr(ctx->b, " ");
+        eb_cstr(ctx->b, " const ");
         emit_var_cname(ctx->b, v);
         eb_fmt(ctx->b, " = %s;\n", tname);
       }
@@ -2288,9 +2302,9 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       if (v != NULL) {
         if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
         if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
-        eb_cstr(ctx->b, "  const ");
+        eb_cstr(ctx->b, "  ");
         eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
-        eb_cstr(ctx->b, " ");
+        eb_cstr(ctx->b, " const ");
         emit_var_cname(ctx->b, v);
         eb_cstr(ctx->b, " = ");
         eb_mem(ctx->b, init_buf.buf, init_buf.len);
@@ -2325,7 +2339,7 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       (void)snprintf(tname, sizeof tname, "_v%u", tid);
       eb_cstr(ctx->b, "  ");
       eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
-      eb_fmt(ctx->b, " %s;\n", tname);
+      eb_fmt(ctx->b, " %s = {0};\n", tname);
       emit_assign_to(ctx, e->u.var_stmt.init, tname, vhint);
       EmitVar *v = emit_register_var(ctx, e->u.var_stmt.name, e->u.var_stmt.type,
                                      ctx->uidx, false);
@@ -2402,6 +2416,11 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       eb_cstr(ctx->b, "    if (!(");
       eb_mem(ctx->b, cbuf.buf, cbuf.len);
       eb_cstr(ctx->b, ")) break;\n");
+    } else if (e->u.while_expr.cond->kind == STIGI_EXPR_BINOP && cbuf.len >= 2U &&
+               cbuf.buf[0] == '(' && cbuf.buf[cbuf.len - 1U] == ')') {
+      eb_cstr(ctx->b, "  while ");
+      eb_mem(ctx->b, cbuf.buf, cbuf.len);
+      eb_cstr(ctx->b, " {\n");
     } else {
       eb_cstr(ctx->b, "  while (");
       eb_mem(ctx->b, cbuf.buf, cbuf.len);
@@ -2730,7 +2749,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
         ctx->pre = NULL;
         eb_cstr(ctx->b, "  ");
         (void)emit_inferred_expr_c_type(ctx->b, ctx, e, hint);
-        eb_fmt(ctx->b, " %s;\n", ename);
+        eb_fmt(ctx->b, " %s = {0};\n", ename);
         emit_assign_to(ctx, e, ename, hint);
         ctx->b = saved_b;
         ctx->pre = saved_pre;
@@ -3134,7 +3153,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
         ctx->pre = NULL;
         eb_cstr(ctx->b, "  ");
         (void)emit_inferred_expr_c_type(ctx->b, ctx, e, hint);
-        eb_fmt(ctx->b, " %s;\n", ename);
+        eb_fmt(ctx->b, " %s = {0};\n", ename);
         emit_assign_to(ctx, e, ename, hint);
         ctx->b = saved_b;
         ctx->pre = saved_pre;
