@@ -1042,12 +1042,14 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
           free(args);
           return z;
         }
-        if (str_eq_lit(cn, "U64.ofU8") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+        if ((str_eq_lit(cn, "U64.ofU8") || str_eq_lit(cn, "U64.ofU32")) &&
+            argc == 1 && args[0].kind == STIGI_VAL_INT) {
           z = args[0]; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
           (void)coerce_int_to_width(ctx, &z, STIGI_INT_U64);
           free(args); return z;
         }
-        if (str_eq_lit(cn, "U64.ofI64") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+        if ((str_eq_lit(cn, "U64.ofI64") || str_eq_lit(cn, "U64.ofI32")) &&
+            argc == 1 && args[0].kind == STIGI_VAL_INT) {
           z = args[0];
           (void)coerce_int_to_width(ctx, &z, STIGI_INT_U64);
           free(args); return z;
@@ -1057,10 +1059,47 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
           (void)coerce_int_to_width(ctx, &z, STIGI_INT_U8);
           free(args); return z;
         }
+        if (str_eq_lit(cn, "U32.ofU64") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+          z = args[0];
+          (void)coerce_int_to_width(ctx, &z, STIGI_INT_U32);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "I64.ofU64") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = false; z.int_width = STIGI_INT_I64;
+          z.u.i = (int64_t)(args[0].is_unsigned ? args[0].u.u : (uint64_t)args[0].u.i);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "I32.ofU64") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = false; z.int_width = STIGI_INT_I32;
+          z.u.i = (int64_t)(int32_t)(uint32_t)(args[0].is_unsigned ? args[0].u.u : (uint64_t)args[0].u.i);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.mix") && argc == 1 && args[0].kind == STIGI_VAL_INT) {
+          uint64_t x = args[0].is_unsigned ? args[0].u.u : (uint64_t)args[0].u.i;
+          x += UINT64_C(0x9e3779b97f4a7c15);
+          x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+          x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+          x = x ^ (x >> 31);
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = x;
+          free(args); return z;
+        }
         if (str_eq_lit(cn, "U32.wrappingAdd") && argc == 2 &&
             args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
           z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
           z.u.u = (uint32_t)(args[0].u.u + args[1].u.u);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U32.wrappingSubtract") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)(args[0].u.u - args[1].u.u);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U32.wrappingMultiply") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)(args[0].u.u * args[1].u.u);
           free(args); return z;
         }
         if (str_eq_lit(cn, "U32.rotateRight") && argc == 2 &&
@@ -1071,16 +1110,72 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
           z.u.u = (r == 0) ? x : ((x >> r) | (x << (32U - r)));
           free(args); return z;
         }
+        if (str_eq_lit(cn, "U32.bitwiseAnd") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)(args[0].u.u & args[1].u.u);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U32.bitwiseOr") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)(args[0].u.u | args[1].u.u);
+          free(args); return z;
+        }
         if (str_eq_lit(cn, "U32.bitwiseXor") && argc == 2 &&
             args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
           z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
           z.u.u = (uint32_t)(args[0].u.u ^ args[1].u.u);
           free(args); return z;
         }
+        if (str_eq_lit(cn, "U32.shiftLeft") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          if (args[1].u.u >= 32ULL) { free(args); eval_fail(ctx, "eval-error", "shift >= 32"); return z; }
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)((uint32_t)args[0].u.u << (uint32_t)args[1].u.u);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U32.shiftRight") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          if (args[1].u.u >= 32ULL) { free(args); eval_fail(ctx, "eval-error", "shift >= 32"); return z; }
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U32;
+          z.u.u = (uint32_t)((uint32_t)args[0].u.u >> (uint32_t)args[1].u.u);
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.wrappingAdd") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = args[0].u.u + args[1].u.u;
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.wrappingSubtract") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = args[0].u.u - args[1].u.u;
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.wrappingMultiply") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = args[0].u.u * args[1].u.u;
+          free(args); return z;
+        }
         if (str_eq_lit(cn, "U64.bitwiseAnd") && argc == 2 &&
             args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
           z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
           z.u.u = args[0].u.u & args[1].u.u;
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.bitwiseOr") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = args[0].u.u | args[1].u.u;
+          free(args); return z;
+        }
+        if (str_eq_lit(cn, "U64.bitwiseXor") && argc == 2 &&
+            args[0].kind == STIGI_VAL_INT && args[1].kind == STIGI_VAL_INT) {
+          z.kind = STIGI_VAL_INT; z.is_unsigned = true; z.int_width = STIGI_INT_U64;
+          z.u.u = args[0].u.u ^ args[1].u.u;
           free(args); return z;
         }
         if (str_eq_lit(cn, "U64.shiftLeft") && argc == 2 &&

@@ -1941,10 +1941,13 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           return alloc_ty(ctx->arena, STIGI_TY_NEVER);
         }
         /* Builtin integer & bit conversions */
-        if (str_eq_c(cn, "U64.ofU8") || str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.ofU32")) {
-          StigiTy *in_ty = alloc_ty(ctx->arena,
-                                    str_eq_c(cn, "U64.ofU8") ? STIGI_TY_U8
-                                    : (str_eq_c(cn, "U64.ofI64") ? STIGI_TY_I64 : STIGI_TY_U32));
+        if (str_eq_c(cn, "U64.ofU8") || str_eq_c(cn, "U64.ofI64") ||
+            str_eq_c(cn, "U64.ofI32") || str_eq_c(cn, "U64.ofU32")) {
+          StigiTyKind ik = STIGI_TY_U32;
+          if (str_eq_c(cn, "U64.ofU8")) ik = STIGI_TY_U8;
+          else if (str_eq_c(cn, "U64.ofI64")) ik = STIGI_TY_I64;
+          else if (str_eq_c(cn, "U64.ofI32")) ik = STIGI_TY_I32;
+          StigiTy *in_ty = alloc_ty(ctx->arena, ik);
           if (e->u.call.arg_count == 1) {
             StigiTy *at = check_expr(ctx, e->u.call.args[0], in_ty);
             if (!stigi_ty_assignable(in_ty, at)) {
@@ -1953,7 +1956,8 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           }
           return alloc_ty(ctx->arena, STIGI_TY_U64);
         }
-        if (str_eq_c(cn, "U8.ofU64") || str_eq_c(cn, "U32.ofU64")) {
+        if (str_eq_c(cn, "U8.ofU64") || str_eq_c(cn, "U32.ofU64") ||
+            str_eq_c(cn, "I64.ofU64") || str_eq_c(cn, "I32.ofU64")) {
           StigiTy *u64 = alloc_ty(ctx->arena, STIGI_TY_U64);
           if (e->u.call.arg_count == 1) {
             StigiTy *at = check_expr(ctx, e->u.call.args[0], u64);
@@ -1961,21 +1965,30 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
               (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->span, ctx->diag, "conversion arg mismatch");
             }
           }
-          return alloc_ty(ctx->arena, str_eq_c(cn, "U8.ofU64") ? STIGI_TY_U8 : STIGI_TY_U32);
+          StigiTyKind rk = STIGI_TY_U32;
+          if (str_eq_c(cn, "U8.ofU64")) rk = STIGI_TY_U8;
+          else if (str_eq_c(cn, "I64.ofU64")) rk = STIGI_TY_I64;
+          else if (str_eq_c(cn, "I32.ofU64")) rk = STIGI_TY_I32;
+          return alloc_ty(ctx->arena, rk);
         }
-        if (str_eq_c(cn, "U32.wrappingAdd") || str_eq_c(cn, "U32.rotateRight") ||
-            str_eq_c(cn, "U32.bitwiseXor") || str_eq_c(cn, "U32.bitwiseAnd")) {
+        if (str_eq_c(cn, "U32.wrappingAdd") || str_eq_c(cn, "U32.wrappingSubtract") ||
+            str_eq_c(cn, "U32.wrappingMultiply") || str_eq_c(cn, "U32.rotateRight") ||
+            str_eq_c(cn, "U32.bitwiseXor") || str_eq_c(cn, "U32.bitwiseAnd") ||
+            str_eq_c(cn, "U32.bitwiseOr") || str_eq_c(cn, "U32.shiftLeft") ||
+            str_eq_c(cn, "U32.shiftRight")) {
           StigiTy *u32 = alloc_ty(ctx->arena, STIGI_TY_U32);
           for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
             StigiTy *at = check_expr(ctx, e->u.call.args[i], u32);
             if (!stigi_ty_assignable(u32, at)) {
               (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[i]->span,
-                              ctx->diag, "U32 bitwise op expects U32");
+                              ctx->diag, "U32 bitwise/wrapping op expects U32");
             }
           }
           return u32;
         }
-        if (str_eq_c(cn, "U64.bitwiseAnd") || str_eq_c(cn, "U64.bitwiseOr") ||
+        if (str_eq_c(cn, "U64.mix") || str_eq_c(cn, "U64.wrappingAdd") ||
+            str_eq_c(cn, "U64.wrappingSubtract") || str_eq_c(cn, "U64.wrappingMultiply") ||
+            str_eq_c(cn, "U64.bitwiseAnd") || str_eq_c(cn, "U64.bitwiseOr") ||
             str_eq_c(cn, "U64.bitwiseXor") || str_eq_c(cn, "U64.shiftLeft") ||
             str_eq_c(cn, "U64.shiftRight")) {
           StigiTy *u64 = alloc_ty(ctx->arena, STIGI_TY_U64);
@@ -1983,7 +1996,7 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
             StigiTy *at = check_expr(ctx, e->u.call.args[i], u64);
             if (!stigi_ty_assignable(u64, at)) {
               (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, e->u.call.args[i]->span,
-                              ctx->diag, "U64 bitwise op expects U64");
+                              ctx->diag, "U64 bitwise/wrapping op expects U64");
             }
           }
           return u64;

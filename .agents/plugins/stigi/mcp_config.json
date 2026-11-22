@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "stigi": {
+      "command": "/home/vic/hk/stigi/build/stigi-seed",
+      "args": [
+        "--mcp",
+        "--rules",
+        "/home/vic/hk/stigi/vic/spec/datalog/all.dl"
+      ],
+      "env": {
+        "PATH": "/nix/store/ii6p6kc1brz3vycqg88q4zb4xd2dmqwp-gcc-wrapper-16.2.0/bin:/run/current-system/sw/bin:/usr/bin:/bin"
+      },
+      "type": "stdio"
+    }
+  }
+}

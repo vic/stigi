@@ -1670,10 +1670,12 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
         if ((str_eq_c(cn, "shiftLeft") || str_eq_c(cn, "shiftRight") ||
              str_eq_c(cn, "rotateLeft") || str_eq_c(cn, "rotateRight") ||
              str_eq_c(cn, "U64.shiftLeft") || str_eq_c(cn, "U64.shiftRight") ||
-             str_eq_c(cn, "U32.shiftLeft") || str_eq_c(cn, "U32.shiftRight")) &&
+             str_eq_c(cn, "U32.shiftLeft") || str_eq_c(cn, "U32.shiftRight") ||
+             str_eq_c(cn, "U32.rotateRight")) &&
             e->u.call.arg_count == 2) {
-          ExtVal lv = ext_expr(ctx, e->u.call.args[0], hint_ty, false);
-          ExtVal rv = ext_expr(ctx, e->u.call.args[1], "U64", false);
+          const char *sty = (cn.len >= 4 && memcmp(cn.ptr, "U32.", 4) == 0) ? "U32" : "U64";
+          ExtVal lv = ext_expr(ctx, e->u.call.args[0], sty, false);
+          ExtVal rv = ext_expr(ctx, e->u.call.args[1], sty, false);
           const char *pt = ext_new_pt(ctx);
           const char *op = ext_new_op(ctx);
           ExtVal res = ext_new_val(ctx, lv.ty);
@@ -1691,14 +1693,33 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
           return res;
         }
 
+        /* Unary wrapping hash finalizer U64.mix (no overflow obligation, arith.dl:4) */
+        if (str_eq_c(cn, "U64.mix") && e->u.call.arg_count == 1) {
+          ExtVal av = ext_expr(ctx, e->u.call.args[0], "U64", false);
+          const char *pt = ext_new_pt(ctx);
+          const char *op = ext_new_op(ctx);
+          ExtVal res = ext_new_val(ctx, "U64");
+          ctx_emit4(ctx, "operation", col_sym(op), col_sym("WrapOp"), col_sym(pt),
+                    col_sym(ctx->cur_sc));
+          ctx_emit2(ctx, "operationOf", col_sym(op), col_sym(ctx->inst_sym));
+          ctx_emit3(ctx, "operand", col_sym(op), col_i64(0), col_sym(av.sym));
+          ctx_emit2(ctx, "result", col_sym(op), col_sym(res.sym));
+          ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Operand"));
+          ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Result"));
+          return res;
+        }
+
         /* Wrapping & bitwise-or/xor ops (no overflow obligation, arith.dl:4) */
-        if ((str_eq_c(cn, "U32.wrappingAdd") || str_eq_c(cn, "U64.wrappingAdd") ||
-             str_eq_c(cn, "U64.wrappingMultiply") || str_eq_c(cn, "U32.wrappingMultiply") ||
-             str_eq_c(cn, "U64.mix") || str_eq_c(cn, "bitwiseOr") || str_eq_c(cn, "bitwiseXor") ||
+        if ((str_eq_c(cn, "U32.wrappingAdd") || str_eq_c(cn, "U32.wrappingSubtract") ||
+             str_eq_c(cn, "U32.wrappingMultiply") ||
+             str_eq_c(cn, "U64.wrappingAdd") || str_eq_c(cn, "U64.wrappingSubtract") ||
+             str_eq_c(cn, "U64.wrappingMultiply") ||
+             str_eq_c(cn, "bitwiseOr") || str_eq_c(cn, "bitwiseXor") ||
              str_eq_c(cn, "U64.bitwiseOr") || str_eq_c(cn, "U64.bitwiseXor") ||
              str_eq_c(cn, "U32.bitwiseOr") || str_eq_c(cn, "U32.bitwiseXor")) &&
             e->u.call.arg_count == 2) {
-          ExtVal lv = ext_expr(ctx, e->u.call.args[0], hint_ty, false);
+          const char *wty = (cn.len >= 4 && memcmp(cn.ptr, "U32.", 4) == 0) ? "U32" : "U64";
+          ExtVal lv = ext_expr(ctx, e->u.call.args[0], wty, false);
           ExtVal rv = ext_expr(ctx, e->u.call.args[1], lv.ty, false);
           const char *pt = ext_new_pt(ctx);
           const char *op = ext_new_op(ctx);
@@ -1714,16 +1735,20 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
           return res;
         }
 
-        /* Narrowing conversions: U8.ofU64(x), U32.ofU64(x), U64.ofI64(x) */
+        /* Narrowing / bit-preserving integer conversions */
         if ((str_eq_c(cn, "U8.ofU64") || str_eq_c(cn, "U32.ofU64") ||
-             str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.ofU8") ||
-             str_eq_c(cn, "U64.ofU32")) &&
+             str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.ofI32") ||
+             str_eq_c(cn, "U64.ofU8") || str_eq_c(cn, "U64.ofU32") ||
+             str_eq_c(cn, "I64.ofU64") || str_eq_c(cn, "I32.ofU64")) &&
             e->u.call.arg_count == 1) {
           ExtVal av = ext_expr(ctx, e->u.call.args[0], NULL, false);
           const char *pt = ext_new_pt(ctx);
           const char *op = ext_new_op(ctx);
-          const char *rty = str_eq_c(cn, "U8.ofU64") ? "U8"
-                            : (str_eq_c(cn, "U32.ofU64") ? "U32" : "U64");
+          const char *rty = "U64";
+          if (str_eq_c(cn, "U8.ofU64")) rty = "U8";
+          else if (str_eq_c(cn, "U32.ofU64")) rty = "U32";
+          else if (str_eq_c(cn, "I64.ofU64")) rty = "I64";
+          else if (str_eq_c(cn, "I32.ofU64")) rty = "I32";
           ExtVal res = ext_new_val(ctx, rty);
           ctx_emit4(ctx, "operation", col_sym(op), col_sym("Narrow"), col_sym(pt),
                     col_sym(ctx->cur_sc));
@@ -1740,13 +1765,16 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
             ExtVal lim = ext_lit_val(ctx, "U64", tupu_i128_from_u64(4294967296ULL));
             ctx_emit5(ctx, "belowOwed", col_sym(op), col_sym(av.sym), col_sym(lim.sym),
                       col_sym(ctx->cur_sc), col_sym("precondition-unproved"));
-          } else if (str_eq_c(cn, "U64.ofI64")) {
-            ExtVal z = ext_lit_val(ctx, "I64", tupu_i128_from_i64(0));
+          } else if (str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.ofI32")) {
+            ExtVal z = ext_lit_val(ctx, str_eq_c(cn, "U64.ofI32") ? "I32" : "I64",
+                                   tupu_i128_from_i64(0));
             ctx_emit5(ctx, "leqOwed", col_sym(op), col_sym(z.sym), col_sym(av.sym),
                       col_sym(ctx->cur_sc), col_sym("precondition-unproved"));
           }
-          ctx_emit3(ctx, "baseLeq", col_sym(av.sym), col_sym(res.sym), col_sym(ctx->cur_sc));
-          ctx_emit3(ctx, "baseLeq", col_sym(res.sym), col_sym(av.sym), col_sym(ctx->cur_sc));
+          if (!str_eq_c(cn, "I64.ofU64") && !str_eq_c(cn, "I32.ofU64")) {
+            ctx_emit3(ctx, "baseLeq", col_sym(av.sym), col_sym(res.sym), col_sym(ctx->cur_sc));
+            ctx_emit3(ctx, "baseLeq", col_sym(res.sym), col_sym(av.sym), col_sym(ctx->cur_sc));
+          }
           return res;
         }
 

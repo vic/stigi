@@ -45,10 +45,12 @@ Status stigi_serve_socket(StigiServerCtx *ctx, const char *sock_path,
 Status stigi_send_socket_frame(const char *sock_path, const char *frame, size_t len,
                                char **out_reply, size_t *out_len, Diag *diag);
 
-/* Claude Code --cc-socks adapter (frames.md 7.2): unwraps peer envelope -> verbatim frame */
+/* Claude Code --cc-socks adapter (frames.md 7.2 + opencc/ircc msgV:1 peer protocol) */
 Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_json, size_t len,
                                       char **out_reply, size_t *out_len, Diag *diag);
 Status stigi_serve_cc_socks(StigiServerCtx *ctx, const char *sock_path,
                             uint32_t max_requests, Diag *diag);
+Status stigi_cc_peer_register(const char *peer_name, const char *sock_path,
+                              char *out_reg_path, size_t reg_cap, Diag *diag);
 
 #endif

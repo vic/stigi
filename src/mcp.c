@@ -377,6 +377,10 @@ static Status handle_mcp_internal(StigiServerCtx *ctx, const char *bridge_sock,
       }
       free(uri);
     }
+  } else if (strcmp(method, "resources/templates/list") == 0) {
+    jb_cstr(&jb, ",\"result\":{\"resourceTemplates\":[]}}\n");
+  } else if (strcmp(method, "prompts/list") == 0) {
+    jb_cstr(&jb, ",\"result\":{\"prompts\":[]}}\n");
   } else {
     jb_cstr(&jb, ",\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\n");
   }

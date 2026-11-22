@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define STIGI_SEED_VERSION "0.1.0"
 #define STIGI_DEFAULT_RULES "vic/spec/datalog/all.dl"
@@ -19,7 +20,7 @@ static void print_usage(void) {
   printf("usage:\n"
          "  stigi-seed --version\n"
          "  stigi-seed --serve <sock> [--load <dir>] [--user] [--rules <all.dl>]\n"
-         "  stigi-seed --cc-socks <sock> [--load <dir>] [--user] [--rules <all.dl>]\n"
+         "  stigi-seed --cc-socks <sock> [--peer <name>] [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --mcp [--socket <sock>] [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --load <dir> --emit <out.c> [--user] [--rules <all.dl>]\n");
 }
@@ -34,6 +35,7 @@ int main(int argc, char **argv) {
   const char *rules_path = STIGI_DEFAULT_RULES;
   const char *serve_sock = NULL;
   const char *cc_sock = NULL;
+  const char *peer_name = NULL;
   const char *mcp_sock = NULL;
   const char *load_dir = NULL;
   const char *emit_path = NULL;
@@ -53,6 +55,8 @@ int main(int argc, char **argv) {
       serve_sock = argv[++i];
     } else if (strcmp(argv[i], "--cc-socks") == 0 && i + 1 < argc) {
       cc_sock = argv[++i];
+    } else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
+      peer_name = argv[++i];
     } else if (strcmp(argv[i], "--mcp") == 0) {
       mcp_mode = true;
     } else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
@@ -159,10 +163,16 @@ int main(int argc, char **argv) {
 
   StigiServerCtx srv;
   stigi_server_init(&srv, &door);
+  char reg_path[512];
+  reg_path[0] = '\0';
   if (serve_sock != NULL) {
     st = stigi_serve_socket(&srv, serve_sock, 0, &diag);
   } else if (cc_sock != NULL) {
+    if (peer_name != NULL) {
+      (void)stigi_cc_peer_register(peer_name, cc_sock, reg_path, sizeof reg_path, &diag);
+    }
     st = stigi_serve_cc_socks(&srv, cc_sock, 0, &diag);
+    if (reg_path[0] != '\0') (void)unlink(reg_path);
   } else if (mcp_mode) {
     st = stigi_serve_mcp_stdio(&srv, &diag);
   }

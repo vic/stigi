@@ -1627,6 +1627,115 @@ static const char *rfind_bytes(const char *hay, size_t hlen, const char *needle,
   return NULL;
 }
 
+static int hex_nibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+/* Decode `uds:<percent-encoded-path>` into a clean absolute .sock path (opencc peer/frame.go) */
+static bool decode_uds_peer_addr(const char *uds, size_t ulen, char *out, size_t cap) {
+  if (uds == NULL || ulen <= 4U || memcmp(uds, "uds:", 4) != 0) return false;
+  size_t w = 0;
+  for (size_t i = 4U; i < ulen; i++) {
+    char c = uds[i];
+    if (c == '%' && i + 2U < ulen) {
+      int hi = hex_nibble(uds[i + 1U]);
+      int lo = hex_nibble(uds[i + 2U]);
+      if (hi < 0 || lo < 0) return false;
+      c = (char)((hi << 4) | lo);
+      i += 2U;
+    }
+    if (c == '\0' || w + 1U >= cap) return false;
+    out[w++] = c;
+  }
+  out[w] = '\0';
+  if (w < 6U || out[0] != '/' || memcmp(out + w - 5U, ".sock", 5) != 0) return false;
+  if (strstr(out, "/../") != NULL || (w >= 3U && memcmp(out + w - 3U, "/..", 3) == 0)) return false;
+  return true;
+}
+
+static Status send_cc_peer_reply(const char *peer_sock, const char *my_sock,
+                                 const char *reply, size_t rlen, Diag *diag) {
+  uint8_t u[16];
+  memset(u, 0, sizeof u);
+  FILE *ur = fopen("/dev/urandom", "rb");
+  if (ur != NULL) {
+    size_t nr = fread(u, 1, sizeof u, ur);
+    (void)nr;
+    (void)fclose(ur);
+  }
+  u[6] = (uint8_t)((u[6] & 0x0fU) | 0x40U);
+  u[8] = (uint8_t)((u[8] & 0x3fU) | 0x80U);
+  char uuid[40];
+  (void)snprintf(uuid, sizeof uuid,
+                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                 u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+
+  ReplyBuf wrap = {NULL, 0, 0, false};
+  rb_fmt(&wrap, "<cross-session-message from=\"uds:%s\" from-name=\"stigi\" from-mode=\"bypass\">\n",
+         my_sock);
+  rb_mem(&wrap, reply, rlen);
+  if (rlen == 0 || reply[rlen - 1U] != '\n') rb_cstr(&wrap, "\n");
+  rb_cstr(&wrap, "</cross-session-message>");
+  if (wrap.oom || wrap.buf == NULL) {
+    free(wrap.buf);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+  }
+
+  ReplyBuf frame = {NULL, 0, 0, false};
+  rb_fmt(&frame, "{\"msgV\":1,\"msg_id\":\"%s\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":",
+         uuid);
+  rb_json_escaped(&frame, wrap.buf, wrap.len);
+  rb_cstr(&frame, "},\"priority\":\"next\",\"from\":");
+  ReplyBuf faddr = {NULL, 0, 0, false};
+  rb_fmt(&faddr, "uds:%s", my_sock);
+  if (!faddr.oom && faddr.buf != NULL) rb_json_escaped(&frame, faddr.buf, faddr.len);
+  free(faddr.buf);
+  free(wrap.buf);
+  rb_cstr(&frame, "}\n");
+  if (frame.oom || frame.buf == NULL) {
+    free(frame.buf);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+  }
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    free(frame.buf);
+    return diag_set(diag, STIGI_ERR_IO, errno, "peer reply socket failed");
+  }
+  struct sockaddr_un paddr;
+  memset(&paddr, 0, sizeof paddr);
+  paddr.sun_family = AF_UNIX;
+  size_t plen = strlen(peer_sock);
+  if (plen >= sizeof paddr.sun_path) {
+    (void)close(fd);
+    free(frame.buf);
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "peer socket path too long");
+  }
+  memcpy(paddr.sun_path, peer_sock, plen + 1U);
+  Status st = STIGI_OK;
+  if (connect(fd, (struct sockaddr *)&paddr, sizeof paddr) != 0) {
+    st = diag_set(diag, STIGI_ERR_IO, errno, "peer reply connect(%s) failed", peer_sock);
+  } else {
+    size_t off = 0;
+    while (off < frame.len) {
+      ssize_t nw = send(fd, frame.buf + off, frame.len - off, MSG_NOSIGNAL);
+      if (nw < 0) {
+        if (errno == EINTR) continue;
+        st = diag_set(diag, STIGI_ERR_IO, errno, "peer reply send failed");
+        break;
+      }
+      off += (size_t)nw;
+    }
+  }
+  (void)close(fd);
+  free(frame.buf);
+  return st;
+}
+
 Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_json, size_t len,
                                       char **out_reply, size_t *out_len, Diag *diag) {
   if (ctx == NULL || envelope_json == NULL || out_reply == NULL) {
@@ -1637,7 +1746,16 @@ Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_
   }
   char *body = NULL;
   size_t blen = 0;
-  JsonStatus bs = stigi_json_obj_get_string(envelope_json, len, "body", &body, &blen);
+  JsonStatus bs = JSON_NOT_FOUND;
+  /* 1. Claude Code / opencc / ircc msgV:1 nested `message.content` */
+  JsonSpan msg_obj = {NULL, 0};
+  if (stigi_json_obj_get_object(envelope_json, len, "message", &msg_obj) == JSON_OK) {
+    bs = stigi_json_obj_get_string(msg_obj.ptr, msg_obj.len, "content", &body, &blen);
+  }
+  /* 2. Flat `body` or `content` */
+  if (bs == JSON_NOT_FOUND) {
+    bs = stigi_json_obj_get_string(envelope_json, len, "body", &body, &blen);
+  }
   if (bs == JSON_NOT_FOUND) {
     bs = stigi_json_obj_get_string(envelope_json, len, "content", &body, &blen);
   }
@@ -1656,6 +1774,8 @@ Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_
       size_t rem = (size_t)((body + blen) - after);
       const char *close_tag = rfind_bytes(after, rem, "</cross-session-message>", 24U);
       if (close_tag != NULL && close_tag >= after) {
+        if (after < close_tag && *after == '\n') after++;
+        if (close_tag > after && close_tag[-1] == '\n') close_tag--;
         frame_ptr = after;
         frame_len = (size_t)(close_tag - after);
       }
@@ -1664,6 +1784,87 @@ Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_
   Status st = stigi_handle_frame(ctx, frame_ptr, frame_len, out_reply, out_len, diag);
   free(body);
   return st;
+}
+
+/* Register this cc-socks server in ~/.claude/sessions/<pid>.json (opencc registry/register.go) */
+Status stigi_cc_peer_register(const char *peer_name, const char *sock_path,
+                              char *out_reg_path, size_t reg_cap, Diag *diag) {
+  if (peer_name == NULL || sock_path == NULL || out_reg_path == NULL || reg_cap == 0) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_cc_peer_register: invalid args");
+  }
+  out_reg_path[0] = '\0';
+  const char *home = getenv("HOME");
+  if (home == NULL || home[0] == '\0') {
+    return diag_set(diag, STIGI_ERR_IO, -1, "HOME unset for cc-socks peer registration");
+  }
+  pid_t pid = getpid();
+  char stat_path[64];
+  (void)snprintf(stat_path, sizeof stat_path, "/proc/%ld/stat", (long)pid);
+  char proc_start[64] = "0";
+  FILE *sf = fopen(stat_path, "r");
+  if (sf != NULL) {
+    char sbuf[1024];
+    size_t sn = fread(sbuf, 1, sizeof sbuf - 1U, sf);
+    sbuf[sn] = '\0';
+    (void)fclose(sf);
+    char *rp = strrchr(sbuf, ')');
+    if (rp != NULL) {
+      char *p = rp + 1;
+      int field = 0;
+      while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        char *tok = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+        if (field == 19) {
+          size_t tl = (size_t)(p - tok);
+          if (tl >= sizeof proc_start) tl = sizeof proc_start - 1U;
+          memcpy(proc_start, tok, tl);
+          proc_start[tl] = '\0';
+          break;
+        }
+        field++;
+      }
+    }
+  }
+
+  char dir[512];
+  int dn = snprintf(dir, sizeof dir, "%s/.claude/sessions", home);
+  if (dn < 0 || (size_t)dn >= sizeof dir) return diag_set(diag, STIGI_ERR_INVALID, -1, "path too long");
+  (void)mkdir(dir, 0700);
+  int fn = snprintf(out_reg_path, reg_cap, "%s/%ld.json", dir, (long)pid);
+  if (fn < 0 || (size_t)fn >= reg_cap) return diag_set(diag, STIGI_ERR_INVALID, -1, "path too long");
+
+  char tmp_path[600];
+  int tn = snprintf(tmp_path, sizeof tmp_path, "%s/.%ld.json.tmp", dir, (long)pid);
+  if (tn < 0 || (size_t)tn >= sizeof tmp_path) return diag_set(diag, STIGI_ERR_INVALID, -1, "path too long");
+
+  ReplyBuf jb = {NULL, 0, 0, false};
+  rb_fmt(&jb, "{\"pid\":%ld,\"sessionId\":\"\",\"cwd\":\"\",\"name\":", (long)pid);
+  rb_json_escaped(&jb, peer_name, strlen(peer_name));
+  rb_cstr(&jb, ",\"kind\":\"bg\",\"status\":\"idle\",\"messagingSocketPath\":");
+  rb_json_escaped(&jb, sock_path, strlen(sock_path));
+  rb_fmt(&jb, ",\"peerProtocol\":1,\"peerFeatures\":[],\"procStart\":\"%s\",\"pidDomain\":\"\"}",
+         proc_start);
+  if (jb.oom || jb.buf == NULL) {
+    free(jb.buf);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+  }
+
+  FILE *tf = fopen(tmp_path, "wb");
+  if (tf == NULL) {
+    free(jb.buf);
+    return diag_set(diag, STIGI_ERR_IO, errno, "cannot create %s", tmp_path);
+  }
+  size_t nw = fwrite(jb.buf, 1, jb.len, tf);
+  int rc = fclose(tf);
+  free(jb.buf);
+  if (nw != jb.len || rc != 0 || rename(tmp_path, out_reg_path) != 0) {
+    (void)unlink(tmp_path);
+    out_reg_path[0] = '\0';
+    return diag_set(diag, STIGI_ERR_IO, errno, "failed writing peer registration");
+  }
+  return STIGI_OK;
 }
 
 /* ---- Core Unix socket server (mode 0600, SO_PEERCRED same-UID) ---- */
@@ -1838,7 +2039,24 @@ static Status serve_unix_loop(StigiServerCtx *ctx, const char *sock_path,
                        ? stigi_cc_socks_handle_envelope(ctx, req, rlen, &rep, &rep_len, diag)
                        : stigi_handle_frame(ctx, req, rlen, &rep, &rep_len, diag);
       if (hst == STIGI_OK && rep != NULL) {
-        (void)write_all_fd(cfd, rep, rep_len, diag);
+        bool sent_async = false;
+        if (cc_socks_mode) {
+          JsonSpan mv = {NULL, 0};
+          char *from_s = NULL;
+          size_t from_l = 0;
+          if (stigi_json_obj_get_raw(req, rlen, "msgV", &mv) == JSON_OK &&
+              stigi_json_obj_get_string(req, rlen, "from", &from_s, &from_l) == JSON_OK) {
+            char peer_sock[256];
+            if (decode_uds_peer_addr(from_s, from_l, peer_sock, sizeof peer_sock)) {
+              (void)send_cc_peer_reply(peer_sock, sock_path, rep, rep_len, diag);
+              sent_async = true;
+            }
+          }
+          free(from_s);
+        }
+        if (!sent_async) {
+          (void)write_all_fd(cfd, rep, rep_len, diag);
+        }
       } else {
         const char *emsg = "error frame processing failed\n";
         (void)write_all_fd(cfd, emsg, strlen(emsg), diag);

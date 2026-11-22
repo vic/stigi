@@ -945,9 +945,11 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
       if (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
           e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
         StigiStr cn = e->u.call.callee->u.ident.name;
-        if (str_eq_c(cn, "Stigi.Test.expect")) return ETY_I32;
+        if (str_eq_c(cn, "Stigi.Test.expect") || str_eq_c(cn, "I32.ofU64")) return ETY_I32;
+        if (str_eq_c(cn, "I64.ofU64")) return ETY_I64;
         if (str_eq_c(cn, "U8.ofU64")) return ETY_U8;
         if (str_eq_c(cn, "U32.ofU64") || str_eq_c(cn, "U32.wrappingAdd") ||
+            str_eq_c(cn, "U32.wrappingSubtract") ||
             str_eq_c(cn, "U32.wrappingMultiply") || str_eq_c(cn, "U32.rotateRight") ||
             str_eq_c(cn, "U32.bitwiseXor") || str_eq_c(cn, "U32.bitwiseAnd") ||
             str_eq_c(cn, "U32.bitwiseOr") || str_eq_c(cn, "U32.shiftLeft") ||
@@ -955,10 +957,12 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
           return ETY_U32;
         }
         if (str_eq_c(cn, "U64.ofU8") || str_eq_c(cn, "U64.ofU32") ||
-            str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.bitwiseAnd") ||
+            str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.ofI32") ||
+            str_eq_c(cn, "U64.bitwiseAnd") ||
             str_eq_c(cn, "U64.bitwiseOr") || str_eq_c(cn, "U64.bitwiseXor") ||
             str_eq_c(cn, "U64.shiftLeft") || str_eq_c(cn, "U64.shiftRight") ||
-            str_eq_c(cn, "U64.wrappingAdd") || str_eq_c(cn, "U64.wrappingMultiply") ||
+            str_eq_c(cn, "U64.wrappingAdd") || str_eq_c(cn, "U64.wrappingSubtract") ||
+            str_eq_c(cn, "U64.wrappingMultiply") ||
             str_eq_c(cn, "U64.mix")) {
           return ETY_U64;
         }
@@ -2894,11 +2898,20 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
         if (str_eq_c(cn, "U64.ofI64") && e->u.call.arg_count == 1) {
           eb_cstr(ctx->b, "((uint64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_I64); eb_cstr(ctx->b, "))"); break;
         }
+        if (str_eq_c(cn, "U64.ofI32") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_I32); eb_cstr(ctx->b, "))"); break;
+        }
         if (str_eq_c(cn, "U8.ofU64") && e->u.call.arg_count == 1) {
           eb_cstr(ctx->b, "((uint8_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
         }
         if (str_eq_c(cn, "U32.ofU64") && e->u.call.arg_count == 1) {
           eb_cstr(ctx->b, "((uint32_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "I64.ofU64") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((int64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "I32.ofU64") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((int32_t)(uint32_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
         }
         if (str_eq_c(cn, "U64.mix") && e->u.call.arg_count == 1) {
           eb_cstr(ctx->b, "stigi_u64_mix("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, ")"); break;
@@ -2912,6 +2925,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
           else if (str_eq_c(cn, "U64.shiftLeft")) { bop = "<<"; bty = ETY_U64; }
           else if (str_eq_c(cn, "U64.shiftRight")) { bop = ">>"; bty = ETY_U64; }
           else if (str_eq_c(cn, "U64.wrappingAdd")) { bop = "+"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.wrappingSubtract")) { bop = "-"; bty = ETY_U64; }
           else if (str_eq_c(cn, "U64.wrappingMultiply")) { bop = "*"; bty = ETY_U64; }
           else if (str_eq_c(cn, "U32.bitwiseAnd")) { bop = "&"; bty = ETY_U32; }
           else if (str_eq_c(cn, "U32.bitwiseOr")) { bop = "|"; bty = ETY_U32; }
@@ -2919,6 +2933,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
           else if (str_eq_c(cn, "U32.shiftLeft")) { bop = "<<"; bty = ETY_U32; }
           else if (str_eq_c(cn, "U32.shiftRight")) { bop = ">>"; bty = ETY_U32; }
           else if (str_eq_c(cn, "U32.wrappingAdd")) { bop = "+"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.wrappingSubtract")) { bop = "-"; bty = ETY_U32; }
           else if (str_eq_c(cn, "U32.wrappingMultiply")) { bop = "*"; bty = ETY_U32; }
           if (bop != NULL) {
             eb_cstr(ctx->b, "((");
@@ -3908,6 +3923,16 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
   EmitBuf b;
   memset(&b, 0, sizeof b);
 
+  bool need_posix_headers = false;
+  for (uint32_t i = 0; i < scnt; i++) {
+    const StigiDecl *d = sorted[i].u->ast->decl;
+    if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val &&
+        d->u.extern_decl.body == NULL) {
+      need_posix_headers = true;
+      break;
+    }
+  }
+
   /* Portable ISO C11 preamble + S118 runtime + X22-g Spectre barrier mask (ZERO abort/exit/builtins) */
   eb_cstr(&b,
           "#define _GNU_SOURCE\n"
@@ -3917,6 +3942,14 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
           "#include <signal.h>\n"
           "#include <sys/mman.h>\n"
           "#include <unistd.h>\n");
+  if (need_posix_headers) {
+    eb_cstr(&b,
+            "#include <fcntl.h>\n"
+            "#include <sys/socket.h>\n"
+            "#include <sys/un.h>\n"
+            "#include <sys/resource.h>\n"
+            "#include <time.h>\n");
+  }
   if (need_alloc) eb_cstr(&b, "#include <stdlib.h>\n#include <string.h>\n");
   eb_cstr(&b,
           "\n"
@@ -4112,25 +4145,35 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
   }
   free(enum_needs_eq);
 
-  /* 1b. Emit body-less extern C declarations */
+  /* 1b. Emit body-less extern C declarations (skip standard POSIX symbols already declared by headers) */
   for (uint32_t i = 0; i < scnt; i++) {
     const StigiImageUnit *u = sorted[i].u;
     const StigiDecl *d = u->ast->decl;
     if (d->kind != STIGI_DECL_EXTERN) continue;
+    StigiStr csym = extern_c_sym(d->name);
     if (d->u.extern_decl.is_val) {
       eb_line_dir(&b, d->span.line, u->name, u->name_len);
       eb_cstr(&b, "extern ");
       emit_c_type(&b, img, u->idx, d->u.extern_decl.val_type, 0);
       eb_cstr(&b, " ");
-      eb_str(&b, extern_c_sym(d->name));
+      eb_str(&b, csym);
       eb_cstr(&b, ";\n");
     } else if (d->u.extern_decl.body == NULL) {
+      if (str_eq_c(csym, "openat") || str_eq_c(csym, "read") || str_eq_c(csym, "write") ||
+          str_eq_c(csym, "close") || str_eq_c(csym, "lseek") || str_eq_c(csym, "socket") ||
+          str_eq_c(csym, "bind") || str_eq_c(csym, "listen") || str_eq_c(csym, "accept") ||
+          str_eq_c(csym, "unlink") || str_eq_c(csym, "mmap") || str_eq_c(csym, "munmap") ||
+          str_eq_c(csym, "mprotect") || str_eq_c(csym, "madvise") || str_eq_c(csym, "mlockall") ||
+          str_eq_c(csym, "sigaction") || str_eq_c(csym, "getrusage") ||
+          str_eq_c(csym, "clock_gettime")) {
+        continue;
+      }
       const StigiDefHead *eh = &d->u.extern_decl.head;
       eb_line_dir(&b, d->span.line, u->name, u->name_len);
       eb_cstr(&b, "extern ");
       emit_c_type(&b, img, u->idx, eh->ret_type, 0);
       eb_cstr(&b, " ");
-      eb_str(&b, extern_c_sym(d->name));
+      eb_str(&b, csym);
       eb_cstr(&b, "(");
       if (eh->param_count == 0) {
         eb_cstr(&b, "void");
