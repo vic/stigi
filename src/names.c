@@ -2901,8 +2901,11 @@ static bool is_builtin_name(const char *s, size_t len) {
     "U32.wrappingAdd", "U32.wrappingSubtract", "U32.wrappingMultiply", "U32.rotateRight",
     "U32.bitwiseAnd", "U32.bitwiseOr", "U32.bitwiseXor", "U32.shiftLeft", "U32.shiftRight",
     "below", "lessOrEqual", "at", "valid", "overwrites", "decreases", "outlives",
+    "externStack", "stackBytes", "borrows", "consumes", "resultFresh", "externSummary",
     "Stigi.Facts.below", "Stigi.Facts.lessOrEqual", "Stigi.Facts.overwrites",
     "Stigi.Facts.at", "Stigi.Facts.outlives", "Stigi.Facts.decreases",
+    "Stigi.Facts.externStack", "Stigi.Facts.borrows", "Stigi.Facts.consumes",
+    "Stigi.Facts.resultFresh", "Stigi.Facts.externSummary",
     "Stigi.Gate.cleared", "Stigi.Gate.owes", "Stigi.Gate.reject",
     "Stigi.Raw.isMapFailed", "Stigi.Raw.nullPtr"
   };

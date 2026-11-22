@@ -1564,7 +1564,7 @@ static void emit_alloc_match(EmitCtx *ctx, const StigiExpr *e, int akind,
       eb_fmt(ctx->b, " *)stigi_rt_try_alloc(_cap%u, sizeof(", sid);
       eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
       eb_fmt(ctx->b, "));\n  if (_arr%u != NULL) {\n#else\n  %s",
-             sid, stack_bytes >= 64ULL ? "_Alignas(64) " : "");
+             sid, stack_bytes >= 64ULL ? "_Alignas(64) " : (stack_bytes >= 16ULL ? "_Alignas(16) " : ""));
       eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
       eb_fmt(ctx->b, " _sarr%u[%llu];\n  ", sid, (unsigned long long)stack_n);
       eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
@@ -3084,9 +3084,33 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       } else {
         emit_expr_typed(ctx, e->u.call.callee, ETY_UNKNOWN);
       }
+      const char *posix_cast = NULL;
+      StigiStr ext_sym = (tgt >= 0 && callee_is_bodyless_extern) ? extern_c_sym(callee_d->name)
+                                                                  : (StigiStr){NULL, 0};
       eb_cstr(ctx->b, "(");
       for (uint32_t i = 0; i < argc; i++) {
         if (i > 0) eb_cstr(ctx->b, ", ");
+        posix_cast = NULL;
+        if (callee_is_bodyless_extern) {
+          if (str_eq_c(ext_sym, "openat") && i == 1) posix_cast = "(const char *)";
+          else if (str_eq_c(ext_sym, "unlink") && i == 0) posix_cast = "(const char *)";
+          else if (str_eq_c(ext_sym, "getrusage") && i == 1) posix_cast = "(struct rusage *)(void *)";
+          else if (str_eq_c(ext_sym, "clock_gettime") && i == 0) posix_cast = "(clockid_t)";
+          else if (str_eq_c(ext_sym, "clock_gettime") && i == 1) posix_cast = "(struct timespec *)(void *)";
+          else if (str_eq_c(ext_sym, "bind") && i == 1) posix_cast = "(const struct sockaddr *)(void *)";
+          else if (str_eq_c(ext_sym, "bind") && i == 2) posix_cast = "(socklen_t)";
+          else if (str_eq_c(ext_sym, "accept") && i == 1) posix_cast = "(struct sockaddr *)(void *)";
+          else if (str_eq_c(ext_sym, "accept") && i == 2) posix_cast = "(socklen_t *)(void *)";
+          else if (str_eq_c(ext_sym, "read") && i == 1) posix_cast = "(void *)";
+          else if (str_eq_c(ext_sym, "read") && i == 2) posix_cast = "(size_t)";
+          else if (str_eq_c(ext_sym, "write") && i == 1) posix_cast = "(const void *)";
+          else if (str_eq_c(ext_sym, "write") && i == 2) posix_cast = "(size_t)";
+          else if (str_eq_c(ext_sym, "lseek") && i == 1) posix_cast = "(off_t)";
+        }
+        if (posix_cast != NULL) {
+          eb_cstr(ctx->b, posix_cast);
+          eb_cstr(ctx->b, "(");
+        }
         if (hoisted) {
           eb_fmt(ctx->b, "_a%u", tids[i]);
         } else {
@@ -3111,6 +3135,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
               eb_cstr(ctx->b, "[");
               emit_expr_typed(ctx, arg->u.call.args[0], ETY_U64);
               eb_cstr(ctx->b, "])");
+              if (posix_cast != NULL) eb_cstr(ctx->b, ")");
               continue;
             }
           }
@@ -3120,11 +3145,13 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
             eb_cstr(ctx->b, ")[");
             emit_expr_typed(ctx, arg->u.index_expr.index, ETY_U64);
             eb_cstr(ctx->b, "])");
+            if (posix_cast != NULL) eb_cstr(ctx->b, ")");
             continue;
           }
           EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, puidx, pty, 0) : ETY_UNKNOWN;
           emit_expr_typed(ctx, arg, ph);
         }
+        if (posix_cast != NULL) eb_cstr(ctx->b, ")");
       }
       eb_cstr(ctx->b, ")");
       free(tids);

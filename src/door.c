@@ -459,7 +459,7 @@ static Status compile_image_rules(const StigiDoor *door, const StigiImage *cand,
 
   DlBuf db = {NULL, 0, 0, false};
   db_mem(&db, door->base_rules_dl, door->base_rules_dl_len);
-  db_cstr(&db, "\n// ---- in-image relations and rules ----\n");
+  db_cstr(&db, "\n");
 
   /* 1. Emit .decl + .input for in-image relations not already in schema.dl */
   for (uint32_t i = 0; i < cand->unit_count && !db.oom; i++) {
