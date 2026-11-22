@@ -3,6 +3,7 @@
 #include "common.h"
 #include "datalog.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,36 @@ static void test_blake3(void) {
   to_hex(h, hex);
   check(strcmp(hex, "a012abdd339b966bfbf116187ba42db7a6aea0ca9d47219b0f88efdf99cd1b2e") == 0,
         "blake3(3000 * 'a') matches b3sum");
+
+  /* Multi-chunk Merkle tree >= 8192B vectors verified against b3sum */
+  uint8_t *big = malloc(65536);
+  check(big != NULL, "blake3 big malloc");
+  if (big != NULL) {
+    memset(big, 'a', 65536);
+    blake3_hash(big, 8192, h);
+    to_hex(h, hex);
+    check(strcmp(hex, "4b6d9ef12ab5a1ab11e7441f0460fb4fc7e03e5dfe75a37dec5c43fabbb03b6e") == 0,
+          "blake3(8192 * 'a') matches b3sum");
+
+    blake3_hash(big, 10240, h);
+    to_hex(h, hex);
+    check(strcmp(hex, "9afd0ba102b2cc68be10ba4d383b3139b97ed36d425b82631a7a1e2424088f7e") == 0,
+          "blake3(10240 * 'a') matches b3sum");
+
+    blake3_hash(big, 65536, h);
+    to_hex(h, hex);
+    check(strcmp(hex, "028712f89696339b8c9ecbb821977d434235d8ae98821d29094933439b2b402b") == 0,
+          "blake3(65536 * 'a') matches b3sum");
+    free(big);
+  }
+
+  /* NULL with len > 0 must not silently hash zeros as a valid message */
+  uint8_t h_null[32], h_zero[32];
+  uint8_t zeros[16];
+  memset(zeros, 0, sizeof zeros);
+  blake3_hash(NULL, 16, h_null);
+  blake3_hash(zeros, 16, h_zero);
+  check(memcmp(h_null, h_zero, 32) != 0, "blake3(NULL, 16) does not hash fake zeros");
 }
 
 static void test_arena_and_intern(void) {
@@ -97,9 +128,15 @@ static void test_arena_and_intern(void) {
   arena_reset(&a);
   void *p3 = arena_alloc(&a, 64);
   check(p3 != NULL, "arena_alloc after reset");
+  ArenaBlock *cur_before_big = a.cur;
   void *big = arena_alloc(&a, 128U * 1024U);
   check(big != NULL, "arena_alloc oversized block");
+  check(a.cur == cur_before_big, "oversized block does not abandon free space in a.cur");
   memset(big, 0x33, 128U * 1024U);
+  void *s1 = arena_alloc_aligned(&a, 5, 1);
+  void *s2 = arena_alloc_aligned(&a, 5, 1);
+  check(s1 != NULL && s2 != NULL && (uintptr_t)s2 - (uintptr_t)s1 == 5U,
+        "arena_alloc_aligned(..., 1) packs without 16-byte waste");
   arena_free(&a);
 
   InternPool pool;
@@ -137,21 +174,19 @@ static void test_arena_and_intern(void) {
 
 static void test_dl_u64_bounds(void) {
   static const char *PROG =
-      ".decl check_add(name: symbol, delta_from_max: number, k: number)\n"
+      ".decl check_add(name: symbol, base: number, k: number, limit: number)\n"
       ".input check_add\n"
-      ".decl u64_limit(m: number)\n"
-      "u64_limit(18446744073709551615).\n"
-      ".decl ok(name: symbol)\n"
+      ".decl ok(name: symbol, sum: number)\n"
       ".output ok\n"
-      ".decl overflow(name: symbol)\n"
+      ".decl overflow(name: symbol, sum: number)\n"
       ".output overflow\n"
-      "ok(name) :- check_add(name, d, k), u64_limit(m), d >= 0, k >= 0, (m - d) + k <= m.\n"
-      "overflow(name) :- check_add(name, d, k), u64_limit(m), (d < 0 ; k < 0 ; (m - d) + k > m).\n";
+      "ok(name, s) :- check_add(name, b, k, lim), s = b + k, s <= lim.\n"
+      "overflow(name, s) :- check_add(name, b, k, lim), s = b + k, s > lim.\n";
 
   StigiDl dl;
   Diag diag;
-  check(stigi_dl_open(&dl, PROG, strlen(PROG), "u64_bounds.dl", 10000, 1, &diag) == STIGI_OK,
-        "stigi_dl_open u64_bounds");
+  check(stigi_dl_open_ex(&dl, PROG, strlen(PROG), "u64_bounds.dl", 10000, 1, 1, &diag) == STIGI_OK,
+        "stigi_dl_open_ex u64_bounds with provenance");
   if (dl.sess == NULL) return;
 
   int rel_in = stigi_dl_rel_id(&dl, "check_add");
@@ -159,26 +194,110 @@ static void test_dl_u64_bounds(void) {
   int rel_ov = stigi_dl_rel_id(&dl, "overflow");
   check(rel_in >= 0 && rel_ok >= 0 && rel_ov >= 0, "u64_bounds rel ids");
 
-  uint32_t s_exact = 0, s_over = 0, s_max1 = 0;
+  uint32_t s_exact = 0, s_over = 0, s_max1 = 0, s_neg = 0;
   check(stigi_dl_intern(&dl, "exact_max", 9, &s_exact, &diag) == STIGI_OK, "intern exact_max");
   check(stigi_dl_intern(&dl, "over_max", 8, &s_over, &diag) == STIGI_OK, "intern over_max");
   check(stigi_dl_intern(&dl, "at_max_plus_1", 13, &s_max1, &diag) == STIGI_OK, "intern at_max_plus_1");
+  check(stigi_dl_intern(&dl, "i64_min_ok", 10, &s_neg, &diag) == STIGI_OK, "intern i64_min_ok");
 
-  int64_t r1[3] = { (int64_t)s_exact, 1, 1 };
-  int64_t r2[3] = { (int64_t)s_over, 1, 2 };
-  int64_t r3[3] = { (int64_t)s_max1, 0, 1 };
-  check(stigi_dl_add(&dl, rel_in, r1, 3, &diag) == STIGI_OK, "add exact_max");
-  check(stigi_dl_add(&dl, rel_in, r2, 3, &diag) == STIGI_OK, "add over_max");
-  check(stigi_dl_add(&dl, rel_in, r3, 3, &diag) == STIGI_OK, "add at_max_plus_1");
+  TupuI128 lim_u64 = tupu_i128_from_u64(UINT64_MAX);
+  TupuI128 r1[4] = { tupu_i128_from_u64(s_exact), tupu_i128_from_u64(UINT64_MAX - 1ULL), tupu_i128_from_u64(1), lim_u64 };
+  TupuI128 r2[4] = { tupu_i128_from_u64(s_over), tupu_i128_from_u64(UINT64_MAX - 1ULL), tupu_i128_from_u64(2), lim_u64 };
+  TupuI128 r3[4] = { tupu_i128_from_u64(s_max1), tupu_i128_from_u64(UINT64_MAX), tupu_i128_from_u64(1), lim_u64 };
+  TupuI128 r4[4] = { tupu_i128_from_u64(s_neg), tupu_i128_from_i64(INT64_MIN), tupu_i128_from_i64(0), tupu_i128_from_i64(0) };
 
-  check(stigi_dl_eval(&dl, &diag) == STIGI_OK, "eval u64_bounds");
-  check(stigi_dl_count(&dl, rel_ok) == 1, "u64_bounds ok count == 1");
+  check(stigi_dl_add_i128(&dl, rel_in, r1, 4, &diag) == STIGI_OK, "add_i128 exact_max");
+  check(stigi_dl_add_i128(&dl, rel_in, r2, 4, &diag) == STIGI_OK, "add_i128 over_max");
+  check(stigi_dl_add_i128(&dl, rel_in, r3, 4, &diag) == STIGI_OK, "add_i128 at_max_plus_1");
+  check(stigi_dl_add_i128(&dl, rel_in, r4, 4, &diag) == STIGI_OK, "add_i128 i64_min_ok");
+
+  check(stigi_dl_eval(&dl, &diag) == STIGI_OK, "eval u64_bounds i128");
+  check(stigi_dl_replay(&dl, &diag) == STIGI_OK, "O6 provenance replay passes");
+  check(stigi_dl_count(&dl, rel_ok) == 2, "u64_bounds ok count == 2");
   check(stigi_dl_count(&dl, rel_ov) == 2, "u64_bounds overflow count == 2");
 
-  int64_t out_row[1] = { -1 };
-  check(stigi_dl_read(&dl, rel_ok, 0, out_row, 1, &diag) == STIGI_OK && out_row[0] == (int64_t)s_exact,
-        "u64_bounds ok row == exact_max");
+  bool saw_u64_max = false, saw_i64_min = false, saw_2p64 = false;
+  for (uint32_t i = 0; i < stigi_dl_count(&dl, rel_ok); i++) {
+    TupuI128 row[2];
+    check(stigi_dl_read_i128(&dl, rel_ok, i, row, 2, &diag) == STIGI_OK, "read_i128 ok");
+    if (row[0].lo == s_exact && row[1].hi == 0 && row[1].lo == UINT64_MAX) saw_u64_max = true;
+    if (row[0].lo == s_neg && row[1].hi == -1 && row[1].lo == (uint64_t)INT64_MIN) saw_i64_min = true;
+  }
+  for (uint32_t i = 0; i < stigi_dl_count(&dl, rel_ov); i++) {
+    TupuI128 row[2];
+    check(stigi_dl_read_i128(&dl, rel_ov, i, row, 2, &diag) == STIGI_OK, "read_i128 overflow");
+    if (row[0].lo == s_max1 && row[1].hi == 1 && row[1].lo == 0ULL) saw_2p64 = true;
+  }
+  check(saw_u64_max, "exact U64_MAX round-tripped via TupuI128");
+  check(saw_i64_min, "exact I64_MIN round-tripped via TupuI128");
+  check(saw_2p64, "exact 2^64 (hi=1, lo=0) computed without 64-bit wrap");
   stigi_dl_close(&dl);
+}
+
+static void test_dl_refusals_and_parallel(void) {
+  Diag diag;
+  StigiDl dl;
+
+  /* 1. rule-unsafe */
+  const char *unsafe_prog =
+      ".decl a(x: number)\n.input a\n.decl b(x: number, y: number)\n.output b\n"
+      "b(x, y) :- a(x).\n";
+  Status st = stigi_dl_open(&dl, unsafe_prog, strlen(unsafe_prog), "unsafe.dl", 1000, 1, &diag);
+  check(st == STIGI_ERR_DATALOG && diag.dl_code == TUPU_CODE_RULE_UNSAFE,
+        "rule-unsafe returns TUPU_CODE_RULE_UNSAFE");
+
+  /* 2. negation-cycle */
+  const char *neg_prog =
+      ".decl base(x: number)\n.input base\n"
+      ".decl p(x: number)\n.decl q(x: number)\n.output p\n"
+      "p(x) :- base(x), !q(x).\n"
+      "q(x) :- base(x), !p(x).\n";
+  st = stigi_dl_open(&dl, neg_prog, strlen(neg_prog), "neg.dl", 1000, 1, &diag);
+  check(st == STIGI_ERR_DATALOG && diag.dl_code == TUPU_CODE_NEGATION_CYCLE,
+        "negation-cycle returns TUPU_CODE_NEGATION_CYCLE");
+
+  /* 3. datalog-arith (128-bit overflow) */
+  const char *arith_prog =
+      ".decl seed(x: number)\n.input seed\n"
+      ".decl big(x: number)\n.output big\n"
+      "big(y) :- seed(x), y = x + x.\n";
+  check(stigi_dl_open(&dl, arith_prog, strlen(arith_prog), "arith.dl", 1000, 1, &diag) == STIGI_OK,
+        "open arith_ov");
+  if (dl.sess != NULL) {
+    int rel_s = stigi_dl_rel_id(&dl, "seed");
+    TupuI128 max128 = { UINT64_MAX, INT64_MAX };
+    check(stigi_dl_add_i128(&dl, rel_s, &max128, 1, &diag) == STIGI_OK, "add I128_MAX");
+    st = stigi_dl_eval(&dl, &diag);
+    check(st == STIGI_ERR_DATALOG && diag.dl_code == TUPU_CODE_DATALOG_ARITH,
+          "128-bit overflow returns TUPU_CODE_DATALOG_ARITH");
+    stigi_dl_close(&dl);
+  }
+
+  /* 4. Multi-threaded determinism (S80): nthreads=4 matches nthreads=1 */
+  const char *tc_prog =
+      ".decl edge(x: number, y: number)\n.input edge\n"
+      ".decl tc(x: number, y: number)\n.output tc\n"
+      "tc(x, y) :- edge(x, y).\n"
+      "tc(x, z) :- tc(x, y), edge(y, z).\n";
+  StigiDl dl1, dl4;
+  check(stigi_dl_open(&dl1, tc_prog, strlen(tc_prog), "tc1.dl", 1000000, 1, &diag) == STIGI_OK, "open tc1");
+  check(stigi_dl_open(&dl4, tc_prog, strlen(tc_prog), "tc4.dl", 1000000, 4, &diag) == STIGI_OK, "open tc4");
+  if (dl1.sess != NULL && dl4.sess != NULL) {
+    int e1 = stigi_dl_rel_id(&dl1, "edge"), t1 = stigi_dl_rel_id(&dl1, "tc");
+    int e4 = stigi_dl_rel_id(&dl4, "edge"), t4 = stigi_dl_rel_id(&dl4, "tc");
+    for (int i = 0; i < 60; i++) {
+      int64_t row[2] = { i, i + 1 };
+      (void)stigi_dl_add(&dl1, e1, row, 2, &diag);
+      (void)stigi_dl_add(&dl4, e4, row, 2, &diag);
+    }
+    check(stigi_dl_eval(&dl1, &diag) == STIGI_OK, "eval tc1");
+    check(stigi_dl_eval(&dl4, &diag) == STIGI_OK, "eval tc4");
+    uint32_t c1 = stigi_dl_count(&dl1, t1);
+    uint32_t c4 = stigi_dl_count(&dl4, t4);
+    check(c1 == 1830U && c1 == c4, "S80 nthreads=4 count matches nthreads=1 (1830)");
+  }
+  stigi_dl_close(&dl1);
+  stigi_dl_close(&dl4);
 }
 
 static const char *TC_PROG =
@@ -232,6 +351,9 @@ static void test_dl_1000_frames(void) {
   long delta = (rss_f10 >= 0 && rss_f1000 >= 0) ? (rss_f1000 - rss_f10) : 0L;
   printf("c1_test 1000_frames wall=%.2fms rss_f10=%ldKB rss_f1000=%ldKB rss_delta=%ldKB\n",
          ms, rss_f10, rss_f1000, delta);
+#if !defined(__SANITIZE_ADDRESS__)
+  check(delta <= 64L, "1000_frames RSS flat (<= 64 KB)");
+#endif
   stigi_dl_close(&dl);
 }
 
@@ -263,6 +385,7 @@ int main(void) {
   test_blake3();
   test_arena_and_intern();
   test_dl_u64_bounds();
+  test_dl_refusals_and_parallel();
   test_dl_1000_frames();
   test_dl_budget_refusal();
   printf("c1_test failures=%d\n", g_fails);

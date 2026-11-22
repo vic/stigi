@@ -25,10 +25,9 @@ void diag_clear(Diag *d);
 Status diag_set(Diag *d, Status code, int dl_code, const char *fmt, ...);
 
 typedef struct ArenaBlock {
-  struct ArenaBlock *next;
+  _Alignas(max_align_t) struct ArenaBlock *next;
   size_t cap;
   size_t used;
-  max_align_t align_pad;
 } ArenaBlock;
 
 typedef struct {
@@ -38,11 +37,13 @@ typedef struct {
 
 #define arena_init stigi_arena_init
 #define arena_alloc stigi_arena_alloc
+#define arena_alloc_aligned stigi_arena_alloc_aligned
 #define arena_reset stigi_arena_reset
 #define arena_free stigi_arena_free
 
 void arena_init(Arena *a);
 void *arena_alloc(Arena *a, size_t size);
+void *arena_alloc_aligned(Arena *a, size_t size, size_t align);
 void arena_reset(Arena *a);
 void arena_free(Arena *a);
 

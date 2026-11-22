@@ -73,6 +73,8 @@ static StigiTokKind classify_word(const char *s, uint32_t n) {
       if (memcmp(s, "catch", 5) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "async", 5) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "await", 5) == 0) return TOK_NOT_IN_LANG;
+      if (memcmp(s, "break", 5) == 0) return TOK_NOT_IN_LANG;
+      if (memcmp(s, "macro", 5) == 0) return TOK_NOT_IN_LANG;
       return TOK_IDENT;
     case 6:
       if (memcmp(s, "extern", 6) == 0) return TOK_KW_EXTERN;
@@ -83,12 +85,15 @@ static StigiTokKind classify_word(const char *s, uint32_t n) {
       if (memcmp(s, "unsafe", 6) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "resume", 6) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "opaque", 6) == 0) return TOK_NOT_IN_LANG;
+      if (memcmp(s, "lambda", 6) == 0) return TOK_NOT_IN_LANG;
+      if (memcmp(s, "module", 6) == 0) return TOK_NOT_IN_LANG;
       return TOK_IDENT;
     case 7:
       if (memcmp(s, "handler", 7) == 0) return TOK_KW_HANDLER;
       return TOK_IDENT;
     case 8:
       if (memcmp(s, "relation", 8) == 0) return TOK_KW_RELATION;
+      if (memcmp(s, "continue", 8) == 0) return TOK_NOT_IN_LANG;
       return TOK_IDENT;
     case 10:
       if (memcmp(s, "capability", 10) == 0) return TOK_KW_CAPABILITY;
@@ -174,19 +179,33 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
     return make_tok(TOK_COMMENT, s, start, p, line, col);
   }
 
-  /* Underscore */
-  if (c == '_' && (p + 1 >= n || !is_ident_cont((unsigned char)s[p + 1]))) {
-    lex->pos = p + 1;
-    lex->col++;
-    return make_tok(TOK_UNDERSCORE, s, start, p + 1, line, col);
+  /* Underscore: standalone '_' only; leading '_' in identifier is invalid */
+  if (c == '_') {
+    if (p + 1 >= n || !is_ident_cont((unsigned char)s[p + 1])) {
+      lex->pos = p + 1;
+      lex->col++;
+      return make_tok(TOK_UNDERSCORE, s, start, p + 1, line, col);
+    }
+    p++;
+    while (p < n && is_ident_cont((unsigned char)s[p])) p++;
+    lex->pos = p;
+    lex->col += (uint32_t)(p - start);
+    lex->err_msg = "identifier cannot start with '_'";
+    return make_tok(TOK_ERROR, s, start, p, line, col);
   }
 
-  /* Identifier, dotted name, or keyword */
-  if (is_ascii_alpha(c) || c == '_') {
+  /* Identifier, dotted name, keyword, or string interpolation s"..." */
+  if (is_ascii_alpha(c)) {
     p++;
     bool has_dot = false;
     while (p < n && is_ident_cont((unsigned char)s[p])) {
       p++;
+    }
+    if (s[p - 1] == '_') {
+      lex->pos = p;
+      lex->col += (uint32_t)(p - start);
+      lex->err_msg = "identifier cannot end with '_'";
+      return make_tok(TOK_ERROR, s, start, p, line, col);
     }
     while (p + 1 < n && s[p] == '.' && is_ascii_alpha((unsigned char)s[p + 1])) {
       has_dot = true;
@@ -194,11 +213,28 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       while (p < n && is_ident_cont((unsigned char)s[p])) {
         p++;
       }
+      if (s[p - 1] == '_') {
+        lex->pos = p;
+        lex->col += (uint32_t)(p - start);
+        lex->err_msg = "identifier cannot end with '_'";
+        return make_tok(TOK_ERROR, s, start, p, line, col);
+      }
     }
     uint32_t tok_len = (uint32_t)(p - start);
+    StigiTokKind kind = has_dot ? TOK_IDENT : classify_word(s + start, tok_len);
+    if (!has_dot && kind == TOK_IDENT && p < n && s[p] == '"') {
+      p++;
+      while (p < n && s[p] != '"' && s[p] != '\n' && s[p] != '\r') {
+        if (s[p] == '\\' && p + 1 < n && s[p + 1] != '\n' && s[p + 1] != '\r') p += 2;
+        else p++;
+      }
+      if (p < n && s[p] == '"') p++;
+      lex->pos = p;
+      lex->col += (uint32_t)(p - start);
+      return make_tok(TOK_STR_INTERP, s, start, p, line, col);
+    }
     lex->pos = p;
     lex->col += tok_len;
-    StigiTokKind kind = has_dot ? TOK_IDENT : classify_word(s + start, tok_len);
     return make_tok(kind, s, start, p, line, col);
   }
 
@@ -214,6 +250,13 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       }
       while (p < n && is_ascii_hex((unsigned char)s[p])) {
         p++;
+      }
+      if (p < n && (is_ascii_alpha((unsigned char)s[p]) || s[p] == '_')) {
+        while (p < n && is_ident_cont((unsigned char)s[p])) p++;
+        lex->pos = p;
+        lex->col += (uint32_t)(p - start);
+        lex->err_msg = "invalid hex integer literal suffix";
+        return make_tok(TOK_ERROR, s, start, p, line, col);
       }
       lex->pos = p;
       lex->col += (uint32_t)(p - start);
@@ -232,19 +275,38 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       lex->col += (uint32_t)(p - start);
       return make_tok(TOK_FLOAT, s, start, p, line, col);
     }
+    if (p < n && (is_ascii_alpha((unsigned char)s[p]) || s[p] == '_')) {
+      while (p < n && is_ident_cont((unsigned char)s[p])) p++;
+      lex->pos = p;
+      lex->col += (uint32_t)(p - start);
+      lex->err_msg = "invalid integer literal suffix";
+      return make_tok(TOK_ERROR, s, start, p, line, col);
+    }
     lex->pos = p;
     lex->col += (uint32_t)(p - start);
     return make_tok(TOK_INT, s, start, p, line, col);
   }
 
-  /* String literal */
+  /* String literal (language.md 1: escapes \n \t \\ \" \' \0 \xHH only; no raw control chars) */
   if (c == '"') {
     p++;
     while (p < n && s[p] != '"' && s[p] != '\n' && s[p] != '\r') {
+      if ((unsigned char)s[p] < 0x20U) {
+        lex->pos = p + 1;
+        lex->col += (uint32_t)(lex->pos - start);
+        lex->err_msg = "unescaped control character in string literal";
+        return make_tok(TOK_ERROR, s, start, lex->pos, line, col);
+      }
       if (s[p] == '\\') {
         p++;
-        if (p >= n) break;
-        if (s[p] == 'x') {
+        if (p >= n || s[p] == '\n' || s[p] == '\r') {
+          lex->pos = p;
+          lex->col += (uint32_t)(p - start);
+          lex->err_msg = "unterminated escape in string literal";
+          return make_tok(TOK_ERROR, s, start, p, line, col);
+        }
+        char esc = s[p];
+        if (esc == 'x') {
           if (p + 2 >= n || !is_ascii_hex((unsigned char)s[p + 1]) ||
               !is_ascii_hex((unsigned char)s[p + 2])) {
             lex->pos = p + 1;
@@ -255,8 +317,14 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
           p += 3;
           continue;
         }
-        p++;
-        continue;
+        if (esc == 'n' || esc == 't' || esc == '\\' || esc == '"' || esc == '\'' || esc == '0') {
+          p++;
+          continue;
+        }
+        lex->pos = p + 1;
+        lex->col += (uint32_t)(lex->pos - start);
+        lex->err_msg = "invalid escape sequence in string literal";
+        return make_tok(TOK_ERROR, s, start, lex->pos, line, col);
       }
       p++;
     }
@@ -275,7 +343,7 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
   /* Byte (char) literal */
   if (c == '\'') {
     p++;
-    if (p >= n || s[p] == '\n' || s[p] == '\r' || s[p] == '\'') {
+    if (p >= n || s[p] == '\n' || s[p] == '\r' || s[p] == '\'' || (unsigned char)s[p] < 0x20U) {
       lex->pos = p;
       lex->col += (uint32_t)(p - start);
       lex->err_msg = "invalid byte literal";
@@ -283,13 +351,14 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
     }
     if (s[p] == '\\') {
       p++;
-      if (p >= n) {
+      if (p >= n || s[p] == '\n' || s[p] == '\r') {
         lex->pos = p;
         lex->col += (uint32_t)(p - start);
         lex->err_msg = "unterminated byte literal";
         return make_tok(TOK_ERROR, s, start, p, line, col);
       }
-      if (s[p] == 'x') {
+      char esc = s[p];
+      if (esc == 'x') {
         if (p + 2 >= n || !is_ascii_hex((unsigned char)s[p + 1]) ||
             !is_ascii_hex((unsigned char)s[p + 2])) {
           lex->pos = p + 1;
@@ -298,8 +367,13 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
           return make_tok(TOK_ERROR, s, start, lex->pos, line, col);
         }
         p += 3;
-      } else {
+      } else if (esc == 'n' || esc == 't' || esc == '\\' || esc == '"' || esc == '\'' || esc == '0') {
         p++;
+      } else {
+        lex->pos = p + 1;
+        lex->col += (uint32_t)(lex->pos - start);
+        lex->err_msg = "invalid escape sequence in byte literal";
+        return make_tok(TOK_ERROR, s, start, lex->pos, line, col);
       }
     } else {
       p++;
@@ -329,11 +403,26 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
     case ',': kind = TOK_COMMA; break;
     case '@': kind = TOK_AT; break;
     case '+': kind = TOK_PLUS; break;
-    case '-': kind = TOK_MINUS; break;
+    case '-':
+      if (p + 1 < n && s[p + 1] == '>') {
+        kind = TOK_RARROW;
+        advance = 2;
+      } else {
+        kind = TOK_MINUS;
+      }
+      break;
     case '*': kind = TOK_STAR; break;
     case '/': kind = TOK_SLASH; break;
     case '%': kind = TOK_PERCENT; break;
     case '#': kind = TOK_HASH; break;
+    case '.':
+      if (p + 2 < n && s[p + 1] == '.' && s[p + 2] == '.') {
+        kind = TOK_ELLIPSIS;
+        advance = 3;
+      } else {
+        lex->err_msg = "unexpected '.'";
+      }
+      break;
     case ':':
       if (p + 1 < n && s[p + 1] == '=') {
         kind = TOK_COLON_EQ;
@@ -346,6 +435,9 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       if (p + 1 < n && s[p + 1] == '=') {
         kind = TOK_EQ;
         advance = 2;
+      } else if (p + 2 < n && s[p + 1] == '>' && s[p + 2] == '>') {
+        kind = TOK_TYPE_ARROW;
+        advance = 3;
       } else if (p + 1 < n && s[p + 1] == '>') {
         kind = TOK_ARROW;
         advance = 2;
@@ -405,14 +497,19 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
 
 Status stigi_lex_all(const char *src, size_t len, StigiTok **out_toks, uint32_t *out_count,
                      Arena *arena, Diag *diag) {
-  if (out_toks == NULL || out_count == NULL || arena == NULL) {
+  if (out_toks == NULL || out_count == NULL || arena == NULL || (src == NULL && len > 0)) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_lex_all: invalid arguments");
+  }
+  if (len > (size_t)UINT32_MAX) {
+    return diag_set(diag, STIGI_ERR_OVERFLOW, -1, "stigi_lex_all: source exceeds 4 GiB");
   }
   StigiLexer lex;
   stigi_lex_init(&lex, src, len);
 
-  uint32_t cap = len / 4U + 32U;
-  if (cap < 64U) cap = 64U;
+  size_t cap_sz = (len / 4U) + 32U;
+  if (cap_sz < 64U) cap_sz = 64U;
+  if (cap_sz > (1U << 20)) cap_sz = (1U << 20);
+  uint32_t cap = (uint32_t)cap_sz;
   StigiTok *buf = malloc((size_t)cap * sizeof *buf);
   if (buf == NULL) {
     return diag_set(diag, STIGI_ERR_OOM, -1, "stigi_lex_all: out of memory");
@@ -471,6 +568,10 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_STRING: return "STRING";
     case TOK_FLOAT: return "FLOAT";
     case TOK_HASH: return "#";
+    case TOK_STR_INTERP: return "STRING_INTERPOLATION";
+    case TOK_RARROW: return "->";
+    case TOK_TYPE_ARROW: return "=>>";
+    case TOK_ELLIPSIS: return "...";
     case TOK_NOT_IN_LANG: return "NOT_IN_LANG";
     case TOK_ERROR: return "ERROR";
     case TOK_KW_ALIAS: return "alias";

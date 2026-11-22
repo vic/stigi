@@ -1,20 +1,26 @@
 #include "datalog.h"
 
-Status stigi_dl_open(StigiDl *dl, const char *src, size_t len, const char *name,
-                     uint64_t budget, size_t nthreads, Diag *diag) {
+Status stigi_dl_open_ex(StigiDl *dl, const char *src, size_t len, const char *name,
+                        uint64_t budget, int prov, size_t nthreads, Diag *diag) {
   if (dl == NULL || (src == NULL && len > 0)) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_open: invalid arguments");
   }
   dl->sess = NULL;
   char ebuf[256];
-  int ecode = 0;
-  TupuSession *s = tupu_open(src, len, name, budget, nthreads, ebuf, sizeof ebuf, &ecode);
+  ebuf[0] = '\0';
+  int ecode = -1;
+  TupuSession *s = tupu_open_ex(src, len, name, budget, prov, nthreads, ebuf, sizeof ebuf, &ecode);
   if (s == NULL) {
     return diag_set(diag, STIGI_ERR_DATALOG, ecode, "%s", ebuf[0] != '\0' ? ebuf : "tupu_open failed");
   }
   dl->sess = s;
   diag_clear(diag);
   return STIGI_OK;
+}
+
+Status stigi_dl_open(StigiDl *dl, const char *src, size_t len, const char *name,
+                     uint64_t budget, size_t nthreads, Diag *diag) {
+  return stigi_dl_open_ex(dl, src, len, name, budget, 0, nthreads, diag);
 }
 
 void stigi_dl_close(StigiDl *dl) {
@@ -30,7 +36,7 @@ Status stigi_dl_reset(StigiDl *dl, Diag *diag) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_reset: null session");
   }
   if (tupu_reset(dl->sess) != 0) {
-    return diag_set(diag, STIGI_ERR_DATALOG, -1, "tupu_reset failed");
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess), "tupu_reset failed");
   }
   return STIGI_OK;
 }
@@ -50,7 +56,7 @@ Status stigi_dl_intern(StigiDl *dl, const char *str, size_t len, uint32_t *out_i
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_intern: invalid arguments");
   }
   if (tupu_intern(dl->sess, str, len, out_id) != 0) {
-    return diag_set(diag, STIGI_ERR_DATALOG, -1, "tupu_intern failed");
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess), "tupu_intern failed");
   }
   return STIGI_OK;
 }
@@ -65,7 +71,19 @@ Status stigi_dl_add(StigiDl *dl, int rel_id, const int64_t *vals, int ncols, Dia
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_add: invalid arguments");
   }
   if (tupu_add_row(dl->sess, rel_id, vals, ncols) != 0) {
-    return diag_set(diag, STIGI_ERR_DATALOG, -1, "tupu_add_row failed (rel=%d, ncols=%d)", rel_id, ncols);
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess),
+                    "tupu_add_row failed (rel=%d, ncols=%d)", rel_id, ncols);
+  }
+  return STIGI_OK;
+}
+
+Status stigi_dl_add_i128(StigiDl *dl, int rel_id, const TupuI128 *vals, int ncols, Diag *diag) {
+  if (dl == NULL || dl->sess == NULL || (ncols > 0 && vals == NULL)) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_add_i128: invalid arguments");
+  }
+  if (tupu_add_row_i128(dl->sess, rel_id, vals, ncols) != 0) {
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess),
+                    "tupu_add_row_i128 failed (rel=%d, ncols=%d)", rel_id, ncols);
   }
   return STIGI_OK;
 }
@@ -75,9 +93,23 @@ Status stigi_dl_eval(StigiDl *dl, Diag *diag) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_eval: null session");
   }
   char ebuf[256];
-  int ecode = 0;
+  ebuf[0] = '\0';
+  int ecode = -1;
   if (tupu_eval(dl->sess, &ecode, ebuf, sizeof ebuf) != 0) {
     return diag_set(diag, STIGI_ERR_DATALOG, ecode, "%s", ebuf[0] != '\0' ? ebuf : "tupu_eval failed");
+  }
+  return STIGI_OK;
+}
+
+Status stigi_dl_replay(StigiDl *dl, Diag *diag) {
+  if (dl == NULL || dl->sess == NULL) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_replay: null session");
+  }
+  char ebuf[256];
+  ebuf[0] = '\0';
+  int ecode = -1;
+  if (tupu_replay(dl->sess, &ecode, ebuf, sizeof ebuf) != 0) {
+    return diag_set(diag, STIGI_ERR_DATALOG, ecode, "%s", ebuf[0] != '\0' ? ebuf : "tupu_replay failed");
   }
   return STIGI_OK;
 }
@@ -92,7 +124,19 @@ Status stigi_dl_read(const StigiDl *dl, int rel_id, uint32_t row, int64_t *out_v
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_read: invalid arguments");
   }
   if (tupu_rel_read_row(dl->sess, rel_id, row, out_vals, ncols) != 0) {
-    return diag_set(diag, STIGI_ERR_DATALOG, -1, "tupu_rel_read_row failed (rel=%d, row=%u)", rel_id, row);
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess),
+                    "tupu_rel_read_row failed (rel=%d, row=%u)", rel_id, row);
+  }
+  return STIGI_OK;
+}
+
+Status stigi_dl_read_i128(const StigiDl *dl, int rel_id, uint32_t row, TupuI128 *out_vals, int ncols, Diag *diag) {
+  if (dl == NULL || dl->sess == NULL || (ncols > 0 && out_vals == NULL)) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_dl_read_i128: invalid arguments");
+  }
+  if (tupu_rel_read_row_i128(dl->sess, rel_id, row, out_vals, ncols) != 0) {
+    return diag_set(diag, STIGI_ERR_DATALOG, tupu_last_err_code(dl->sess),
+                    "tupu_rel_read_row_i128 failed (rel=%d, row=%u)", rel_id, row);
   }
   return STIGI_OK;
 }

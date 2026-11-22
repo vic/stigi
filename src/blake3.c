@@ -104,6 +104,10 @@ static void blake3_compress(const uint32_t cv[8], const uint8_t block[64],
 
 void blake3_hash(const uint8_t *in, size_t len, uint8_t out[32]) {
   if (out == NULL) return;
+  if (in == NULL && len > 0) {
+    memset(out, 0, 32);
+    return;
+  }
 
   size_t num_chunks = len == 0 ? 1 : ((len - 1) / BLAKE3_CHUNK_LEN + 1);
   uint32_t cv_stack[64][8];

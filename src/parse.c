@@ -6,14 +6,68 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define STIGI_MAX_PARSE_DEPTH 256U
+
 typedef struct {
   const StigiTok *toks;
   uint32_t count;
   uint32_t pos;
+  uint32_t depth;
   Arena *arena;
   StigiParseResult res;
   bool failed;
 } Parser;
+
+static bool p_enter_depth(Parser *p, StigiSpan sp) {
+  if (p->depth >= STIGI_MAX_PARSE_DEPTH) {
+    if (!p->failed) {
+      p->failed = true;
+      p->res.status = STIGI_ERR_INVALID;
+      p->res.diag_kind = STIGI_PARSE_ERR_PARSE;
+      p->res.diag_code = "parse";
+      p->res.help = NULL;
+      p->res.err_span = sp;
+      (void)snprintf(p->res.msg, sizeof p->res.msg, "maximum nesting depth exceeded");
+    }
+    return false;
+  }
+  p->depth++;
+  return true;
+}
+
+static void p_leave_depth(Parser *p) {
+  if (p->depth > 0) p->depth--;
+}
+
+static bool p_grow(Parser *p, void **buf, uint32_t *cap, size_t elem_sz) {
+  uint32_t ncap = (*cap == 0) ? 4U : (*cap <= UINT32_MAX / 2U ? (*cap) * 2U : 0U);
+  if (ncap == 0 || (size_t)ncap > SIZE_MAX / elem_sz) {
+    if (!p->failed) {
+      p->failed = true;
+      p->res.status = STIGI_ERR_OVERFLOW;
+      p->res.diag_kind = STIGI_PARSE_ERR_PARSE;
+      p->res.diag_code = "parse";
+      p->res.help = NULL;
+      (void)snprintf(p->res.msg, sizeof p->res.msg, "array capacity overflow");
+    }
+    return false;
+  }
+  void *nb = realloc(*buf, (size_t)ncap * elem_sz);
+  if (nb == NULL) {
+    if (!p->failed) {
+      p->failed = true;
+      p->res.status = STIGI_ERR_OOM;
+      p->res.diag_kind = STIGI_PARSE_ERR_PARSE;
+      p->res.diag_code = "parse";
+      p->res.help = NULL;
+      (void)snprintf(p->res.msg, sizeof p->res.msg, "out of memory");
+    }
+    return false;
+  }
+  *buf = nb;
+  *cap = ncap;
+  return true;
+}
 
 static void *p_alloc(Parser *p, size_t sz) {
   void *m = arena_alloc(p->arena, sz);
@@ -67,6 +121,14 @@ static void p_fail_not_in_lang_tok(Parser *p, const StigiTok *t) {
     p_fail_not_in_lang(p, t->span, "float");
   } else if (t->kind == TOK_HASH) {
     p_fail_not_in_lang(p, t->span, "#");
+  } else if (t->kind == TOK_STR_INTERP) {
+    p_fail_not_in_lang(p, t->span, "string-interpolation");
+  } else if (t->kind == TOK_RARROW) {
+    p_fail_not_in_lang(p, t->span, "lambda");
+  } else if (t->kind == TOK_TYPE_ARROW) {
+    p_fail_not_in_lang(p, t->span, "type-lambda");
+  } else if (t->kind == TOK_ELLIPSIS) {
+    p_fail_not_in_lang(p, t->span, "varargs");
   } else {
     p_fail_not_in_lang(p, t->span, kw);
   }
@@ -127,11 +189,24 @@ static const StigiTok *advance(Parser *p) {
 
 static bool check_not_in_lang(Parser *p) {
   const StigiTok *t = peek(p);
-  if (t->kind == TOK_NOT_IN_LANG || t->kind == TOK_FLOAT || t->kind == TOK_HASH) {
+  if (t->kind == TOK_NOT_IN_LANG || t->kind == TOK_FLOAT || t->kind == TOK_HASH ||
+      t->kind == TOK_STR_INTERP || t->kind == TOK_RARROW ||
+      t->kind == TOK_TYPE_ARROW || t->kind == TOK_ELLIPSIS) {
     p_fail_not_in_lang_tok(p, t);
     return true;
   }
   return false;
+}
+
+static void skip_head_cont_nl(Parser *p, uint32_t decl_col) {
+  if (peek(p)->kind != TOK_NEWLINE) return;
+  const StigiTok *nxt = peek_skip_nl(p);
+  if (nxt->span.col <= decl_col) return;
+  StigiTokKind k = nxt->kind;
+  if (k == TOK_LBRACKET || k == TOK_LBRACE || k == TOK_LPAREN ||
+      k == TOK_LT || k == TOK_COLON || k == TOK_ASSIGN || k == TOK_KW_FOR) {
+    skip_newlines(p);
+  }
 }
 
 static bool expect(Parser *p, StigiTokKind k) {
@@ -164,11 +239,15 @@ static bool tok_is_ident_eq(const StigiTok *t, const char *lit) {
   return t->kind == TOK_IDENT && t->len == n && memcmp(t->ptr, lit, n) == 0;
 }
 
+static bool is_ident_like(StigiTokKind k) {
+  return k == TOK_IDENT || k == TOK_KW_START || k == TOK_KW_STATE || k == TOK_KW_STOP;
+}
+
 static StigiStr parse_name(Parser *p) {
   StigiStr empty = {NULL, 0};
   if (p->failed || check_not_in_lang(p)) return empty;
   const StigiTok *t = peek(p);
-  if (t->kind != TOK_IDENT) {
+  if (!is_ident_like(t->kind)) {
     p_fail(p, t->span, "expected identifier, got '%s'", stigi_tok_kind_name(t->kind));
     return empty;
   }
@@ -180,7 +259,7 @@ static StigiStr parse_binder_name(Parser *p) {
   StigiStr empty = {NULL, 0};
   if (p->failed || check_not_in_lang(p)) return empty;
   const StigiTok *t = peek(p);
-  if (t->kind == TOK_IDENT || t->kind == TOK_UNDERSCORE) {
+  if (is_ident_like(t->kind) || t->kind == TOK_UNDERSCORE) {
     advance(p);
     return tok_str(t);
   }
@@ -289,15 +368,27 @@ static uint32_t decoded_str_len(const char *s, uint32_t len) {
 static StigiType *parse_type(Parser *p) {
   if (p->failed || check_not_in_lang(p)) return NULL;
   const StigiTok *t = peek(p);
+  if (t->kind == TOK_LBRACKET) {
+    p_fail_not_in_lang(p, t->span, "type-lambda");
+    return NULL;
+  }
+  if (!p_enter_depth(p, t->span)) return NULL;
   if (t->kind != TOK_IDENT) {
     p_fail(p, t->span, "expected type name, got '%s'", stigi_tok_kind_name(t->kind));
+    p_leave_depth(p);
     return NULL;
   }
   advance(p);
+  if (tok_is_ident_eq(t, "ACell")) {
+    p_fail_not_in_lang(p, t->span, "ACell");
+    p_leave_depth(p);
+    return NULL;
+  }
 
   StigiType *ty = p_alloc(p, sizeof *ty);
   if (ty == NULL) {
     p_fail_oom(p);
+    p_leave_depth(p);
     return NULL;
   }
   ty->span = t->span;
@@ -310,30 +401,32 @@ static StigiType *parse_type(Parser *p) {
   /* Optional [Type, ...] */
   if (peek(p)->kind == TOK_LBRACKET) {
     advance(p);
+    skip_newlines(p);
     StigiType **args = NULL;
     uint32_t cnt = 0, cap = 0;
     if (peek(p)->kind != TOK_RBRACKET) {
       for (;;) {
+        skip_newlines(p);
         StigiType *a = parse_type(p);
-        if (p->failed) { free(args); return NULL; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiType **na = realloc(args, (size_t)cap * sizeof *na);
-          if (na == NULL) { free(args); p_fail_oom(p); return NULL; }
-          args = na;
+        if (p->failed) { free(args); p_leave_depth(p); return NULL; }
+        if (cnt == cap && !p_grow(p, (void **)&args, &cap, sizeof *args)) {
+          free(args); p_leave_depth(p); return NULL;
         }
         args[cnt++] = a;
+        skip_newlines(p);
         if (peek(p)->kind == TOK_COMMA) {
           advance(p);
+          skip_newlines(p);
         } else {
           break;
         }
       }
     }
-    if (!expect(p, TOK_RBRACKET)) { free(args); return NULL; }
+    skip_newlines(p);
+    if (!expect(p, TOK_RBRACKET)) { free(args); p_leave_depth(p); return NULL; }
     if (cnt > 0) {
       ty->type_args = p_alloc(p, (size_t)cnt * sizeof *ty->type_args);
-      if (ty->type_args == NULL) { free(args); p_fail_oom(p); return NULL; }
+      if (ty->type_args == NULL) { free(args); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(ty->type_args, args, (size_t)cnt * sizeof *args);
       ty->type_arg_count = cnt;
     }
@@ -343,30 +436,32 @@ static StigiType *parse_type(Parser *p) {
   /* Optional (lenTerm, ...) */
   if (peek(p)->kind == TOK_LPAREN) {
     advance(p);
+    skip_newlines(p);
     StigiExpr **largs = NULL;
     uint32_t cnt = 0, cap = 0;
     if (peek(p)->kind != TOK_RPAREN) {
       for (;;) {
+        skip_newlines(p);
         StigiExpr *e = parse_expr(p, 0);
-        if (p->failed) { free(largs); return NULL; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiExpr **na = realloc(largs, (size_t)cap * sizeof *na);
-          if (na == NULL) { free(largs); p_fail_oom(p); return NULL; }
-          largs = na;
+        if (p->failed) { free(largs); p_leave_depth(p); return NULL; }
+        if (cnt == cap && !p_grow(p, (void **)&largs, &cap, sizeof *largs)) {
+          free(largs); p_leave_depth(p); return NULL;
         }
         largs[cnt++] = e;
+        skip_newlines(p);
         if (peek(p)->kind == TOK_COMMA) {
           advance(p);
+          skip_newlines(p);
         } else {
           break;
         }
       }
     }
-    if (!expect(p, TOK_RPAREN)) { free(largs); return NULL; }
+    skip_newlines(p);
+    if (!expect(p, TOK_RPAREN)) { free(largs); p_leave_depth(p); return NULL; }
     if (cnt > 0) {
       ty->len_args = p_alloc(p, (size_t)cnt * sizeof *ty->len_args);
-      if (ty->len_args == NULL) { free(largs); p_fail_oom(p); return NULL; }
+      if (ty->len_args == NULL) { free(largs); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(ty->len_args, largs, (size_t)cnt * sizeof *largs);
       ty->len_arg_count = cnt;
     }
@@ -376,10 +471,13 @@ static StigiType *parse_type(Parser *p) {
   /* Optional {regionName} */
   if (peek(p)->kind == TOK_LBRACE) {
     advance(p);
+    skip_newlines(p);
     ty->cap_arg = parse_name(p);
-    if (!expect(p, TOK_RBRACE)) return NULL;
+    skip_newlines(p);
+    if (!expect(p, TOK_RBRACE)) { p_leave_depth(p); return NULL; }
   }
 
+  p_leave_depth(p);
   return ty;
 }
 
@@ -391,6 +489,25 @@ static StigiExpr *parse_fact_term(Parser *p) {
   StigiExpr *e = p_alloc(p, sizeof *e);
   if (e == NULL) { p_fail_oom(p); return NULL; }
   e->span = t->span;
+  if (t->kind == TOK_MINUS) {
+    advance(p);
+    const StigiTok *nt = peek(p);
+    if (nt->kind != TOK_INT) {
+      p_fail(p, nt->span, "expected integer literal after '-' in fact term");
+      return NULL;
+    }
+    advance(p);
+    StigiExpr *lit = p_alloc(p, sizeof *lit);
+    if (lit == NULL) { p_fail_oom(p); return NULL; }
+    lit->kind = STIGI_EXPR_LIT_INT;
+    lit->span = nt->span;
+    lit->u.lit_int.raw = tok_str(nt);
+    lit->u.lit_int.value = parse_u64_lit(nt->ptr, nt->len, &lit->u.lit_int.overflow);
+    e->kind = STIGI_EXPR_UNOP;
+    e->u.unop.op = STIGI_OP_NEG;
+    e->u.unop.operand = lit;
+    return e;
+  }
   if (t->kind == TOK_INT) {
     advance(p);
     e->kind = STIGI_EXPR_LIT_INT;
@@ -404,7 +521,7 @@ static StigiExpr *parse_fact_term(Parser *p) {
     e->u.ident.name = tok_str(t);
     return e;
   }
-  if (t->kind == TOK_IDENT) {
+  if (is_ident_like(t->kind)) {
     advance(p);
     bool has_dot = memchr(t->ptr, '.', t->len) != NULL;
     e->kind = has_dot ? STIGI_EXPR_GLOBAL : STIGI_EXPR_LOCAL;
@@ -413,7 +530,9 @@ static StigiExpr *parse_fact_term(Parser *p) {
   }
   if (t->kind == TOK_LPAREN) {
     advance(p);
+    skip_newlines(p);
     StigiExpr *inner = parse_expr(p, 0);
+    skip_newlines(p);
     if (!expect(p, TOK_RPAREN)) return NULL;
     return inner;
   }
@@ -448,79 +567,135 @@ static StigiFactItem parse_fact_item(Parser *p, bool allow_evidence) {
   memset(&item, 0, sizeof item);
   if (p->failed || check_not_in_lang(p)) return item;
   item.span = peek(p)->span;
+  if (!p_enter_depth(p, item.span)) return item;
 
   if (peek(p)->kind == TOK_KW_NOT) {
     advance(p);
     item.is_negated = true;
+    /* Multi-atom denial: not (atom1, atom2, ...) (facts.md 6) */
+    if (peek(p)->kind == TOK_LPAREN) {
+      advance(p);
+      skip_newlines(p);
+      item.kind = STIGI_FACT_DENY;
+      StigiFactItem *atoms = NULL;
+      uint32_t cnt = 0, cap = 0;
+      if (peek(p)->kind == TOK_RPAREN) {
+        p_fail(p, peek(p)->span, "denial 'not (...)' requires at least one atom");
+        p_leave_depth(p);
+        return item;
+      }
+      for (;;) {
+        skip_newlines(p);
+        StigiFactItem sub = parse_fact_item(p, false);
+        if (p->failed) { free(atoms); p_leave_depth(p); return item; }
+        if (sub.kind != STIGI_FACT_ATOM || sub.is_negated) {
+          free(atoms);
+          p_fail(p, sub.span, "denial 'not (...)' accepts only positive atoms");
+          p_leave_depth(p);
+          return item;
+        }
+        if (cnt == cap && !p_grow(p, (void **)&atoms, &cap, sizeof *atoms)) {
+          free(atoms); p_leave_depth(p); return item;
+        }
+        atoms[cnt++] = sub;
+        skip_newlines(p);
+        if (peek(p)->kind == TOK_COMMA) {
+          advance(p);
+          skip_newlines(p);
+        } else {
+          break;
+        }
+      }
+      skip_newlines(p);
+      if (!expect(p, TOK_RPAREN)) { free(atoms); p_leave_depth(p); return item; }
+      item.deny_atoms = p_alloc(p, (size_t)cnt * sizeof *atoms);
+      if (item.deny_atoms == NULL) { free(atoms); p_fail_oom(p); p_leave_depth(p); return item; }
+      memcpy(item.deny_atoms, atoms, (size_t)cnt * sizeof *atoms);
+      item.deny_atom_count = cnt;
+      free(atoms);
+      p_leave_depth(p);
+      return item;
+    }
   }
 
   /* Check for evidence binder: `p: atom(...)` */
-  if (allow_evidence && !item.is_negated && peek(p)->kind == TOK_IDENT &&
+  if (allow_evidence && !item.is_negated && is_ident_like(peek(p)->kind) &&
       peek_next_non_comment(p)->kind == TOK_COLON) {
     item.evidence_name = tok_str(advance(p));
     advance(p); /* ':' */
   }
 
   /* Check for atom `Name(t1, t2)` vs comparison `t1 < t2` vs arith `x = t1 + t2` */
-  if (peek(p)->kind == TOK_IDENT && peek_next_non_comment(p)->kind == TOK_LPAREN) {
+  if (is_ident_like(peek(p)->kind) && peek_next_non_comment(p)->kind == TOK_LPAREN) {
     item.kind = STIGI_FACT_ATOM;
     item.atom_name = tok_str(advance(p));
     advance(p); /* '(' */
+    skip_newlines(p);
     StigiExpr **args = NULL;
     uint32_t cnt = 0, cap = 0;
     if (peek(p)->kind != TOK_RPAREN) {
       for (;;) {
+        skip_newlines(p);
         StigiExpr *arg = parse_expr(p, 0);
-        if (p->failed) { free(args); return item; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiExpr **na = realloc(args, (size_t)cap * sizeof *na);
-          if (na == NULL) { free(args); p_fail_oom(p); return item; }
-          args = na;
+        if (p->failed) { free(args); p_leave_depth(p); return item; }
+        if (cnt == cap && !p_grow(p, (void **)&args, &cap, sizeof *args)) {
+          free(args); p_leave_depth(p); return item;
         }
         args[cnt++] = arg;
+        skip_newlines(p);
         if (peek(p)->kind == TOK_COMMA) {
           advance(p);
+          skip_newlines(p);
         } else {
           break;
         }
       }
     }
-    if (!expect(p, TOK_RPAREN)) { free(args); return item; }
+    skip_newlines(p);
+    if (!expect(p, TOK_RPAREN)) { free(args); p_leave_depth(p); return item; }
     if (cnt > 0) {
       item.args = p_alloc(p, (size_t)cnt * sizeof *item.args);
-      if (item.args == NULL) { free(args); p_fail_oom(p); return item; }
+      if (item.args == NULL) { free(args); p_fail_oom(p); p_leave_depth(p); return item; }
       memcpy(item.args, args, (size_t)cnt * sizeof *args);
       item.arg_count = cnt;
     }
     free(args);
+    p_leave_depth(p);
     return item;
   }
 
-  if (!item.is_negated && peek(p)->kind == TOK_IDENT &&
-      peek_next_non_comment(p)->kind == TOK_ASSIGN) {
+  if (item.is_negated) {
+    p_fail(p, peek(p)->span, "expected atom or '(...)' after 'not'");
+    p_leave_depth(p);
+    return item;
+  }
+
+  if (is_ident_like(peek(p)->kind) && peek_next_non_comment(p)->kind == TOK_ASSIGN) {
     item.kind = STIGI_FACT_ARITH;
     item.lhs_var = tok_str(advance(p));
     advance(p); /* '=' */
     item.lhs = parse_fact_term(p);
-    if (p->failed) return item;
+    if (p->failed) { p_leave_depth(p); return item; }
     StigiOp op = STIGI_OP_ADD;
     if (!is_arith_tok(peek(p)->kind, &op)) {
       p_fail(p, peek(p)->span, "expected arithmetic operator in rule literal");
+      p_leave_depth(p);
       return item;
     }
     advance(p);
     item.op = op;
     item.rhs = parse_fact_term(p);
+    p_leave_depth(p);
     return item;
   }
 
   /* Comparison: term cmp term */
   StigiExpr *lhs = parse_fact_term(p);
-  if (p->failed) return item;
+  if (p->failed) { p_leave_depth(p); return item; }
   StigiOp cmp_op = STIGI_OP_EQ;
   if (!is_cmp_tok(peek(p)->kind, &cmp_op)) {
     p_fail(p, peek(p)->span, "expected atom or comparison in fact group");
+    p_leave_depth(p);
     return item;
   }
   advance(p);
@@ -528,6 +703,7 @@ static StigiFactItem parse_fact_item(Parser *p, bool allow_evidence) {
   item.lhs = lhs;
   item.op = cmp_op;
   item.rhs = parse_fact_term(p);
+  p_leave_depth(p);
   return item;
 }
 
@@ -537,27 +713,29 @@ static StigiFactGroup parse_fact_group(Parser *p) {
   if (p->failed) return fg;
   fg.span = peek(p)->span;
   if (!expect(p, TOK_LT)) return fg;
+  skip_newlines(p);
 
   StigiFactItem *items = NULL;
   uint32_t cnt = 0, cap = 0;
   if (peek(p)->kind != TOK_GT) {
     for (;;) {
+      skip_newlines(p);
       StigiFactItem it = parse_fact_item(p, true);
       if (p->failed) { free(items); return fg; }
-      if (cnt == cap) {
-        cap = cap == 0 ? 4U : cap * 2U;
-        StigiFactItem *ni = realloc(items, (size_t)cap * sizeof *ni);
-        if (ni == NULL) { free(items); p_fail_oom(p); return fg; }
-        items = ni;
+      if (cnt == cap && !p_grow(p, (void **)&items, &cap, sizeof *items)) {
+        free(items); return fg;
       }
       items[cnt++] = it;
+      skip_newlines(p);
       if (peek(p)->kind == TOK_COMMA) {
         advance(p);
+        skip_newlines(p);
       } else {
         break;
       }
     }
   }
+  skip_newlines(p);
   if (!expect(p, TOK_GT)) { free(items); return fg; }
   if (cnt > 0) {
     fg.items = p_alloc(p, (size_t)cnt * sizeof *fg.items);
@@ -574,10 +752,12 @@ static StigiFactGroup parse_fact_group(Parser *p) {
 static bool parse_param_list(Parser *p, StigiTokKind open_k, StigiTokKind close_k,
                              StigiParam **out_params, uint32_t *out_count) {
   if (!expect(p, open_k)) return false;
+  skip_newlines(p);
   StigiParam *arr = NULL;
   uint32_t cnt = 0, cap = 0;
   if (peek(p)->kind != close_k) {
     for (;;) {
+      skip_newlines(p);
       StigiParam pr;
       memset(&pr, 0, sizeof pr);
       pr.span = peek(p)->span;
@@ -586,20 +766,25 @@ static bool parse_param_list(Parser *p, StigiTokKind open_k, StigiTokKind close_
       if (!expect(p, TOK_COLON)) { free(arr); return false; }
       pr.type = parse_type(p);
       if (p->failed) { free(arr); return false; }
-      if (cnt == cap) {
-        cap = cap == 0 ? 4U : cap * 2U;
-        StigiParam *na = realloc(arr, (size_t)cap * sizeof *na);
-        if (na == NULL) { free(arr); p_fail_oom(p); return false; }
-        arr = na;
+      if (peek(p)->kind == TOK_STAR) {
+        free(arr);
+        p_fail_not_in_lang(p, peek(p)->span, "varargs");
+        return false;
+      }
+      if (cnt == cap && !p_grow(p, (void **)&arr, &cap, sizeof *arr)) {
+        free(arr); return false;
       }
       arr[cnt++] = pr;
+      skip_newlines(p);
       if (peek(p)->kind == TOK_COMMA) {
         advance(p);
+        skip_newlines(p);
       } else {
         break;
       }
     }
   }
+  skip_newlines(p);
   if (!expect(p, close_k)) { free(arr); return false; }
   if (cnt > 0) {
     *out_params = p_alloc(p, (size_t)cnt * sizeof **out_params);
@@ -616,33 +801,35 @@ static bool parse_param_list(Parser *p, StigiTokKind open_k, StigiTokKind close_
 
 static bool parse_cap_group(Parser *p, StigiCapParam **out_caps, uint32_t *out_count) {
   if (!expect(p, TOK_LBRACE)) return false;
+  skip_newlines(p);
   StigiCapParam *arr = NULL;
   uint32_t cnt = 0, cap = 0;
   if (peek(p)->kind != TOK_RBRACE) {
     for (;;) {
+      skip_newlines(p);
       StigiCapParam cp;
       memset(&cp, 0, sizeof cp);
       cp.span = peek(p)->span;
-      if (peek(p)->kind == TOK_IDENT && peek_next_non_comment(p)->kind == TOK_COLON) {
+      if (is_ident_like(peek(p)->kind) && peek_next_non_comment(p)->kind == TOK_COLON) {
         cp.name = tok_str(advance(p));
         advance(p); /* ':' */
       }
       cp.cap_type = parse_type(p);
       if (p->failed) { free(arr); return false; }
-      if (cnt == cap) {
-        cap = cap == 0 ? 4U : cap * 2U;
-        StigiCapParam *na = realloc(arr, (size_t)cap * sizeof *na);
-        if (na == NULL) { free(arr); p_fail_oom(p); return false; }
-        arr = na;
+      if (cnt == cap && !p_grow(p, (void **)&arr, &cap, sizeof *arr)) {
+        free(arr); return false;
       }
       arr[cnt++] = cp;
+      skip_newlines(p);
       if (peek(p)->kind == TOK_COMMA) {
         advance(p);
+        skip_newlines(p);
       } else {
         break;
       }
     }
   }
+  skip_newlines(p);
   if (!expect(p, TOK_RBRACE)) { free(arr); return false; }
   if (cnt > 0) {
     *out_caps = p_alloc(p, (size_t)cnt * sizeof **out_caps);
@@ -676,10 +863,17 @@ static StigiPat parse_pattern(Parser *p) {
     advance(p);
     pat.kind = STIGI_PAT_INT;
     pat.name = tok_str(t);
-    pat.int_val = parse_u64_lit(t->ptr, t->len, NULL);
+    pat.int_val = parse_u64_lit(t->ptr, t->len, &pat.int_overflow);
     return pat;
   }
-  if (t->kind == TOK_IDENT) {
+  if (t->kind == TOK_KW_TRUE || t->kind == TOK_KW_FALSE) {
+    advance(p);
+    pat.kind = STIGI_PAT_BOOL;
+    pat.name = tok_str(t);
+    pat.bool_val = (t->kind == TOK_KW_TRUE);
+    return pat;
+  }
+  if (is_ident_like(t->kind)) {
     advance(p);
     pat.name = tok_str(t);
     bool is_upper_start = (t->len > 0 && t->ptr[0] >= 'A' && t->ptr[0] <= 'Z');
@@ -687,26 +881,28 @@ static StigiPat parse_pattern(Parser *p) {
       pat.kind = STIGI_PAT_CTOR;
       pat.has_parens = true;
       advance(p);
+      skip_newlines(p);
       StigiStr *fields = NULL;
       uint32_t cnt = 0, cap = 0;
       if (peek(p)->kind != TOK_RPAREN) {
         for (;;) {
+          skip_newlines(p);
           StigiStr fn = parse_binder_name(p);
           if (p->failed) { free(fields); return pat; }
-          if (cnt == cap) {
-            cap = cap == 0 ? 4U : cap * 2U;
-            StigiStr *nf = realloc(fields, (size_t)cap * sizeof *nf);
-            if (nf == NULL) { free(fields); p_fail_oom(p); return pat; }
-            fields = nf;
+          if (cnt == cap && !p_grow(p, (void **)&fields, &cap, sizeof *fields)) {
+            free(fields); return pat;
           }
           fields[cnt++] = fn;
+          skip_newlines(p);
           if (peek(p)->kind == TOK_COMMA) {
             advance(p);
+            skip_newlines(p);
           } else {
             break;
           }
         }
       }
+      skip_newlines(p);
       if (!expect(p, TOK_RPAREN)) { free(fields); return pat; }
       if (cnt > 0) {
         pat.fields = p_alloc(p, (size_t)cnt * sizeof *pat.fields);
@@ -730,77 +926,111 @@ static StigiPat parse_pattern(Parser *p) {
 static StigiExpr *parse_primary(Parser *p, uint32_t base_col) {
   if (p->failed || check_not_in_lang(p)) return NULL;
   const StigiTok *t = peek(p);
+  if (!p_enter_depth(p, t->span)) return NULL;
 
   if (t->kind == TOK_KW_FOR) {
     p_fail_not_in_lang(p, t->span, "for");
+    p_leave_depth(p);
     return NULL;
   }
 
   if (t->kind == TOK_INT) {
     advance(p);
     StigiExpr *e = p_alloc(p, sizeof *e);
-    if (e == NULL) { p_fail_oom(p); return NULL; }
+    if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     e->kind = STIGI_EXPR_LIT_INT;
     e->span = t->span;
     e->u.lit_int.raw = tok_str(t);
     e->u.lit_int.value = parse_u64_lit(t->ptr, t->len, &e->u.lit_int.overflow);
+    p_leave_depth(p);
     return e;
   }
   if (t->kind == TOK_CHAR) {
     advance(p);
     StigiExpr *e = p_alloc(p, sizeof *e);
-    if (e == NULL) { p_fail_oom(p); return NULL; }
+    if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     e->kind = STIGI_EXPR_LIT_CHAR;
     e->span = t->span;
     e->u.lit_char.raw = tok_str(t);
     e->u.lit_char.value = parse_char_lit(t->ptr, t->len);
+    p_leave_depth(p);
     return e;
   }
   if (t->kind == TOK_STRING) {
     advance(p);
     StigiExpr *e = p_alloc(p, sizeof *e);
-    if (e == NULL) { p_fail_oom(p); return NULL; }
+    if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     e->kind = STIGI_EXPR_LIT_STR;
     e->span = t->span;
     e->u.lit_str.raw = tok_str(t);
     e->u.lit_str.decoded_len = decoded_str_len(t->ptr, t->len);
+    p_leave_depth(p);
     return e;
   }
   if (t->kind == TOK_KW_TRUE || t->kind == TOK_KW_FALSE) {
     advance(p);
     StigiExpr *e = p_alloc(p, sizeof *e);
-    if (e == NULL) { p_fail_oom(p); return NULL; }
+    if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     e->kind = STIGI_EXPR_LIT_BOOL;
     e->span = t->span;
     e->u.lit_bool.value = (t->kind == TOK_KW_TRUE);
+    p_leave_depth(p);
     return e;
   }
-  if (t->kind == TOK_IDENT) {
+  if (is_ident_like(t->kind)) {
     advance(p);
     StigiExpr *e = p_alloc(p, sizeof *e);
-    if (e == NULL) { p_fail_oom(p); return NULL; }
+    if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     bool has_dot = memchr(t->ptr, '.', t->len) != NULL;
     e->kind = has_dot ? STIGI_EXPR_GLOBAL : STIGI_EXPR_LOCAL;
     e->span = t->span;
     e->u.ident.name = tok_str(t);
+    p_leave_depth(p);
     return e;
   }
   if (t->kind == TOK_LPAREN) {
     advance(p);
+    skip_newlines(p);
     if (peek(p)->kind == TOK_RPAREN) {
       advance(p);
+      if (peek(p)->kind == TOK_ARROW) {
+        p_fail_not_in_lang(p, peek(p)->span, "lambda");
+        p_leave_depth(p);
+        return NULL;
+      }
       StigiExpr *e = p_alloc(p, sizeof *e);
-      if (e == NULL) { p_fail_oom(p); return NULL; }
+      if (e == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
       e->kind = STIGI_EXPR_LIT_UNIT;
       e->span = t->span;
+      p_leave_depth(p);
       return e;
     }
+    /* Detect Scala/Rust lambda `(x: T) => ...` */
+    if ((is_ident_like(peek(p)->kind) || peek(p)->kind == TOK_UNDERSCORE) &&
+        peek_next_non_comment(p)->kind == TOK_COLON) {
+      p_fail_not_in_lang(p, t->span, "lambda");
+      p_leave_depth(p);
+      return NULL;
+    }
     StigiExpr *inner = parse_expr(p, base_col);
-    if (!expect(p, TOK_RPAREN)) return NULL;
+    skip_newlines(p);
+    if (!p->failed && peek(p)->kind == TOK_COMMA) {
+      p_fail_not_in_lang(p, peek(p)->span, "lambda");
+      p_leave_depth(p);
+      return NULL;
+    }
+    if (!expect(p, TOK_RPAREN)) { p_leave_depth(p); return NULL; }
+    if (peek(p)->kind == TOK_ARROW) {
+      p_fail_not_in_lang(p, peek(p)->span, "lambda");
+      p_leave_depth(p);
+      return NULL;
+    }
+    p_leave_depth(p);
     return inner;
   }
 
   p_fail(p, t->span, "expected expression, got '%s'", stigi_tok_kind_name(t->kind));
+  p_leave_depth(p);
   return NULL;
 }
 
@@ -810,7 +1040,7 @@ static StigiExpr *parse_postfix(Parser *p, uint32_t base_col) {
 
   for (;;) {
     const StigiTok *t = peek(p);
-    /* Call with optional [typeArgs] {capArgs} (args) */
+    /* Call or generic application: [typeArgs] {capArgs} (args), where (...) is optional when [...] or {...} is present */
     if (t->kind == TOK_LBRACKET || t->kind == TOK_LBRACE || t->kind == TOK_LPAREN) {
       StigiExpr *call = p_alloc(p, sizeof *call);
       if (call == NULL) { p_fail_oom(p); return NULL; }
@@ -820,23 +1050,24 @@ static StigiExpr *parse_postfix(Parser *p, uint32_t base_col) {
 
       if (peek(p)->kind == TOK_LBRACKET) {
         advance(p);
+        skip_newlines(p);
         StigiType **targs = NULL;
         uint32_t cnt = 0, cap = 0;
         if (peek(p)->kind != TOK_RBRACKET) {
           for (;;) {
+            skip_newlines(p);
             StigiType *ta = parse_type(p);
             if (p->failed) { free(targs); return NULL; }
-            if (cnt == cap) {
-              cap = cap == 0 ? 4U : cap * 2U;
-              StigiType **na = realloc(targs, (size_t)cap * sizeof *na);
-              if (na == NULL) { free(targs); p_fail_oom(p); return NULL; }
-              targs = na;
+            if (cnt == cap && !p_grow(p, (void **)&targs, &cap, sizeof *targs)) {
+              free(targs); return NULL;
             }
             targs[cnt++] = ta;
-            if (peek(p)->kind == TOK_COMMA) advance(p);
+            skip_newlines(p);
+            if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
             else break;
           }
         }
+        skip_newlines(p);
         if (!expect(p, TOK_RBRACKET)) { free(targs); return NULL; }
         if (cnt > 0) {
           call->u.call.type_args = p_alloc(p, (size_t)cnt * sizeof *targs);
@@ -849,23 +1080,24 @@ static StigiExpr *parse_postfix(Parser *p, uint32_t base_col) {
 
       if (peek(p)->kind == TOK_LBRACE) {
         advance(p);
+        skip_newlines(p);
         StigiStr *cargs = NULL;
         uint32_t cnt = 0, cap = 0;
         if (peek(p)->kind != TOK_RBRACE) {
           for (;;) {
+            skip_newlines(p);
             StigiStr cn = parse_name(p);
             if (p->failed) { free(cargs); return NULL; }
-            if (cnt == cap) {
-              cap = cap == 0 ? 4U : cap * 2U;
-              StigiStr *na = realloc(cargs, (size_t)cap * sizeof *na);
-              if (na == NULL) { free(cargs); p_fail_oom(p); return NULL; }
-              cargs = na;
+            if (cnt == cap && !p_grow(p, (void **)&cargs, &cap, sizeof *cargs)) {
+              free(cargs); return NULL;
             }
             cargs[cnt++] = cn;
-            if (peek(p)->kind == TOK_COMMA) advance(p);
+            skip_newlines(p);
+            if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
             else break;
           }
         }
+        skip_newlines(p);
         if (!expect(p, TOK_RBRACE)) { free(cargs); return NULL; }
         if (cnt > 0) {
           call->u.call.cap_args = p_alloc(p, (size_t)cnt * sizeof *cargs);
@@ -876,32 +1108,36 @@ static StigiExpr *parse_postfix(Parser *p, uint32_t base_col) {
         free(cargs);
       }
 
-      if (!expect(p, TOK_LPAREN)) return NULL;
-      StigiExpr **args = NULL;
-      uint32_t cnt = 0, cap = 0;
-      if (peek(p)->kind != TOK_RPAREN) {
-        for (;;) {
-          StigiExpr *a = parse_expr(p, base_col);
-          if (p->failed) { free(args); return NULL; }
-          if (cnt == cap) {
-            cap = cap == 0 ? 4U : cap * 2U;
-            StigiExpr **na = realloc(args, (size_t)cap * sizeof *na);
-            if (na == NULL) { free(args); p_fail_oom(p); return NULL; }
-            args = na;
+      if (peek(p)->kind == TOK_LPAREN) {
+        call->u.call.has_parens = true;
+        advance(p);
+        skip_newlines(p);
+        StigiExpr **args = NULL;
+        uint32_t cnt = 0, cap = 0;
+        if (peek(p)->kind != TOK_RPAREN) {
+          for (;;) {
+            skip_newlines(p);
+            StigiExpr *a = parse_expr(p, base_col);
+            if (p->failed) { free(args); return NULL; }
+            if (cnt == cap && !p_grow(p, (void **)&args, &cap, sizeof *args)) {
+              free(args); return NULL;
+            }
+            args[cnt++] = a;
+            skip_newlines(p);
+            if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
+            else break;
           }
-          args[cnt++] = a;
-          if (peek(p)->kind == TOK_COMMA) advance(p);
-          else break;
         }
+        skip_newlines(p);
+        if (!expect(p, TOK_RPAREN)) { free(args); return NULL; }
+        if (cnt > 0) {
+          call->u.call.args = p_alloc(p, (size_t)cnt * sizeof *args);
+          if (call->u.call.args == NULL) { free(args); p_fail_oom(p); return NULL; }
+          memcpy(call->u.call.args, args, (size_t)cnt * sizeof *args);
+          call->u.call.arg_count = cnt;
+        }
+        free(args);
       }
-      if (!expect(p, TOK_RPAREN)) { free(args); return NULL; }
-      if (cnt > 0) {
-        call->u.call.args = p_alloc(p, (size_t)cnt * sizeof *args);
-        if (call->u.call.args == NULL) { free(args); p_fail_oom(p); return NULL; }
-        memcpy(call->u.call.args, args, (size_t)cnt * sizeof *args);
-        call->u.call.arg_count = cnt;
-      }
-      free(args);
       e = call;
       continue;
     }
@@ -921,56 +1157,6 @@ static StigiExpr *parse_postfix(Parser *p, uint32_t base_col) {
       continue;
     }
 
-    /* expr match \n case pat => body ... */
-    if (t->kind == TOK_KW_MATCH) {
-      advance(p);
-      StigiExpr *m = p_alloc(p, sizeof *m);
-      if (m == NULL) { p_fail_oom(p); return NULL; }
-      m->kind = STIGI_EXPR_MATCH;
-      m->span = e->span;
-      m->u.match_expr.scrutinee = e;
-
-      skip_newlines(p);
-      const StigiTok *first_arm = peek(p);
-      if (first_arm->kind != TOK_KW_CASE) {
-        p_fail(p, first_arm->span, "expected 'case' arm after 'match'");
-        return NULL;
-      }
-      uint32_t arm_col = first_arm->span.col;
-      StigiMatchArm *arms = NULL;
-      uint32_t cnt = 0, cap = 0;
-
-      for (;;) {
-        const StigiTok *nxt = peek_skip_nl(p);
-        if (nxt->kind != TOK_KW_CASE || nxt->span.col != arm_col) break;
-        skip_newlines(p);
-        StigiMatchArm arm;
-        memset(&arm, 0, sizeof arm);
-        arm.span = advance(p)->span; /* 'case' */
-        arm.pat = parse_pattern(p);
-        if (p->failed) { free(arms); return NULL; }
-        if (!expect(p, TOK_ARROW)) { free(arms); return NULL; }
-        arm.body = parse_block_or_expr(p, arm_col);
-        if (p->failed) { free(arms); return NULL; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiMatchArm *na = realloc(arms, (size_t)cap * sizeof *na);
-          if (na == NULL) { free(arms); p_fail_oom(p); return NULL; }
-          arms = na;
-        }
-        arms[cnt++] = arm;
-      }
-      if (cnt > 0) {
-        m->u.match_expr.arms = p_alloc(p, (size_t)cnt * sizeof *arms);
-        if (m->u.match_expr.arms == NULL) { free(arms); p_fail_oom(p); return NULL; }
-        memcpy(m->u.match_expr.arms, arms, (size_t)cnt * sizeof *arms);
-        m->u.match_expr.arm_count = cnt;
-      }
-      free(arms);
-      e = m;
-      continue;
-    }
-
     break;
   }
 
@@ -981,8 +1167,10 @@ static StigiExpr *parse_unary(Parser *p, uint32_t base_col) {
   if (p->failed || check_not_in_lang(p)) return NULL;
   const StigiTok *t = peek(p);
   if (t->kind == TOK_BANG || t->kind == TOK_MINUS) {
+    if (!p_enter_depth(p, t->span)) return NULL;
     advance(p);
     StigiExpr *opnd = parse_unary(p, base_col);
+    p_leave_depth(p);
     if (p->failed) return NULL;
     StigiExpr *u = p_alloc(p, sizeof *u);
     if (u == NULL) { p_fail_oom(p); return NULL; }
@@ -1023,6 +1211,9 @@ static StigiExpr *parse_binop(Parser *p, uint32_t base_col, int min_prec) {
     int prec = binop_prec(peek(p)->kind, &op);
     if (prec < min_prec) break;
     advance(p);
+    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->span.col > base_col) {
+      skip_newlines(p);
+    }
     StigiExpr *rhs = parse_binop(p, base_col, prec + 1);
     if (p->failed) return NULL;
     StigiExpr *b = p_alloc(p, sizeof *b);
@@ -1037,60 +1228,122 @@ static StigiExpr *parse_binop(Parser *p, uint32_t base_col, int min_prec) {
   return lhs;
 }
 
+static StigiExpr *parse_match(Parser *p, uint32_t base_col) {
+  StigiExpr *e = parse_binop(p, base_col, 1);
+  if (p->failed) return NULL;
+
+  while (peek(p)->kind == TOK_KW_MATCH) {
+    advance(p);
+    StigiExpr *m = p_alloc(p, sizeof *m);
+    if (m == NULL) { p_fail_oom(p); return NULL; }
+    m->kind = STIGI_EXPR_MATCH;
+    m->span = e->span;
+    m->u.match_expr.scrutinee = e;
+
+    skip_newlines(p);
+    const StigiTok *first_arm = peek(p);
+    if (first_arm->kind != TOK_KW_CASE) {
+      p_fail(p, first_arm->span, "expected 'case' arm after 'match'");
+      return NULL;
+    }
+    uint32_t arm_col = first_arm->span.col;
+    StigiMatchArm *arms = NULL;
+    uint32_t cnt = 0, cap = 0;
+
+    for (;;) {
+      const StigiTok *nxt = peek_skip_nl(p);
+      if (nxt->kind != TOK_KW_CASE || nxt->span.col != arm_col) break;
+      skip_newlines(p);
+      StigiMatchArm arm;
+      memset(&arm, 0, sizeof arm);
+      arm.span = advance(p)->span; /* 'case' */
+      arm.pat = parse_pattern(p);
+      if (p->failed) { free(arms); return NULL; }
+      if (!expect(p, TOK_ARROW)) { free(arms); return NULL; }
+      arm.body = parse_block_or_expr(p, arm_col);
+      if (p->failed) { free(arms); return NULL; }
+      if (cnt == cap && !p_grow(p, (void **)&arms, &cap, sizeof *arms)) {
+        free(arms); return NULL;
+      }
+      arms[cnt++] = arm;
+    }
+    if (cnt > 0) {
+      m->u.match_expr.arms = p_alloc(p, (size_t)cnt * sizeof *arms);
+      if (m->u.match_expr.arms == NULL) { free(arms); p_fail_oom(p); return NULL; }
+      memcpy(m->u.match_expr.arms, arms, (size_t)cnt * sizeof *arms);
+      m->u.match_expr.arm_count = cnt;
+    }
+    free(arms);
+    e = m;
+  }
+  return e;
+}
+
 static StigiExpr *parse_expr(Parser *p, uint32_t base_col) {
   if (p->failed || check_not_in_lang(p)) return NULL;
   const StigiTok *t = peek(p);
+  if (!p_enter_depth(p, t->span)) return NULL;
 
   if (t->kind == TOK_KW_IF) {
     uint32_t if_col = t->span.col;
+    uint32_t blk_col = (base_col < if_col) ? base_col : if_col;
     advance(p);
-    StigiExpr *cond = parse_expr(p, if_col);
-    if (!expect(p, TOK_KW_THEN)) return NULL;
-    StigiExpr *then_br = parse_block_or_expr(p, if_col);
-    if (p->failed) return NULL;
-    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->kind == TOK_KW_ELSE &&
-        peek_skip_nl(p)->span.col == if_col) {
+    StigiExpr *cond = parse_expr(p, blk_col);
+    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->kind == TOK_KW_THEN) {
       skip_newlines(p);
     }
-    if (!expect(p, TOK_KW_ELSE)) return NULL;
-    StigiExpr *else_br = parse_block_or_expr(p, if_col);
-    if (p->failed) return NULL;
+    if (!expect(p, TOK_KW_THEN)) { p_leave_depth(p); return NULL; }
+    StigiExpr *then_br = parse_block_or_expr(p, blk_col);
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->kind == TOK_KW_ELSE &&
+        (peek_skip_nl(p)->span.col == if_col || peek_skip_nl(p)->span.col == base_col)) {
+      skip_newlines(p);
+    }
+    if (!expect(p, TOK_KW_ELSE)) { p_leave_depth(p); return NULL; }
+    StigiExpr *else_br = parse_block_or_expr(p, blk_col);
+    if (p->failed) { p_leave_depth(p); return NULL; }
     StigiExpr *ife = p_alloc(p, sizeof *ife);
-    if (ife == NULL) { p_fail_oom(p); return NULL; }
+    if (ife == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     ife->kind = STIGI_EXPR_IF;
     ife->span = t->span;
     ife->u.if_expr.cond = cond;
     ife->u.if_expr.then_br = then_br;
     ife->u.if_expr.else_br = else_br;
+    p_leave_depth(p);
     return ife;
   }
 
   if (t->kind == TOK_KW_WHILE) {
     uint32_t w_col = t->span.col;
+    uint32_t blk_col = (base_col < w_col) ? base_col : w_col;
     advance(p);
-    StigiExpr *cond = parse_expr(p, w_col);
-    if (p->failed) return NULL;
-    StigiExpr *dec = NULL;
-    if (tok_is_ident_eq(peek(p), "decreases")) {
-      advance(p);
-      if (!expect(p, TOK_LPAREN)) return NULL;
-      dec = parse_expr(p, w_col);
-      if (!expect(p, TOK_RPAREN)) return NULL;
+    StigiExpr *cond = parse_expr(p, blk_col);
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->kind == TOK_KW_DO) {
+      skip_newlines(p);
     }
-    if (!expect(p, TOK_KW_DO)) return NULL;
-    StigiExpr *body = parse_block_or_expr(p, w_col);
-    if (p->failed) return NULL;
+    if (!expect(p, TOK_KW_DO)) { p_leave_depth(p); return NULL; }
+    StigiExpr *body = parse_block_or_expr(p, blk_col);
+    if (p->failed) { p_leave_depth(p); return NULL; }
     StigiExpr *wh = p_alloc(p, sizeof *wh);
-    if (wh == NULL) { p_fail_oom(p); return NULL; }
+    if (wh == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     wh->kind = STIGI_EXPR_WHILE;
     wh->span = t->span;
     wh->u.while_expr.cond = cond;
-    wh->u.while_expr.decreases = dec;
+    wh->u.while_expr.decreases = NULL;
     wh->u.while_expr.body = body;
+    p_leave_depth(p);
     return wh;
   }
 
-  return parse_binop(p, base_col, 1);
+  StigiExpr *res = parse_match(p, base_col);
+  if (!p->failed && peek(p)->kind == TOK_ARROW) {
+    p_fail_not_in_lang(p, peek(p)->span, "lambda");
+    p_leave_depth(p);
+    return NULL;
+  }
+  p_leave_depth(p);
+  return res;
 }
 
 static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
@@ -1160,39 +1413,98 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
     return vs;
   }
 
-  /* handle [name =] Handler [(args)] [: block] */
+  /* handle [name =] Handler [typeArgs] {capArgs} [(args)] [: block] */
   if (t->kind == TOK_KW_HANDLE) {
     advance(p);
     StigiExpr *hs = p_alloc(p, sizeof *hs);
     if (hs == NULL) { p_fail_oom(p); return NULL; }
     hs->kind = STIGI_EXPR_HANDLE;
     hs->span = t->span;
-    if (peek(p)->kind == TOK_IDENT && peek_next_non_comment(p)->kind == TOK_ASSIGN) {
+    if (is_ident_like(peek(p)->kind) && peek_next_non_comment(p)->kind == TOK_ASSIGN) {
       hs->u.handle_stmt.binder = tok_str(advance(p));
       advance(p); /* '=' */
     }
     hs->u.handle_stmt.handler_name = parse_name(p);
     if (p->failed) return NULL;
+    if (peek(p)->kind == TOK_LBRACKET) {
+      advance(p);
+      skip_newlines(p);
+      StigiType **targs = NULL;
+      uint32_t cnt = 0, cap = 0;
+      if (peek(p)->kind != TOK_RBRACKET) {
+        for (;;) {
+          skip_newlines(p);
+          StigiType *ta = parse_type(p);
+          if (p->failed) { free(targs); return NULL; }
+          if (cnt == cap && !p_grow(p, (void **)&targs, &cap, sizeof *targs)) {
+            free(targs); return NULL;
+          }
+          targs[cnt++] = ta;
+          skip_newlines(p);
+          if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
+          else break;
+        }
+      }
+      skip_newlines(p);
+      if (!expect(p, TOK_RBRACKET)) { free(targs); return NULL; }
+      if (cnt > 0) {
+        hs->u.handle_stmt.type_args = p_alloc(p, (size_t)cnt * sizeof *targs);
+        if (hs->u.handle_stmt.type_args == NULL) { free(targs); p_fail_oom(p); return NULL; }
+        memcpy(hs->u.handle_stmt.type_args, targs, (size_t)cnt * sizeof *targs);
+        hs->u.handle_stmt.type_arg_count = cnt;
+      }
+      free(targs);
+    }
+    if (peek(p)->kind == TOK_LBRACE) {
+      advance(p);
+      skip_newlines(p);
+      StigiStr *cargs = NULL;
+      uint32_t cnt = 0, cap = 0;
+      if (peek(p)->kind != TOK_RBRACE) {
+        for (;;) {
+          skip_newlines(p);
+          StigiStr cn = parse_name(p);
+          if (p->failed) { free(cargs); return NULL; }
+          if (cnt == cap && !p_grow(p, (void **)&cargs, &cap, sizeof *cargs)) {
+            free(cargs); return NULL;
+          }
+          cargs[cnt++] = cn;
+          skip_newlines(p);
+          if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
+          else break;
+        }
+      }
+      skip_newlines(p);
+      if (!expect(p, TOK_RBRACE)) { free(cargs); return NULL; }
+      if (cnt > 0) {
+        hs->u.handle_stmt.cap_args = p_alloc(p, (size_t)cnt * sizeof *cargs);
+        if (hs->u.handle_stmt.cap_args == NULL) { free(cargs); p_fail_oom(p); return NULL; }
+        memcpy(hs->u.handle_stmt.cap_args, cargs, (size_t)cnt * sizeof *cargs);
+        hs->u.handle_stmt.cap_arg_count = cnt;
+      }
+      free(cargs);
+    }
     if (peek(p)->kind == TOK_LPAREN) {
       hs->u.handle_stmt.has_parens = true;
       advance(p);
+      skip_newlines(p);
       StigiExpr **args = NULL;
       uint32_t cnt = 0, cap = 0;
       if (peek(p)->kind != TOK_RPAREN) {
         for (;;) {
+          skip_newlines(p);
           StigiExpr *a = parse_expr(p, stmt_col);
           if (p->failed) { free(args); return NULL; }
-          if (cnt == cap) {
-            cap = cap == 0 ? 4U : cap * 2U;
-            StigiExpr **na = realloc(args, (size_t)cap * sizeof *na);
-            if (na == NULL) { free(args); p_fail_oom(p); return NULL; }
-            args = na;
+          if (cnt == cap && !p_grow(p, (void **)&args, &cap, sizeof *args)) {
+            free(args); return NULL;
           }
           args[cnt++] = a;
-          if (peek(p)->kind == TOK_COMMA) advance(p);
+          skip_newlines(p);
+          if (peek(p)->kind == TOK_COMMA) { advance(p); skip_newlines(p); }
           else break;
         }
       }
+      skip_newlines(p);
       if (!expect(p, TOK_RPAREN)) { free(args); return NULL; }
       if (cnt > 0) {
         hs->u.handle_stmt.args = p_alloc(p, (size_t)cnt * sizeof *args);
@@ -1224,7 +1536,7 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
   }
 
   /* Assignment: name = expr */
-  if (t->kind == TOK_IDENT && peek_next_non_comment(p)->kind == TOK_ASSIGN) {
+  if (is_ident_like(t->kind) && peek_next_non_comment(p)->kind == TOK_ASSIGN) {
     StigiStr name = tok_str(advance(p));
     advance(p); /* '=' */
     StigiExpr *val = parse_block_or_expr(p, stmt_col);
@@ -1242,7 +1554,8 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
   StigiExpr *e = parse_expr(p, stmt_col);
   if (p->failed) return NULL;
   if (peek(p)->kind == TOK_COLON_EQ) {
-    if (e->kind != STIGI_EXPR_CALL || e->u.call.arg_count != 1) {
+    if (e->kind != STIGI_EXPR_CALL || !e->u.call.has_parens || e->u.call.arg_count != 1 ||
+        e->u.call.type_arg_count != 0 || e->u.call.cap_arg_count != 0) {
       p_fail(p, peek(p)->span, "':=' requires an indexed element target 'arr(idx)'");
       return NULL;
     }
@@ -1263,12 +1576,16 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
 
 static StigiExpr *parse_block_or_expr(Parser *p, uint32_t base_col) {
   if (p->failed) return NULL;
+  if (!p_enter_depth(p, peek(p)->span)) return NULL;
   if (peek(p)->kind != TOK_NEWLINE) {
-    return parse_stmt(p, base_col);
+    StigiExpr *s = parse_stmt(p, base_col);
+    p_leave_depth(p);
+    return s;
   }
   const StigiTok *first = peek_skip_nl(p);
   if (first->kind == TOK_EOF || first->span.col <= base_col) {
     p_fail(p, first->span, "expected indented block");
+    p_leave_depth(p);
     return NULL;
   }
   skip_newlines(p);
@@ -1283,39 +1600,39 @@ static StigiExpr *parse_block_or_expr(Parser *p, uint32_t base_col) {
     if (nxt->span.col > block_col) {
       p_fail(p, nxt->span, "unexpected indentation");
       free(stmts);
+      p_leave_depth(p);
       return NULL;
     }
     skip_newlines(p);
     StigiExpr *s = parse_stmt(p, block_col);
-    if (p->failed) { free(stmts); return NULL; }
-    if (cnt == cap) {
-      cap = cap == 0 ? 4U : cap * 2U;
-      StigiExpr **ns = realloc(stmts, (size_t)cap * sizeof *ns);
-      if (ns == NULL) { free(stmts); p_fail_oom(p); return NULL; }
-      stmts = ns;
+    if (p->failed) { free(stmts); p_leave_depth(p); return NULL; }
+    if (cnt == cap && !p_grow(p, (void **)&stmts, &cap, sizeof *stmts)) {
+      free(stmts); p_leave_depth(p); return NULL;
     }
     stmts[cnt++] = s;
   }
 
   StigiExpr *blk = p_alloc(p, sizeof *blk);
-  if (blk == NULL) { free(stmts); p_fail_oom(p); return NULL; }
+  if (blk == NULL) { free(stmts); p_fail_oom(p); p_leave_depth(p); return NULL; }
   blk->kind = STIGI_EXPR_BLOCK;
   blk->span = cnt > 0 ? stmts[0]->span : first->span;
   if (cnt > 0) {
     blk->u.block.stmts = p_alloc(p, (size_t)cnt * sizeof *stmts);
-    if (blk->u.block.stmts == NULL) { free(stmts); p_fail_oom(p); return NULL; }
+    if (blk->u.block.stmts == NULL) { free(stmts); p_fail_oom(p); p_leave_depth(p); return NULL; }
     memcpy(blk->u.block.stmts, stmts, (size_t)cnt * sizeof *stmts);
     blk->u.block.count = cnt;
   }
   free(stmts);
+  p_leave_depth(p);
   return blk;
 }
 
 /* ---- Declarations ---- */
 
-static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
+static bool parse_def_head(Parser *p, bool is_lemma, uint32_t decl_col, StigiDefHead *h) {
   memset(h, 0, sizeof *h);
 
+  skip_head_cont_nl(p, decl_col);
   /* Optional [typeGroup] */
   if (peek(p)->kind == TOK_LBRACKET) {
     if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET, &h->type_params, &h->type_param_count)) {
@@ -1326,7 +1643,9 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   /* Zero or more {capGroup} or <factGroup> before (valGroup) */
   StigiHeadGroup *pre = NULL;
   uint32_t pre_cnt = 0, pre_cap = 0;
-  while (peek(p)->kind == TOK_LBRACE || peek(p)->kind == TOK_LT) {
+  for (;;) {
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind != TOK_LBRACE && peek(p)->kind != TOK_LT) break;
     StigiHeadGroup g;
     memset(&g, 0, sizeof g);
     g.span = peek(p)->span;
@@ -1338,11 +1657,8 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
       g.facts = parse_fact_group(p);
       if (p->failed) { free(pre); return false; }
     }
-    if (pre_cnt == pre_cap) {
-      pre_cap = pre_cap == 0 ? 4U : pre_cap * 2U;
-      StigiHeadGroup *np = realloc(pre, (size_t)pre_cap * sizeof *np);
-      if (np == NULL) { free(pre); p_fail_oom(p); return false; }
-      pre = np;
+    if (pre_cnt == pre_cap && !p_grow(p, (void **)&pre, &pre_cap, sizeof *pre)) {
+      free(pre); return false;
     }
     pre[pre_cnt++] = g;
   }
@@ -1354,6 +1670,7 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   }
   free(pre);
 
+  skip_head_cont_nl(p, decl_col);
   /* Value parameter group (...) */
   if (peek(p)->kind == TOK_LPAREN) {
     h->has_val_group = true;
@@ -1365,14 +1682,13 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   /* Zero or more <factGroup> after (valGroup), before ':' */
   StigiFactGroup *post_val = NULL;
   uint32_t pv_cnt = 0, pv_cap = 0;
-  while (peek(p)->kind == TOK_LT) {
+  for (;;) {
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind != TOK_LT) break;
     StigiFactGroup fg = parse_fact_group(p);
     if (p->failed) { free(post_val); return false; }
-    if (pv_cnt == pv_cap) {
-      pv_cap = pv_cap == 0 ? 4U : pv_cap * 2U;
-      StigiFactGroup *np = realloc(post_val, (size_t)pv_cap * sizeof *np);
-      if (np == NULL) { free(post_val); p_fail_oom(p); return false; }
-      post_val = np;
+    if (pv_cnt == pv_cap && !p_grow(p, (void **)&post_val, &pv_cap, sizeof *post_val)) {
+      free(post_val); return false;
     }
     post_val[pv_cnt++] = fg;
   }
@@ -1384,6 +1700,7 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   }
   free(post_val);
 
+  skip_head_cont_nl(p, decl_col);
   if (!expect(p, TOK_COLON)) return false;
 
   if (!is_lemma) {
@@ -1394,14 +1711,13 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   /* Zero or more exit <factGroup> (at least one for lemma def) */
   StigiFactGroup *ex = NULL;
   uint32_t ex_cnt = 0, ex_cap = 0;
-  while (peek(p)->kind == TOK_LT) {
+  for (;;) {
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind != TOK_LT) break;
     StigiFactGroup fg = parse_fact_group(p);
     if (p->failed) { free(ex); return false; }
-    if (ex_cnt == ex_cap) {
-      ex_cap = ex_cap == 0 ? 4U : ex_cap * 2U;
-      StigiFactGroup *ne = realloc(ex, (size_t)ex_cap * sizeof *ne);
-      if (ne == NULL) { free(ex); p_fail_oom(p); return false; }
-      ex = ne;
+    if (ex_cnt == ex_cap && !p_grow(p, (void **)&ex, &ex_cap, sizeof *ex)) {
+      free(ex); return false;
     }
     ex[ex_cnt++] = fg;
   }
@@ -1418,14 +1734,7 @@ static bool parse_def_head(Parser *p, bool is_lemma, StigiDefHead *h) {
   }
   free(ex);
 
-  /* Optional decreases(expr) */
-  if (tok_is_ident_eq(peek(p), "decreases")) {
-    advance(p);
-    if (!expect(p, TOK_LPAREN)) return false;
-    h->decreases = parse_expr(p, 0);
-    if (!expect(p, TOK_RPAREN)) return false;
-  }
-
+  skip_head_cont_nl(p, decl_col);
   return true;
 }
 
@@ -1441,6 +1750,10 @@ static StigiDecl *parse_rule_decl(Parser *p, bool is_pub, uint32_t decl_col) {
   if (p->failed || !expect(p, TOK_COLON)) return NULL;
   d->u.rule_decl.head = parse_fact_item(p, false);
   if (p->failed) return NULL;
+  if (d->u.rule_decl.head.kind != STIGI_FACT_ATOM || d->u.rule_decl.head.is_negated) {
+    p_fail(p, d->u.rule_decl.head.span, "rule head must be a positive atom");
+    return NULL;
+  }
 
   if (peek(p)->kind == TOK_ASSIGN) {
     advance(p);
@@ -1456,11 +1769,8 @@ static StigiDecl *parse_rule_decl(Parser *p, bool is_pub, uint32_t decl_col) {
     for (;;) {
       StigiFactItem it = parse_fact_item(p, false);
       if (p->failed) { free(lits); return NULL; }
-      if (cnt == cap) {
-        cap = cap == 0 ? 4U : cap * 2U;
-        StigiFactItem *nl = realloc(lits, (size_t)cap * sizeof *nl);
-        if (nl == NULL) { free(lits); p_fail_oom(p); return NULL; }
-        lits = nl;
+      if (cnt == cap && !p_grow(p, (void **)&lits, &cap, sizeof *lits)) {
+        free(lits); return NULL;
       }
       lits[cnt++] = it;
       if (peek(p)->kind == TOK_COMMA) {
@@ -1486,53 +1796,68 @@ static StigiDecl *parse_rule_decl(Parser *p, bool is_pub, uint32_t decl_col) {
 static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
   if (p->failed || check_not_in_lang(p)) return NULL;
   const StigiTok *t = peek(p);
+  if (!p_enter_depth(p, t->span)) return NULL;
 
   if (t->kind == TOK_KW_DEF) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_DEF;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed || !parse_def_head(p, false, &d->u.def_decl.head)) return NULL;
-    if (!expect(p, TOK_ASSIGN)) return NULL;
+    if (p->failed || !parse_def_head(p, false, decl_col, &d->u.def_decl.head)) {
+      p_leave_depth(p);
+      return NULL;
+    }
+    if (!expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
     d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_LEMMA) {
     advance(p);
-    if (!expect(p, TOK_KW_DEF)) return NULL;
+    if (!expect(p, TOK_KW_DEF)) { p_leave_depth(p); return NULL; }
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_LEMMA_DEF;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed || !parse_def_head(p, true, &d->u.def_decl.head)) return NULL;
-    if (!expect(p, TOK_ASSIGN)) return NULL;
+    if (p->failed || !parse_def_head(p, true, decl_col, &d->u.def_decl.head)) {
+      p_leave_depth(p);
+      return NULL;
+    }
+    if (!expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
     d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_VAL) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_VAL;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LBRACE) {
-      if (!parse_cap_group(p, &d->u.val_decl.caps, &d->u.val_decl.cap_count)) return NULL;
+      if (!parse_cap_group(p, &d->u.val_decl.caps, &d->u.val_decl.cap_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
     }
-    if (!expect(p, TOK_COLON)) return NULL;
+    skip_head_cont_nl(p, decl_col);
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
     d->u.val_decl.type = parse_type(p);
-    if (p->failed || !expect(p, TOK_ASSIGN)) return NULL;
+    skip_head_cont_nl(p, decl_col);
+    if (p->failed || !expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
     d->u.val_decl.body = parse_block_or_expr(p, decl_col);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
 
     /* Detect Test and NegTest (language.md 6) */
     if (d->u.val_decl.cap_count == 1 && d->u.val_decl.caps[0].name.len == 0 &&
@@ -1545,29 +1870,32 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
         d->kind = STIGI_DECL_NEG_TEST;
       }
     }
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_ENUM) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_ENUM;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
     if (peek(p)->kind == TOK_LBRACKET) {
       if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
                             &d->u.enum_decl.type_params, &d->u.enum_decl.type_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
-    if (!expect(p, TOK_COLON)) return NULL;
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
     skip_newlines(p);
     const StigiTok *fc = peek(p);
     if (fc->kind != TOK_KW_CASE || fc->span.col <= decl_col) {
       p_fail(p, fc->span, "expected indented 'case' in enum");
+      p_leave_depth(p);
       return NULL;
     }
     uint32_t case_col = fc->span.col;
@@ -1581,96 +1909,110 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       memset(&ec, 0, sizeof ec);
       ec.span = advance(p)->span; /* 'case' */
       ec.name = parse_name(p);
-      if (p->failed) { free(cases); return NULL; }
+      if (p->failed) { free(cases); p_leave_depth(p); return NULL; }
       if (peek(p)->kind == TOK_LPAREN) {
         ec.has_parens = true;
         if (!parse_param_list(p, TOK_LPAREN, TOK_RPAREN, &ec.fields, &ec.field_count)) {
           free(cases);
+          p_leave_depth(p);
           return NULL;
         }
+        skip_head_cont_nl(p, case_col);
         if (peek(p)->kind == TOK_LT) {
           ec.has_facts = true;
           ec.facts = parse_fact_group(p);
-          if (p->failed) { free(cases); return NULL; }
+          if (p->failed) { free(cases); p_leave_depth(p); return NULL; }
         }
       }
-      if (cnt == cap) {
-        cap = cap == 0 ? 4U : cap * 2U;
-        StigiEnumCase *nc = realloc(cases, (size_t)cap * sizeof *nc);
-        if (nc == NULL) { free(cases); p_fail_oom(p); return NULL; }
-        cases = nc;
+      if (cnt == cap && !p_grow(p, (void **)&cases, &cap, sizeof *cases)) {
+        free(cases); p_leave_depth(p); return NULL;
       }
       cases[cnt++] = ec;
     }
     if (cnt > 0) {
       d->u.enum_decl.cases = p_alloc(p, (size_t)cnt * sizeof *cases);
-      if (d->u.enum_decl.cases == NULL) { free(cases); p_fail_oom(p); return NULL; }
+      if (d->u.enum_decl.cases == NULL) { free(cases); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.enum_decl.cases, cases, (size_t)cnt * sizeof *cases);
       d->u.enum_decl.case_count = cnt;
     }
     free(cases);
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_TYPE) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_TYPE;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LBRACKET) {
       if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
                             &d->u.type_decl.type_params, &d->u.type_decl.type_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LPAREN) {
       if (!parse_param_list(p, TOK_LPAREN, TOK_RPAREN,
                             &d->u.type_decl.val_params, &d->u.type_decl.val_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LBRACE) {
       if (!parse_cap_group(p, &d->u.type_decl.cap_params, &d->u.type_decl.cap_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
-    if (!expect(p, TOK_ASSIGN)) return NULL;
+    skip_head_cont_nl(p, decl_col);
+    if (!expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
+    if (peek(p)->kind == TOK_NEWLINE && peek_skip_nl(p)->span.col > decl_col) {
+      skip_newlines(p);
+    }
     d->u.type_decl.rhs = parse_type(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LT) {
       d->u.type_decl.has_facts = true;
       d->u.type_decl.facts = parse_fact_group(p);
     }
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_CAPABILITY) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_CAPABILITY;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
     if (peek(p)->kind == TOK_LBRACKET) {
       if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
                             &d->u.cap_decl.type_params, &d->u.cap_decl.type_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
-    if (!expect(p, TOK_COLON)) return NULL;
-    skip_newlines(p);
-    const StigiTok *fm = peek(p);
-    if (fm->span.col <= decl_col) {
-      p_fail(p, fm->span, "expected indented capability body");
-      return NULL;
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
+    const StigiTok *fm = peek_skip_nl(p);
+    /* Marker capability (e.g. `capability Stigi.Mut:` with 0 operations, ruling S42) */
+    if (fm->kind == TOK_EOF || fm->span.col <= decl_col) {
+      p_leave_depth(p);
+      return d;
     }
-    uint32_t body_col = fm->span.col;
+    skip_newlines(p);
+    uint32_t body_col = peek(p)->span.col;
 
     if (peek(p)->kind == TOK_KW_STATE && peek(p)->span.col == body_col) {
       advance(p);
@@ -1678,47 +2020,41 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       uint32_t cnt = 0, cap = 0;
       for (;;) {
         StigiStr sn = parse_name(p);
-        if (p->failed) { free(sts); return NULL; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiStr *ns = realloc(sts, (size_t)cap * sizeof *ns);
-          if (ns == NULL) { free(sts); p_fail_oom(p); return NULL; }
-          sts = ns;
+        if (p->failed) { free(sts); p_leave_depth(p); return NULL; }
+        if (cnt == cap && !p_grow(p, (void **)&sts, &cap, sizeof *sts)) {
+          free(sts); p_leave_depth(p); return NULL;
         }
         sts[cnt++] = sn;
         if (peek(p)->kind == TOK_COMMA) advance(p);
         else break;
       }
       d->u.cap_decl.states = p_alloc(p, (size_t)cnt * sizeof *sts);
-      if (d->u.cap_decl.states == NULL) { free(sts); p_fail_oom(p); return NULL; }
+      if (d->u.cap_decl.states == NULL) { free(sts); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.cap_decl.states, sts, (size_t)cnt * sizeof *sts);
       d->u.cap_decl.state_count = cnt;
       free(sts);
 
       skip_newlines(p);
-      if (!expect(p, TOK_KW_START)) return NULL;
+      if (!expect(p, TOK_KW_START)) { p_leave_depth(p); return NULL; }
       d->u.cap_decl.start_state = parse_name(p);
-      if (p->failed) return NULL;
+      if (p->failed) { p_leave_depth(p); return NULL; }
 
       skip_newlines(p);
-      if (!expect(p, TOK_KW_STOP)) return NULL;
+      if (!expect(p, TOK_KW_STOP)) { p_leave_depth(p); return NULL; }
       StigiStr *stops = NULL;
       cnt = 0; cap = 0;
       for (;;) {
         StigiStr sn = parse_name(p);
-        if (p->failed) { free(stops); return NULL; }
-        if (cnt == cap) {
-          cap = cap == 0 ? 4U : cap * 2U;
-          StigiStr *ns = realloc(stops, (size_t)cap * sizeof *ns);
-          if (ns == NULL) { free(stops); p_fail_oom(p); return NULL; }
-          stops = ns;
+        if (p->failed) { free(stops); p_leave_depth(p); return NULL; }
+        if (cnt == cap && !p_grow(p, (void **)&stops, &cap, sizeof *stops)) {
+          free(stops); p_leave_depth(p); return NULL;
         }
         stops[cnt++] = sn;
         if (peek(p)->kind == TOK_COMMA) advance(p);
         else break;
       }
       d->u.cap_decl.stop_states = p_alloc(p, (size_t)cnt * sizeof *stops);
-      if (d->u.cap_decl.stop_states == NULL) { free(stops); p_fail_oom(p); return NULL; }
+      if (d->u.cap_decl.stop_states == NULL) { free(stops); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.cap_decl.stop_states, stops, (size_t)cnt * sizeof *stops);
       d->u.cap_decl.stop_state_count = cnt;
       free(stops);
@@ -1736,65 +2072,79 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       if (peek(p)->kind == TOK_KW_DEF) {
         StigiSpan osp = advance(p)->span;
         m = p_alloc(p, sizeof *m);
-        if (m == NULL) { free(members); p_fail_oom(p); return NULL; }
+        if (m == NULL) { free(members); p_fail_oom(p); p_leave_depth(p); return NULL; }
         m->kind = STIGI_DECL_DEF;
         m->span = osp;
         m->name = parse_name(p);
-        if (p->failed || !parse_def_head(p, false, &m->u.def_decl.head)) {
+        if (p->failed || !parse_def_head(p, false, body_col, &m->u.def_decl.head)) {
           free(members);
+          p_leave_depth(p);
           return NULL;
         }
       } else {
         m = parse_rule_decl(p, false, body_col);
-        if (p->failed) { free(members); return NULL; }
+        if (p->failed) { free(members); p_leave_depth(p); return NULL; }
       }
-      if (mcnt == mcap) {
-        mcap = mcap == 0 ? 4U : mcap * 2U;
-        StigiDecl **nm = realloc(members, (size_t)mcap * sizeof *nm);
-        if (nm == NULL) { free(members); p_fail_oom(p); return NULL; }
-        members = nm;
+      if (mcnt == mcap && !p_grow(p, (void **)&members, &mcap, sizeof *members)) {
+        free(members); p_leave_depth(p); return NULL;
       }
       members[mcnt++] = m;
     }
     if (mcnt > 0) {
       d->u.cap_decl.members = p_alloc(p, (size_t)mcnt * sizeof *members);
-      if (d->u.cap_decl.members == NULL) { free(members); p_fail_oom(p); return NULL; }
+      if (d->u.cap_decl.members == NULL) { free(members); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.cap_decl.members, members, (size_t)mcnt * sizeof *members);
       d->u.cap_decl.member_count = mcnt;
     }
     free(members);
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_HANDLER) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_HANDLER;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LBRACKET) {
       if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
                             &d->u.handler_decl.type_params, &d->u.handler_decl.type_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind == TOK_LBRACE) {
+      if (!parse_cap_group(p, &d->u.handler_decl.cap_params, &d->u.handler_decl.cap_param_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    }
+    skip_head_cont_nl(p, decl_col);
     if (peek(p)->kind == TOK_LPAREN) {
       d->u.handler_decl.has_val_parens = true;
       if (!parse_param_list(p, TOK_LPAREN, TOK_RPAREN,
                             &d->u.handler_decl.val_params, &d->u.handler_decl.val_param_count)) {
+        p_leave_depth(p);
         return NULL;
       }
     }
-    if (!expect(p, TOK_KW_FOR)) return NULL;
-    d->u.handler_decl.for_cap = parse_name(p);
-    if (p->failed || !expect(p, TOK_COLON)) return NULL;
+    skip_head_cont_nl(p, decl_col);
+    if (!expect(p, TOK_KW_FOR)) { p_leave_depth(p); return NULL; }
+    d->u.handler_decl.for_cap_type = parse_type(p);
+    if (p->failed || d->u.handler_decl.for_cap_type == NULL) { p_leave_depth(p); return NULL; }
+    d->u.handler_decl.for_cap = d->u.handler_decl.for_cap_type->name;
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
     skip_newlines(p);
     const StigiTok *fm = peek(p);
     if (fm->span.col <= decl_col) {
       p_fail(p, fm->span, "expected indented handler body");
+      p_leave_depth(p);
       return NULL;
     }
     uint32_t body_col = fm->span.col;
@@ -1806,18 +2156,15 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       if (nxt->kind != TOK_KW_VAR || nxt->span.col != body_col) break;
       skip_newlines(p);
       StigiExpr *v = parse_stmt(p, body_col);
-      if (p->failed) { free(vars); return NULL; }
-      if (vcnt == vcap) {
-        vcap = vcap == 0 ? 4U : vcap * 2U;
-        StigiExpr **nv = realloc(vars, (size_t)vcap * sizeof *nv);
-        if (nv == NULL) { free(vars); p_fail_oom(p); return NULL; }
-        vars = nv;
+      if (p->failed) { free(vars); p_leave_depth(p); return NULL; }
+      if (vcnt == vcap && !p_grow(p, (void **)&vars, &vcap, sizeof *vars)) {
+        free(vars); p_leave_depth(p); return NULL;
       }
       vars[vcnt++] = v;
     }
     if (vcnt > 0) {
       d->u.handler_decl.vars = p_alloc(p, (size_t)vcnt * sizeof *vars);
-      if (d->u.handler_decl.vars == NULL) { free(vars); p_fail_oom(p); return NULL; }
+      if (d->u.handler_decl.vars == NULL) { free(vars); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.handler_decl.vars, vars, (size_t)vcnt * sizeof *vars);
       d->u.handler_decl.var_count = vcnt;
     }
@@ -1830,22 +2177,20 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       if (nxt->kind != TOK_KW_DEF || nxt->span.col != body_col) break;
       skip_newlines(p);
       StigiDecl *op = parse_decl(p, false, body_col);
-      if (p->failed) { free(defs); return NULL; }
-      if (dcnt == dcap) {
-        dcap = dcap == 0 ? 4U : dcap * 2U;
-        StigiDecl **nd = realloc(defs, (size_t)dcap * sizeof *nd);
-        if (nd == NULL) { free(defs); p_fail_oom(p); return NULL; }
-        defs = nd;
+      if (p->failed) { free(defs); p_leave_depth(p); return NULL; }
+      if (dcnt == dcap && !p_grow(p, (void **)&defs, &dcap, sizeof *defs)) {
+        free(defs); p_leave_depth(p); return NULL;
       }
       defs[dcnt++] = op;
     }
     if (dcnt > 0) {
       d->u.handler_decl.defs = p_alloc(p, (size_t)dcnt * sizeof *defs);
-      if (d->u.handler_decl.defs == NULL) { free(defs); p_fail_oom(p); return NULL; }
+      if (d->u.handler_decl.defs == NULL) { free(defs); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.handler_decl.defs, defs, (size_t)dcnt * sizeof *defs);
       d->u.handler_decl.def_count = dcnt;
     }
     free(defs);
+    p_leave_depth(p);
     return d;
   }
 
@@ -1854,15 +2199,17 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
     const StigiTok *abi = peek(p);
     if (abi->kind != TOK_STRING) {
       p_fail(p, abi->span, "expected ABI string after 'extern'");
+      p_leave_depth(p);
       return NULL;
     }
     advance(p);
     if (abi->len != 3 || memcmp(abi->ptr, "\"c\"", 3) != 0) {
       p_fail_not_in_lang(p, abi->span, "extern-abi");
+      p_leave_depth(p);
       return NULL;
     }
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_EXTERN;
     d->span = t->span;
     d->is_pub = is_pub;
@@ -1872,79 +2219,78 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       advance(p);
       d->u.extern_decl.is_val = false;
       d->name = parse_name(p);
-      if (p->failed || !parse_def_head(p, false, &d->u.extern_decl.head)) return NULL;
+      if (p->failed || !parse_def_head(p, false, decl_col, &d->u.extern_decl.head)) {
+        p_leave_depth(p);
+        return NULL;
+      }
       if (peek(p)->kind == TOK_ASSIGN) {
         advance(p);
         d->u.extern_decl.body = parse_block_or_expr(p, decl_col);
       }
+      p_leave_depth(p);
       return d;
     }
     if (peek(p)->kind == TOK_KW_VAL) {
       advance(p);
       d->u.extern_decl.is_val = true;
       d->name = parse_name(p);
-      if (p->failed || !expect(p, TOK_COLON)) return NULL;
+      if (p->failed || !expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
       d->u.extern_decl.val_type = parse_type(p);
+      p_leave_depth(p);
       return d;
     }
     p_fail(p, peek(p)->span, "expected 'def' or 'val' after extern \"c\"");
+    p_leave_depth(p);
     return NULL;
   }
 
   if (t->kind == TOK_KW_RELATION) {
     advance(p);
     StigiDecl *d = p_alloc(p, sizeof *d);
-    if (d == NULL) { p_fail_oom(p); return NULL; }
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
     d->kind = STIGI_DECL_RELATION;
     d->span = t->span;
     d->is_pub = is_pub;
     d->name = parse_name(p);
-    if (p->failed) return NULL;
+    if (p->failed) { p_leave_depth(p); return NULL; }
     if (!parse_param_list(p, TOK_LPAREN, TOK_RPAREN,
                           &d->u.relation_decl.columns, &d->u.relation_decl.column_count)) {
+      p_leave_depth(p);
       return NULL;
     }
+    p_leave_depth(p);
     return d;
   }
 
   if (t->kind == TOK_KW_RULE) {
-    return parse_rule_decl(p, is_pub, decl_col);
+    StigiDecl *rd = parse_rule_decl(p, is_pub, decl_col);
+    p_leave_depth(p);
+    return rd;
   }
 
   if (t->kind == TOK_KW_FOR) {
     p_fail_not_in_lang(p, t->span, "for");
+    p_leave_depth(p);
     return NULL;
   }
 
   p_fail(p, t->span, "expected declaration, got '%s'", stigi_tok_kind_name(t->kind));
+  p_leave_depth(p);
   return NULL;
 }
 
-StigiParseResult stigi_parse_unit(const char *src, size_t len, Arena *arena) {
+StigiParseResult stigi_parse_tokens(const StigiTok *toks, uint32_t count, Arena *arena) {
   Parser p;
   memset(&p, 0, sizeof p);
   p.arena = arena;
   p.res.status = STIGI_OK;
   p.res.diag_kind = STIGI_PARSE_OK;
 
-  if (src == NULL || arena == NULL) {
+  if (toks == NULL || count == 0 || arena == NULL) {
     p.res.status = STIGI_ERR_INVALID;
     p.res.diag_kind = STIGI_PARSE_ERR_PARSE;
     p.res.diag_code = "parse";
     (void)snprintf(p.res.msg, sizeof p.res.msg, "invalid arguments");
-    return p.res;
-  }
-
-  StigiTok *toks = NULL;
-  uint32_t count = 0;
-  Diag ldiag;
-  diag_clear(&ldiag);
-  Status st = stigi_lex_all(src, len, &toks, &count, arena, &ldiag);
-  if (st != STIGI_OK) {
-    p.res.status = st;
-    p.res.diag_kind = STIGI_PARSE_ERR_PARSE;
-    p.res.diag_code = "parse";
-    (void)snprintf(p.res.msg, sizeof p.res.msg, "%s", ldiag.msg);
     return p.res;
   }
 
@@ -1986,11 +2332,8 @@ StigiParseResult stigi_parse_unit(const char *src, size_t len, Arena *arena) {
     if (p.failed || !expect(&p, TOK_ASSIGN)) { free(aliases); return p.res; }
     al.target = parse_name(&p);
     if (p.failed) { free(aliases); return p.res; }
-    if (acnt == acap) {
-      acap = acap == 0 ? 4U : acap * 2U;
-      StigiAlias *na = realloc(aliases, (size_t)acap * sizeof *na);
-      if (na == NULL) { free(aliases); p_fail_oom(&p); return p.res; }
-      aliases = na;
+    if (acnt == acap && !p_grow(&p, (void **)&aliases, &acap, sizeof *aliases)) {
+      free(aliases); return p.res;
     }
     aliases[acnt++] = al;
     skip_newlines(&p);
@@ -2024,4 +2367,29 @@ StigiParseResult stigi_parse_unit(const char *src, size_t len, Arena *arena) {
 
   p.res.unit = unit;
   return p.res;
+}
+
+StigiParseResult stigi_parse_unit(const char *src, size_t len, Arena *arena) {
+  StigiParseResult res;
+  memset(&res, 0, sizeof res);
+  if (src == NULL || arena == NULL) {
+    res.status = STIGI_ERR_INVALID;
+    res.diag_kind = STIGI_PARSE_ERR_PARSE;
+    res.diag_code = "parse";
+    (void)snprintf(res.msg, sizeof res.msg, "invalid arguments");
+    return res;
+  }
+  StigiTok *toks = NULL;
+  uint32_t count = 0;
+  Diag ldiag;
+  diag_clear(&ldiag);
+  Status st = stigi_lex_all(src, len, &toks, &count, arena, &ldiag);
+  if (st != STIGI_OK) {
+    res.status = st;
+    res.diag_kind = STIGI_PARSE_ERR_PARSE;
+    res.diag_code = "parse";
+    (void)snprintf(res.msg, sizeof res.msg, "%s", ldiag.msg);
+    return res;
+  }
+  return stigi_parse_tokens(toks, count, arena);
 }

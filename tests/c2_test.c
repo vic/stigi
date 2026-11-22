@@ -75,7 +75,7 @@ static void test_roundtrips(void) {
   check_roundtrip(
       "lemma_def",
       "// prompt: transitivity of below.\n"
-      "lemma def Demo.belowTrans(low: U64, mid: U64, high: U64) <below(low, mid), below(mid, high)>: <below(low, high)> decreases(high) =\n"
+      "lemma def Demo.belowTrans(low: U64, mid: U64, high: U64) <below(low, mid), below(mid, high), decreases(high)>: <below(low, high)> =\n"
       "  @<below(low, high)>\n",
       STIGI_DECL_LEMMA_DEF);
 
@@ -159,8 +159,8 @@ static void test_roundtrips(void) {
       "def Demo.Bytes.count(size: U64, block: Array[U8](size), wanted: U8): U64 <lessOrEqual(result, size)> =\n"
       "  var matches@<lessOrEqual(matches, size)>: U64 = 0\n"
       "  var index: U64 = 0\n"
-      "  while index < size decreases(size - index) do\n"
-      "    @<lessOrEqual(matches, index), lessOrEqual(index, size)>\n"
+      "  while index < size do\n"
+      "    @<lessOrEqual(matches, index), lessOrEqual(index, size), decreases(size - index)>\n"
       "    matches = if block(index) == wanted then matches + 1 else matches\n"
       "    index = index + 1\n"
       "  matches\n",
@@ -176,6 +176,163 @@ static void test_roundtrips(void) {
       "    case VariableIndex(variables, position) => position\n"
       "    case Constant(value) => value\n",
       STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "denial_multi_atom",
+      "// prompt: count rows and finish statement before closing database.\n"
+      "def Demo.Database.count {database: Demo.Database} <at(database, Open)> (query: Demo.Text(size), size: U64): U64 <at(database, Closed)> =\n"
+      "  handle statement = Demo.Statement(database, size, query)\n"
+      "  @<not (close(database), at(statement, Prepared))>\n"
+      "  val rows = statement.step()\n"
+      "  statement.finish()\n"
+      "  database.close()\n"
+      "  rows\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "marker_capability",
+      "// prompt: marker capability for mutation.\n"
+      "capability Stigi.Mut:\n",
+      STIGI_DECL_CAPABILITY);
+
+  check_roundtrip(
+      "cap_using_handler_and_generic_handle",
+      "// prompt: handler using another capability for generic capability.\n"
+      "handler Demo.Buffered [A: Type] {region: Stigi.Region} (cap: U64) for Demo.Channel[A]:\n"
+      "  def send(item: A): Unit = ()\n",
+      STIGI_DECL_HANDLER);
+
+  check_roundtrip(
+      "generic_expr_no_parens",
+      "// prompt: C-DSL size of element type.\n"
+      "extern \"c\" def Stigi.Array.bytesFor [A: Type] (count: U64) <below(count, Stigi.Array.maximumCount[A])>: U64 =\n"
+      "  count * size[A]\n",
+      STIGI_DECL_EXTERN);
+
+  check_roundtrip(
+      "precedence_and_multiline_if_then",
+      "// prompt: preserve precedence and multiline if-then-match.\n"
+      "def Demo.prec(flag: Bool, left: U64, right: U64): U64 =\n"
+      "  val negFlag: Bool = !(left == right)\n"
+      "  val scaled: U64 = (if flag then left else right) + 3\n"
+      "  if negFlag then\n"
+      "    scaled match\n"
+      "      case 0 => 1\n"
+      "      case _ => scaled\n"
+      "  else\n"
+      "    left + right\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "rule_neg_lit_and_parens",
+      "// prompt: rule with negative literal and parenthesized arithmetic.\n"
+      "rule def Stigi.Arith.sample: Stigi.Facts.ok(out) =\n"
+      "  Stigi.Facts.val(num), num > -1, out = num * (num + 1)\n",
+      STIGI_DECL_RULE);
+
+  check_roundtrip(
+      "bool_pattern_match",
+      "// prompt: match over Bool.\n"
+      "def Demo.fromBool(flag: Bool): U64 =\n"
+      "  flag match\n"
+      "    case true => 1\n"
+      "    case false => 0\n",
+      STIGI_DECL_DEF);
+
+  /* Verify ALL 3 real D1 units verbatim from vic/plan/d1-units.md parse, pass tenet-gate, and round-trip idempotently */
+  const char *d1_units[] = {
+      "// prompt: outcome of appending one row into a heap-backed table.\n"
+      "enum Stigi.Table.AppendResult[A: Type]:\n"
+      "  case Appended(cap: U64, count: U64, items: Array[A](cap)) <lessOrEqual(count, cap), below(0, cap)>\n"
+      "  case AppendFailed(cap: U64, count: U64, items: Array[A](cap)) <lessOrEqual(count, cap), below(0, cap)>\n",
+
+      "// prompt: append one row into a heap-backed table, growing capacity by doubling via Array.tryGrow when full.\n"
+      "pub def Stigi.Table.append [A: Type] {region: Stigi.Region, Stigi.Mut} (\n"
+      "    cap: U64,\n"
+      "    count: U64,\n"
+      "    items: Array[A](cap),\n"
+      "    row: A\n"
+      ") <lessOrEqual(count, cap), below(0, cap), below(cap, Stigi.Table.maxCap)> : Stigi.Table.AppendResult[A] =\n"
+      "  if count < cap then\n"
+      "    items(count) := row\n"
+      "    AppendResult.Appended(cap, count + 1, items)\n"
+      "  else\n"
+      "    val nextCap: U64 = cap + cap\n"
+      "    Array.tryGrow{region}(items, nextCap, row) match\n"
+      "      case Grown(grown) =>\n"
+      "        grown(count) := row\n"
+      "        AppendResult.Appended(nextCap, count + 1, grown)\n"
+      "      case GrowFailed(kept) =>\n"
+      "        AppendResult.AppendFailed(cap, count, kept)\n",
+
+      "// prompt: scan one identifier span forward in source starting at start.\n"
+      "pub def Stigi.Lex.step(\n"
+      "    len: U64,\n"
+      "    start: U64,\n"
+      "    source: Array[U8](len)\n"
+      ") <lessOrEqual(start, len)> : U64 <lessOrEqual(start, result), lessOrEqual(result, len)> =\n"
+      "  var pos: U64 = start\n"
+      "  while pos < len && Stigi.Lex.isIdentByte(source(pos)) do\n"
+      "    @<lessOrEqual(start, pos), lessOrEqual(pos, len), decreases(len - pos)>\n"
+      "    pos = pos + 1\n"
+      "  pos\n",
+
+      "// prompt: allocate bytes with 8-byte alignment from an arena chunk, or map a new chunk via Array.tryFill.\n"
+      "pub def Stigi.Arena.tryAllocate {region: Stigi.Region} (\n"
+      "    cap: U64,\n"
+      "    pos: U64,\n"
+      "    bytes: U64,\n"
+      "    chunk: Array[U8](cap)\n"
+      ") <lessOrEqual(pos, cap), below(cap, Stigi.Arena.maxChunk), below(bytes, Stigi.Arena.maxChunk)> : Stigi.Arena.AllocResult =\n"
+      "  val rem: U64 = bytes % 8\n"
+      "  val pad: U64 = (8 - rem) % 8\n"
+      "  val aligned: U64 = bytes + pad\n"
+      "  val nextPos: U64 = pos + aligned\n"
+      "  if nextPos <= cap then\n"
+      "    AllocResult.Allocated(pos, nextPos, cap, chunk)\n"
+      "  else\n"
+      "    val chunkCap: U64 = if aligned < 65536 then 65536 else aligned\n"
+      "    Array.tryFill{region}(chunkCap, 0) match\n"
+      "      case Filled(freshChunk) =>\n"
+      "        AllocResult.Allocated(0, aligned, chunkCap, freshChunk)\n"
+      "      case FillFailed =>\n"
+      "        AllocResult.FillFailed\n"
+  };
+  for (size_t i = 0; i < sizeof(d1_units) / sizeof(d1_units[0]); i++) {
+    Arena a;
+    arena_init(&a);
+    StigiGateFindings gf;
+    stigi_gate_findings_init(&gf);
+    Diag gd;
+    diag_clear(&gd);
+    CHECK(stigi_gate_check_source(d1_units[i], strlen(d1_units[i]), &gf, &gd) == STIGI_OK && gf.count == 0,
+          "D1 unit passes tenet gate");
+    if (gf.count > 0) {
+      fprintf(stderr, "  D1[%zu] gate finding: %s: %s\n", i,
+              stigi_gate_code_name(gf.items[0].code), gf.items[0].msg);
+    }
+    stigi_gate_findings_free(&gf);
+
+    StigiParseResult r1 = stigi_parse_unit(d1_units[i], strlen(d1_units[i]), &a);
+    if (r1.status != STIGI_OK || r1.unit == NULL) {
+      fprintf(stderr, "  D1[%zu] parse error at %u:%u: %s (%s)\n", i,
+              r1.err_span.line, r1.err_span.col, r1.msg,
+              r1.diag_code != NULL ? r1.diag_code : "none");
+    }
+    CHECK(r1.status == STIGI_OK && r1.unit != NULL, "D1 unit parses");
+    if (r1.unit != NULL) {
+      char *p1 = NULL, *p2 = NULL;
+      size_t l1 = 0, l2 = 0;
+      CHECK(stigi_print_unit(r1.unit, &p1, &l1, &a, &gd) == STIGI_OK, "D1 unit prints");
+      StigiParseResult r2 = stigi_parse_unit(p1, l1, &a);
+      CHECK(r2.status == STIGI_OK && r2.unit != NULL, "D1 unit re-parses");
+      if (r2.unit != NULL) {
+        CHECK(stigi_print_unit(r2.unit, &p2, &l2, &a, &gd) == STIGI_OK, "D1 unit re-prints");
+        CHECK(l1 == l2 && memcmp(p1, p2, l1) == 0, "D1 unit print(parse(print(parse(x)))) idempotent");
+      }
+    }
+    arena_free(&a);
+  }
 }
 
 static bool has_gate_code(const StigiGateFindings *f, StigiGateCode code) {
@@ -219,18 +376,32 @@ static void check_gate_neg(const char *label, const char *src, StigiGateCode exp
 }
 
 static void test_tenet_gate(void) {
-  /* Self-check word table */
+  /* Self-check ALL 32 decoded words (28 general + 4 exit) */
   CHECK(stigi_gate_word_count() == 28, "28 general forbidden words");
   CHECK(stigi_gate_exit_word_count() == 4, "4 exit call-target words");
+  static const char *const WANT_WORDS[28] = {
+      "abort", "aborts", "aborted", "aborting",
+      "trap", "traps", "trapped", "trapping",
+      "unreachable",
+      "todo", "todos",
+      "fixme", "fixmes",
+      "skip", "skips", "skipped", "skipping",
+      "later",
+      "stub", "stubs", "stubbed", "stubbing",
+      "placeholder", "placeholders",
+      "unsupported",
+      "panic", "panics", "panicked"
+  };
+  static const char *const WANT_EXITS[4] = { "exit", "exits", "exited", "exiting" };
   char wbuf[32];
-  stigi_gate_word_decode(0, wbuf, sizeof wbuf);
-  CHECK(strcmp(wbuf, "abort") == 0, "first forbidden word decodes to abort");
-  stigi_gate_word_decode(27, wbuf, sizeof wbuf);
-  CHECK(strcmp(wbuf, "panicked") == 0, "last forbidden word decodes to panicked");
-  stigi_gate_exit_word_decode(0, wbuf, sizeof wbuf);
-  CHECK(strcmp(wbuf, "exit") == 0, "first exit word decodes to exit");
-  stigi_gate_exit_word_decode(3, wbuf, sizeof wbuf);
-  CHECK(strcmp(wbuf, "exiting") == 0, "last exit word decodes to exiting");
+  for (size_t i = 0; i < 28; i++) {
+    stigi_gate_word_decode(i, wbuf, sizeof wbuf);
+    CHECK(strcmp(wbuf, WANT_WORDS[i]) == 0, "forbidden word table entry matches spec");
+  }
+  for (size_t i = 0; i < 4; i++) {
+    stigi_gate_exit_word_decode(i, wbuf, sizeof wbuf);
+    CHECK(strcmp(wbuf, WANT_EXITS[i]) == 0, "exit word table entry matches spec");
+  }
 
   /* POS: lateral, trapezoid, stubborn, bytesAt, sizeOf, exitState, freeAtExit -> 0 findings */
   check_gate_pos(
@@ -290,7 +461,20 @@ static void test_tenet_gate(void) {
       "type Demo.Raw = Ptr[U8](8)\n",
       STIGI_GATE_BARE_POINTER);
 
-  /* NEG: 2-arg Stigi.Test.expect */
+  check_gate_neg(
+      "neg_ptr_lt_inside_len_bypass",
+      "// prompt: pointer with '<' inside len expr, no fact group.\n"
+      "type Demo.Raw = Ptr[U8](if 1 < 2 then 8 else 8)\n",
+      STIGI_GATE_BARE_POINTER);
+
+  check_gate_pos(
+      "pos_multiline_refined_ptr",
+      "// prompt: multiline refined pointer type.\n"
+      "type Stigi.RawBuf =\n"
+      "  Ptr[U8](16)\n"
+      "  <valid(self)>\n");
+
+  /* NEG: 2-arg Stigi.Test.expect, alias bypass, whitespace reason, NegTest.expect */
   check_gate_neg(
       "neg_expect_2args",
       "// prompt: test with only two args.\n"
@@ -298,13 +482,86 @@ static void test_tenet_gate(void) {
       "  Stigi.Test.expect(1, 1)\n",
       STIGI_GATE_EXPECT_FORM);
 
-  /* NEG: empty reason */
   check_gate_neg(
       "neg_expect_empty_reason",
       "// prompt: test with empty reason.\n"
       "val Demo.Tests.bad {Stigi.Test}: Stigi.Test.Result =\n"
       "  Stigi.Test.expect(1, 1, \"\")\n",
       STIGI_GATE_EXPECT_FORM);
+
+  check_gate_neg(
+      "neg_expect_whitespace_reason",
+      "// prompt: test with whitespace-only reason.\n"
+      "val Demo.Tests.bad {Stigi.Test}: Stigi.Test.Result =\n"
+      "  Stigi.Test.expect(1, 1, \"   \\t \")\n",
+      STIGI_GATE_EXPECT_FORM);
+
+  check_gate_neg(
+      "neg_expect_alias_bypass",
+      "// prompt: aliased expect with only two args.\n"
+      "alias checkEqual = Stigi.Test.expect\n"
+      "val Demo.Tests.bad {Stigi.Test}: Stigi.Test.Result =\n"
+      "  checkEqual(1, 1)\n",
+      STIGI_GATE_EXPECT_FORM);
+
+  check_gate_pos(
+      "pos_expect_alias_valid",
+      "// prompt: aliased expect with valid 3 args.\n"
+      "alias checkEqual = Stigi.Test.expect\n"
+      "val Demo.Tests.good {Stigi.Test}: Stigi.Test.Result =\n"
+      "  checkEqual(1, 1, \"one equals one\")\n");
+
+  check_gate_neg(
+      "neg_negtest_expect_1arg",
+      "// prompt: negtest expect missing reason.\n"
+      "val Demo.NegTests.bad {Stigi.NegTest}: Never =\n"
+      "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved)\n",
+      STIGI_GATE_EXPECT_FORM);
+
+  /* NEG: cryptic-name & name-case on alias, handle binder, cap binder, evidence binder, type param, underscore */
+  check_gate_neg(
+      "neg_alias_cryptic",
+      "// prompt: cryptic alias name.\n"
+      "alias bi = Demo.Table.at\n"
+      "def Demo.one(): U64 = 1\n",
+      STIGI_GATE_CRYPTIC_NAME);
+
+  check_gate_neg(
+      "neg_handle_binder_cryptic",
+      "// prompt: cryptic handle binder.\n"
+      "def Demo.one(bytes: U64): U64 =\n"
+      "  handle r = Stigi.Arena(bytes)\n"
+      "  1\n",
+      STIGI_GATE_CRYPTIC_NAME);
+
+  check_gate_neg(
+      "neg_cap_binder_cryptic",
+      "// prompt: cryptic cap binder.\n"
+      "def Demo.one {r: Stigi.Region} (): U64 = 1\n",
+      STIGI_GATE_CRYPTIC_NAME);
+
+  check_gate_neg(
+      "neg_evidence_binder_cryptic",
+      "// prompt: cryptic evidence binder.\n"
+      "def Demo.one(idx: U64, len: U64) <p: below(idx, len)>: U64 = idx\n",
+      STIGI_GATE_CRYPTIC_NAME);
+
+  check_gate_neg(
+      "neg_type_param_digit",
+      "// prompt: type param ending in digit.\n"
+      "def Demo.one [T2: Type] (value: T2): T2 = value\n",
+      STIGI_GATE_CRYPTIC_NAME);
+
+  check_gate_neg(
+      "neg_underscore_in_def",
+      "// prompt: underscore inside L0 def name.\n"
+      "def Demo.bad_name(value: U64): U64 = value\n",
+      STIGI_GATE_NAME_CASE);
+
+  check_gate_pos(
+      "pos_extern_c_underscore_clock_gettime",
+      "// prompt: POSIX clock_gettime extern.\n"
+      "extern \"c\" def clock_gettime(clock: I32, time: Array[U8](16)): I32\n");
 
   /* NEG: missing // prompt: */
   check_gate_neg(
@@ -400,6 +657,27 @@ static void test_tenet_gate(void) {
     CHECK(stigi_gate_check_c_source(c_bad, strlen(c_bad), &f, &d) == STIGI_OK, "c_bad");
     CHECK(has_gate_code(&f, STIGI_GATE_FORBIDDEN_WORD), "c_bad triggers S117 forbidden-word");
     stigi_gate_findings_free(&f);
+
+    /* Hardened C gate bypass checks: newline, block comment, parenthesized callee, string literal */
+    const char *c_bypasses[] = {
+        "int main(void) { exit\n(1); }\n",
+        "int main(void) { exit /* gap */ (1); }\n",
+        "int main(void) { (exit)(1); }\n",
+        "int main(void) { __builtin_unreachable(); }\n"
+    };
+    for (size_t i = 0; i < sizeof(c_bypasses) / sizeof(c_bypasses[0]); i++) {
+      stigi_gate_findings_init(&f);
+      CHECK(stigi_gate_check_c_source(c_bypasses[i], strlen(c_bypasses[i]), &f, &d) == STIGI_OK,
+            "c_bypass scan");
+      CHECK(has_gate_code(&f, STIGI_GATE_FORBIDDEN_WORD), "c_bypass triggers forbidden-word");
+      stigi_gate_findings_free(&f);
+    }
+
+    stigi_gate_findings_init(&f);
+    const char *c_str_ok = "const char *msg = \"exit(1) inside literal\";\n";
+    CHECK(stigi_gate_check_c_source(c_str_ok, strlen(c_str_ok), &f, &d) == STIGI_OK, "c_str_ok");
+    CHECK(f.count == 0, "exit(1) inside C string literal does not false-positive");
+    stigi_gate_findings_free(&f);
   }
 
   /* case-pair check */
@@ -439,6 +717,53 @@ static void test_not_in_language(void) {
   check_not_in_lang("import", "// prompt: uses import.\nimport Demo.Other\ndef Demo.one(): U64 = 1\n");
   check_not_in_lang("float", "// prompt: uses float.\nval Demo.half: U64 = 0.5\n");
   check_not_in_lang("extern_abi", "// prompt: bad abi.\nextern \"rust\" def foo(): U64\n");
+  check_not_in_lang("lambda_expr", "// prompt: uses lambda.\ndef Demo.fn(val1: U64): U64 = (num: U64) => num + 1\n");
+  check_not_in_lang("lambda_bare", "// prompt: uses bare lambda.\ndef Demo.fn(): U64 = num => num + 1\n");
+  check_not_in_lang("string_interp", "// prompt: uses string interpolation.\nval Demo.msg: Array[U8](2) = s\"hi\"\n");
+  check_not_in_lang("type_lambda", "// prompt: uses type lambda.\ntype Demo.Id = [A] =>> A\n");
+  check_not_in_lang("varargs", "// prompt: uses varargs.\ndef Demo.many(items: U64*): U64 = 0\n");
+  check_not_in_lang("acell", "// prompt: uses ACell.\ntype Demo.Shared = ACell[U64]\n");
+
+  /* Verify S56 Stigi.Help rows exist for Option, Vec.push, Str, recursive-type */
+  CHECK(strstr(stigi_help_not_in_language("Option"), "enum") != NULL, "Stigi.Help Option");
+  CHECK(strstr(stigi_help_not_in_language("Vec.push"), "Array.tryGrow") != NULL, "Stigi.Help Vec.push");
+  CHECK(strstr(stigi_help_not_in_language("Str"), "Array[U8]") != NULL, "Stigi.Help Str");
+  CHECK(strstr(stigi_help_not_in_language("recursive-type"), "Array") != NULL, "Stigi.Help recursive-type");
+
+  /* Hardened lexer rejections: bad escapes, raw control chars, numeric suffix, leading/trailing _ */
+  const char *bad_lex[] = {
+      "// prompt: bad escape.\nval Demo.msg: Array[U8](1) = \"\\q\"\n",
+      "// prompt: raw tab in string.\nval Demo.msg: Array[U8](1) = \"\t\"\n",
+      "// prompt: numeric suffix.\nval Demo.num: U64 = 123foo\n",
+      "// prompt: numeric keyword suffix.\nval Demo.num: U64 = 123then\n",
+      "// prompt: bad hex suffix.\nval Demo.num: U64 = 0x1g\n",
+      "// prompt: leading underscore.\ndef Demo._bad(): U64 = 1\n",
+      "// prompt: trailing underscore.\ndef Demo.bad_(): U64 = 1\n"
+  };
+  for (size_t i = 0; i < sizeof(bad_lex) / sizeof(bad_lex[0]); i++) {
+    Arena a;
+    arena_init(&a);
+    StigiParseResult r = stigi_parse_unit(bad_lex[i], strlen(bad_lex[i]), &a);
+    CHECK(r.status != STIGI_OK, "bad lex rejected");
+    arena_free(&a);
+  }
+
+  /* Depth cap: 300 nested parens fails cleanly with parse instead of crashing */
+  {
+    char deep[800];
+    size_t pos = (size_t)snprintf(deep, sizeof deep, "// prompt: deep.\nval Demo.deep: U64 = ");
+    for (int i = 0; i < 300; i++) deep[pos++] = '(';
+    deep[pos++] = '1';
+    for (int i = 0; i < 300; i++) deep[pos++] = ')';
+    deep[pos++] = '\n';
+    deep[pos] = '\0';
+    Arena a;
+    arena_init(&a);
+    StigiParseResult r = stigi_parse_unit(deep, pos, &a);
+    CHECK(r.status != STIGI_OK && r.diag_code != NULL && strcmp(r.diag_code, "parse") == 0,
+          "deep nesting hits STIGI_MAX_PARSE_DEPTH cleanly");
+    arena_free(&a);
+  }
 }
 
 static void bench_lexer_1mb(void) {
@@ -447,42 +772,49 @@ static void bench_lexer_1mb(void) {
       "def Demo.Bytes.count(size: U64, block: Array[U8](size), wanted: U8): U64 <lessOrEqual(result, size)> =\n"
       "  var matches: U64 = 0\n"
       "  var index: U64 = 0\n"
-      "  while index < size decreases(size - index) do\n"
-      "    @<lessOrEqual(matches, index), lessOrEqual(index, size)>\n"
+      "  while index < size do\n"
+      "    @<lessOrEqual(matches, index), lessOrEqual(index, size), decreases(size - index)>\n"
       "    matches = if block(index) == wanted then matches + 1 else matches\n"
       "    index = index + 1\n"
       "  matches\n";
   size_t slen = strlen(sample);
-  size_t target = 1024U * 1024U;
-  size_t total = ((target + slen - 1U) / slen) * slen;
-  char *buf = malloc(total + 1U);
-  CHECK(buf != NULL, "bench malloc");
-  if (buf == NULL) return;
-  for (size_t off = 0; off < total; off += slen) {
-    memcpy(buf + off, sample, slen);
-  }
-  buf[total] = '\0';
+  size_t iters = (1024U * 1024U + slen - 1U) / slen;
+  size_t total = iters * slen;
 
+  Arena a;
+  arena_init(&a);
   struct timespec t0, t1;
   clock_gettime(CLOCK_MONOTONIC, &t0);
-  StigiLexer lex;
-  stigi_lex_init(&lex, buf, total);
   uint64_t tok_count = 0;
-  for (;;) {
-    StigiTok t = stigi_lex_next(&lex);
-    tok_count++;
-    if (t.kind == TOK_EOF || t.kind == TOK_ERROR) break;
+  for (size_t i = 0; i < iters; i++) {
+    arena_reset(&a);
+    StigiTok *toks = NULL;
+    uint32_t ntoks = 0;
+    Diag d;
+    diag_clear(&d);
+    CHECK(stigi_lex_all(sample, slen, &toks, &ntoks, &a, &d) == STIGI_OK, "bench lex");
+    StigiGateFindings gf;
+    stigi_gate_findings_init(&gf);
+    CHECK(stigi_gate_check_tokens(toks, ntoks, &gf, &d) == STIGI_OK && gf.count == 0, "bench gate");
+    stigi_gate_findings_free(&gf);
+    StigiParseResult pr = stigi_parse_tokens(toks, ntoks, &a);
+    CHECK(pr.status == STIGI_OK && pr.unit != NULL, "bench parse");
+    tok_count += ntoks;
   }
   clock_gettime(CLOCK_MONOTONIC, &t1);
+  arena_free(&a);
 
   double elapsed_s = (double)(t1.tv_sec - t0.tv_sec) +
                      (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
   double mb = (double)total / (1024.0 * 1024.0);
   double mb_per_s = elapsed_s > 0.0 ? mb / elapsed_s : 0.0;
-  printf("c2_test: lex bench: %.2f MB in %.4f s (%.1f MB/s, %llu tokens)\n",
+  printf("c2_test: lex+gate+parse bench: %.2f MB in %.4f s (%.1f MB/s, %llu tokens)\n",
          mb, elapsed_s, mb_per_s, (unsigned long long)tok_count);
-  CHECK(mb_per_s >= 20.0, "lexer throughput >= 20 MB/s");
-  free(buf);
+#if defined(__SANITIZE_ADDRESS__)
+  CHECK(mb_per_s >= 2.0, "lex+gate+parse throughput >= 2 MB/s under ASan");
+#else
+  CHECK(mb_per_s >= 10.0, "lex+gate+parse throughput >= 10 MB/s");
+#endif
 }
 
 int main(void) {

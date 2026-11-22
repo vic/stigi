@@ -135,7 +135,26 @@ static void print_type(PrintBuf *b, const StigiType *ty) {
   }
 }
 
+static void print_fact_term_expr(PrintBuf *b, const StigiExpr *e) {
+  if (e == NULL) return;
+  bool par = (e->kind == STIGI_EXPR_BINOP || e->kind == STIGI_EXPR_IF ||
+              e->kind == STIGI_EXPR_WHILE || e->kind == STIGI_EXPR_MATCH ||
+              e->kind == STIGI_EXPR_BLOCK);
+  if (par) pb_char(b, '(');
+  print_expr(b, e, 0);
+  if (par) pb_char(b, ')');
+}
+
 static void print_fact_item(PrintBuf *b, const StigiFactItem *it) {
+  if (it->kind == STIGI_FACT_DENY) {
+    pb_cstr(b, "not (");
+    for (uint32_t i = 0; i < it->deny_atom_count; i++) {
+      if (i > 0) pb_cstr(b, ", ");
+      print_fact_item(b, &it->deny_atoms[i]);
+    }
+    pb_char(b, ')');
+    return;
+  }
   if (it->is_negated) pb_cstr(b, "not ");
   if (it->evidence_name.len > 0) {
     pb_str(b, it->evidence_name);
@@ -150,19 +169,19 @@ static void print_fact_item(PrintBuf *b, const StigiFactItem *it) {
     }
     pb_char(b, ')');
   } else if (it->kind == STIGI_FACT_CMP) {
-    print_expr(b, it->lhs, 0);
+    print_fact_term_expr(b, it->lhs);
     pb_char(b, ' ');
     pb_cstr(b, op_str(it->op));
     pb_char(b, ' ');
-    print_expr(b, it->rhs, 0);
+    print_fact_term_expr(b, it->rhs);
   } else if (it->kind == STIGI_FACT_ARITH) {
     pb_str(b, it->lhs_var);
     pb_cstr(b, " = ");
-    print_expr(b, it->lhs, 0);
+    print_fact_term_expr(b, it->lhs);
     pb_char(b, ' ');
     pb_cstr(b, op_str(it->op));
     pb_char(b, ' ');
-    print_expr(b, it->rhs, 0);
+    print_fact_term_expr(b, it->rhs);
   }
 }
 
@@ -212,6 +231,51 @@ static void print_pat(PrintBuf *b, const StigiPat *pat) {
   }
 }
 
+static bool expr_is_multiline(const StigiExpr *e) {
+  if (e == NULL) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_BLOCK:
+    case STIGI_EXPR_MATCH:
+    case STIGI_EXPR_WHILE:
+      return true;
+    case STIGI_EXPR_IF:
+      return expr_is_multiline(e->u.if_expr.then_br) ||
+             expr_is_multiline(e->u.if_expr.else_br);
+    case STIGI_EXPR_HANDLE:
+      return e->u.handle_stmt.body != NULL && expr_is_multiline(e->u.handle_stmt.body);
+    case STIGI_EXPR_VAL:
+      return expr_is_multiline(e->u.val_stmt.init);
+    case STIGI_EXPR_VAR:
+      return expr_is_multiline(e->u.var_stmt.init);
+    case STIGI_EXPR_ASSIGN:
+      return expr_is_multiline(e->u.assign_stmt.value);
+    case STIGI_EXPR_INDEX_WRITE:
+      return expr_is_multiline(e->u.index_expr.value);
+    default:
+      return false;
+  }
+}
+
+static bool expr_needs_atom_parens(const StigiExpr *e) {
+  if (e == NULL) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_BINOP:
+    case STIGI_EXPR_UNOP:
+    case STIGI_EXPR_IF:
+    case STIGI_EXPR_WHILE:
+    case STIGI_EXPR_MATCH:
+    case STIGI_EXPR_BLOCK:
+    case STIGI_EXPR_VAL:
+    case STIGI_EXPR_VAR:
+    case STIGI_EXPR_ASSIGN:
+    case STIGI_EXPR_HANDLE:
+    case STIGI_EXPR_INDEX_WRITE:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static void print_body_after_sep(PrintBuf *b, const StigiExpr *body, uint32_t indent) {
   if (body == NULL) return;
   if (body->kind == STIGI_EXPR_BLOCK) {
@@ -249,8 +313,11 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
     case STIGI_EXPR_LIT_UNIT:
       pb_cstr(b, "()");
       break;
-    case STIGI_EXPR_CALL:
+    case STIGI_EXPR_CALL: {
+      bool cpar = expr_needs_atom_parens(e->u.call.callee);
+      if (cpar) pb_char(b, '(');
       print_expr(b, e->u.call.callee, indent);
+      if (cpar) pb_char(b, ')');
       if (e->u.call.type_arg_count > 0) {
         pb_char(b, '[');
         for (uint32_t i = 0; i < e->u.call.type_arg_count; i++) {
@@ -267,40 +334,56 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
         }
         pb_char(b, '}');
       }
-      pb_char(b, '(');
-      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
-        if (i > 0) pb_cstr(b, ", ");
-        print_expr(b, e->u.call.args[i], indent);
+      if (e->u.call.has_parens || e->u.call.arg_count > 0) {
+        pb_char(b, '(');
+        for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+          if (i > 0) pb_cstr(b, ", ");
+          print_expr(b, e->u.call.args[i], indent);
+        }
+        pb_char(b, ')');
       }
-      pb_char(b, ')');
       break;
+    }
     case STIGI_EXPR_BINOP: {
       int p = op_prec(e->u.binop.op);
-      bool lpar = e->u.binop.lhs->kind == STIGI_EXPR_BINOP &&
-                  op_prec(e->u.binop.lhs->u.binop.op) < p;
-      bool rpar = e->u.binop.rhs->kind == STIGI_EXPR_BINOP &&
-                  op_prec(e->u.binop.rhs->u.binop.op) <= p;
+      const StigiExpr *lh = e->u.binop.lhs;
+      const StigiExpr *rh = e->u.binop.rhs;
+      bool lpar = (lh->kind == STIGI_EXPR_IF || lh->kind == STIGI_EXPR_WHILE ||
+                   lh->kind == STIGI_EXPR_MATCH || lh->kind == STIGI_EXPR_BLOCK ||
+                   (lh->kind == STIGI_EXPR_BINOP && op_prec(lh->u.binop.op) < p));
+      bool rpar = (rh->kind == STIGI_EXPR_IF || rh->kind == STIGI_EXPR_WHILE ||
+                   rh->kind == STIGI_EXPR_MATCH || rh->kind == STIGI_EXPR_BLOCK ||
+                   (rh->kind == STIGI_EXPR_BINOP && op_prec(rh->u.binop.op) <= p));
       if (lpar) pb_char(b, '(');
-      print_expr(b, e->u.binop.lhs, indent);
+      print_expr(b, lh, indent);
       if (lpar) pb_char(b, ')');
       pb_char(b, ' ');
       pb_cstr(b, op_str(e->u.binop.op));
       pb_char(b, ' ');
       if (rpar) pb_char(b, '(');
-      print_expr(b, e->u.binop.rhs, indent);
+      print_expr(b, rh, indent);
       if (rpar) pb_char(b, ')');
       break;
     }
-    case STIGI_EXPR_UNOP:
+    case STIGI_EXPR_UNOP: {
       pb_cstr(b, op_str(e->u.unop.op));
-      print_expr(b, e->u.unop.operand, indent);
+      const StigiExpr *opnd = e->u.unop.operand;
+      bool upar = (opnd->kind == STIGI_EXPR_BINOP || opnd->kind == STIGI_EXPR_IF ||
+                   opnd->kind == STIGI_EXPR_WHILE || opnd->kind == STIGI_EXPR_MATCH ||
+                   opnd->kind == STIGI_EXPR_BLOCK ||
+                   (opnd->kind == STIGI_EXPR_UNOP && opnd->u.unop.op == STIGI_OP_NEG &&
+                    e->u.unop.op == STIGI_OP_NEG));
+      if (upar) pb_char(b, '(');
+      print_expr(b, opnd, indent);
+      if (upar) pb_char(b, ')');
       break;
+    }
     case STIGI_EXPR_IF:
       pb_cstr(b, "if ");
       print_expr(b, e->u.if_expr.cond, indent);
       pb_cstr(b, " then");
       print_body_after_sep(b, e->u.if_expr.then_br, indent);
-      if (e->u.if_expr.then_br != NULL && e->u.if_expr.then_br->kind == STIGI_EXPR_BLOCK) {
+      if (expr_is_multiline(e->u.if_expr.then_br)) {
         pb_char(b, '\n');
         pb_indent(b, indent);
         pb_cstr(b, "else");
@@ -312,16 +395,16 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
     case STIGI_EXPR_WHILE:
       pb_cstr(b, "while ");
       print_expr(b, e->u.while_expr.cond, indent);
-      if (e->u.while_expr.decreases != NULL) {
-        pb_cstr(b, " decreases(");
-        print_expr(b, e->u.while_expr.decreases, indent);
-        pb_char(b, ')');
-      }
       pb_cstr(b, " do");
       print_body_after_sep(b, e->u.while_expr.body, indent);
       break;
-    case STIGI_EXPR_MATCH:
-      print_expr(b, e->u.match_expr.scrutinee, indent);
+    case STIGI_EXPR_MATCH: {
+      const StigiExpr *sc = e->u.match_expr.scrutinee;
+      bool spar = (sc->kind == STIGI_EXPR_IF || sc->kind == STIGI_EXPR_WHILE ||
+                   sc->kind == STIGI_EXPR_MATCH || sc->kind == STIGI_EXPR_BLOCK);
+      if (spar) pb_char(b, '(');
+      print_expr(b, sc, indent);
+      if (spar) pb_char(b, ')');
       pb_cstr(b, " match");
       for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
         pb_char(b, '\n');
@@ -332,6 +415,7 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
         print_body_after_sep(b, e->u.match_expr.arms[i].body, indent + 2);
       }
       break;
+    }
     case STIGI_EXPR_VAL:
       pb_cstr(b, "val ");
       print_pat(b, &e->u.val_stmt.pat);
@@ -361,19 +445,27 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       pb_cstr(b, " =");
       print_body_after_sep(b, e->u.assign_stmt.value, indent);
       break;
-    case STIGI_EXPR_INDEX_READ:
+    case STIGI_EXPR_INDEX_READ: {
+      bool tpar = expr_needs_atom_parens(e->u.index_expr.target);
+      if (tpar) pb_char(b, '(');
       print_expr(b, e->u.index_expr.target, indent);
+      if (tpar) pb_char(b, ')');
       pb_char(b, '(');
       print_expr(b, e->u.index_expr.index, indent);
       pb_char(b, ')');
       break;
-    case STIGI_EXPR_INDEX_WRITE:
+    }
+    case STIGI_EXPR_INDEX_WRITE: {
+      bool tpar = expr_needs_atom_parens(e->u.index_expr.target);
+      if (tpar) pb_char(b, '(');
       print_expr(b, e->u.index_expr.target, indent);
+      if (tpar) pb_char(b, ')');
       pb_char(b, '(');
       print_expr(b, e->u.index_expr.index, indent);
       pb_cstr(b, ") :=");
       print_body_after_sep(b, e->u.index_expr.value, indent);
       break;
+    }
     case STIGI_EXPR_HANDLE:
       pb_cstr(b, "handle ");
       if (e->u.handle_stmt.binder.len > 0) {
@@ -381,6 +473,22 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
         pb_cstr(b, " = ");
       }
       pb_str(b, e->u.handle_stmt.handler_name);
+      if (e->u.handle_stmt.type_arg_count > 0) {
+        pb_char(b, '[');
+        for (uint32_t i = 0; i < e->u.handle_stmt.type_arg_count; i++) {
+          if (i > 0) pb_cstr(b, ", ");
+          print_type(b, e->u.handle_stmt.type_args[i]);
+        }
+        pb_char(b, ']');
+      }
+      if (e->u.handle_stmt.cap_arg_count > 0) {
+        pb_char(b, '{');
+        for (uint32_t i = 0; i < e->u.handle_stmt.cap_arg_count; i++) {
+          if (i > 0) pb_cstr(b, ", ");
+          pb_str(b, e->u.handle_stmt.cap_args[i]);
+        }
+        pb_char(b, '}');
+      }
       if (e->u.handle_stmt.has_parens) {
         pb_char(b, '(');
         for (uint32_t i = 0; i < e->u.handle_stmt.arg_count; i++) {
@@ -396,7 +504,10 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       break;
     case STIGI_EXPR_ASSERT:
       if (e->u.assert_expr.expr != NULL) {
+        bool apar = expr_needs_atom_parens(e->u.assert_expr.expr);
+        if (apar) pb_char(b, '(');
         print_expr(b, e->u.assert_expr.expr, indent);
+        if (apar) pb_char(b, ')');
       }
       pb_char(b, '@');
       print_fact_group(b, &e->u.assert_expr.facts);
@@ -451,11 +562,6 @@ static void print_def_head(PrintBuf *b, const StigiDefHead *h, bool is_lemma) {
   for (uint32_t i = 0; i < h->exit_fact_count; i++) {
     pb_char(b, ' ');
     print_fact_group(b, &h->exit_facts[i]);
-  }
-  if (h->decreases != NULL) {
-    pb_cstr(b, " decreases(");
-    print_expr(b, h->decreases, 0);
-    pb_char(b, ')');
   }
 }
 
@@ -583,12 +689,23 @@ static void print_decl(PrintBuf *b, const StigiDecl *d, uint32_t indent) {
         print_params(b, '[', ']', d->u.handler_decl.type_params,
                      d->u.handler_decl.type_param_count);
       }
+      if (d->u.handler_decl.cap_param_count > 0) {
+        pb_char(b, ' ');
+        print_cap_group(b, d->u.handler_decl.cap_params, d->u.handler_decl.cap_param_count);
+      }
       if (d->u.handler_decl.has_val_parens) {
+        if (d->u.handler_decl.type_param_count > 0 || d->u.handler_decl.cap_param_count > 0) {
+          pb_char(b, ' ');
+        }
         print_params(b, '(', ')', d->u.handler_decl.val_params,
                      d->u.handler_decl.val_param_count);
       }
       pb_cstr(b, " for ");
-      pb_str(b, d->u.handler_decl.for_cap);
+      if (d->u.handler_decl.for_cap_type != NULL) {
+        print_type(b, d->u.handler_decl.for_cap_type);
+      } else {
+        pb_str(b, d->u.handler_decl.for_cap);
+      }
       pb_char(b, ':');
       for (uint32_t i = 0; i < d->u.handler_decl.var_count; i++) {
         pb_char(b, '\n');

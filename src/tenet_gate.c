@@ -216,11 +216,15 @@ static bool tok_eq(const StigiTok *t, const char *lit) {
 
 /* Check cryptic-name on a single component (no dots) */
 static Status check_component_cryptic(const char *s, size_t len, StigiSpan span,
+                                      bool allow_single_upper,
                                       StigiGateFindings *out, Diag *diag) {
   if (len == 0) return STIGI_OK;
   if (is_digit((unsigned char)s[len - 1])) {
     return add_finding(out, STIGI_GATE_CRYPTIC_NAME, span, diag,
                        "name '%.*s' ends in a digit", (int)len, s);
+  }
+  if (allow_single_upper && len == 1 && is_upper((unsigned char)s[0])) {
+    return STIGI_OK;
   }
   size_t i = 0;
   while (i < len) {
@@ -246,8 +250,10 @@ static Status check_component_cryptic(const char *s, size_t len, StigiSpan span,
 
 /* Check cryptic-name and name-case on a possibly dotted name.
  * expect_upper_last: true for type/enum/case/capability/handler/state, false for def/val/var/binder/relation/rule */
-static Status check_name_rules(const StigiTok *tok, bool expect_upper_last,
-                               bool check_cryptic, StigiGateFindings *out, Diag *diag) {
+static Status check_name_rules_ex(const StigiTok *tok, bool expect_upper_last,
+                                  bool check_cryptic, bool allow_single_upper,
+                                  bool allow_c_abi_underscore,
+                                  StigiGateFindings *out, Diag *diag) {
   const char *s = tok->ptr;
   size_t len = tok->len;
   size_t pos = 0;
@@ -257,6 +263,11 @@ static Status check_name_rules(const StigiTok *tok, bool expect_upper_last,
     bool is_last = (dot == len);
     size_t clen = dot - pos;
     if (clen > 0) {
+      if (!allow_c_abi_underscore && memchr(s + pos, '_', clen) != NULL) {
+        Status st = add_finding(out, STIGI_GATE_NAME_CASE, tok->span, diag,
+                                "name '%.*s' must not contain '_'", (int)clen, s + pos);
+        if (st != STIGI_OK) return st;
+      }
       unsigned char first = (unsigned char)s[pos];
       if (!is_last) {
         if (!is_upper(first)) {
@@ -279,7 +290,8 @@ static Status check_name_rules(const StigiTok *tok, bool expect_upper_last,
         }
       }
       if (check_cryptic) {
-        Status st = check_component_cryptic(s + pos, clen, tok->span, out, diag);
+        Status st = check_component_cryptic(s + pos, clen, tok->span,
+                                            allow_single_upper && is_last, out, diag);
         if (st != STIGI_OK) return st;
       }
     }
@@ -288,8 +300,21 @@ static Status check_name_rules(const StigiTok *tok, bool expect_upper_last,
   return STIGI_OK;
 }
 
+static Status check_name_rules(const StigiTok *tok, bool expect_upper_last,
+                               bool check_cryptic, StigiGateFindings *out, Diag *diag) {
+  return check_name_rules_ex(tok, expect_upper_last, check_cryptic, false, false, out, diag);
+}
+
 static uint32_t next_sig_tok(const StigiTok *toks, uint32_t count, uint32_t i) {
   while (i < count && (toks[i].kind == TOK_COMMENT || toks[i].kind == TOK_PROMPT)) {
+    i++;
+  }
+  return i;
+}
+
+static uint32_t next_sig_tok_nl(const StigiTok *toks, uint32_t count, uint32_t i) {
+  while (i < count && (toks[i].kind == TOK_COMMENT || toks[i].kind == TOK_PROMPT ||
+                       toks[i].kind == TOK_NEWLINE)) {
     i++;
   }
   return i;
@@ -301,6 +326,195 @@ static uint32_t prev_sig_tok(const StigiTok *toks, uint32_t i) {
     if (toks[i].kind != TOK_COMMENT && toks[i].kind != TOK_PROMPT) return i;
   }
   return UINT32_MAX;
+}
+
+static uint32_t prev_sig_tok_nl(const StigiTok *toks, uint32_t i) {
+  while (i > 0) {
+    i--;
+    if (toks[i].kind != TOK_COMMENT && toks[i].kind != TOK_PROMPT &&
+        toks[i].kind != TOK_NEWLINE) {
+      return i;
+    }
+  }
+  return UINT32_MAX;
+}
+
+static uint32_t skip_balanced(const StigiTok *toks, uint32_t count, uint32_t idx,
+                              StigiTokKind open_k, StigiTokKind close_k) {
+  if (idx >= count || toks[idx].kind != open_k) return idx;
+  int depth = 1;
+  idx++;
+  while (idx < count && depth > 0 && toks[idx].kind != TOK_EOF) {
+    if (toks[idx].kind == open_k) depth++;
+    else if (toks[idx].kind == close_k) depth--;
+    idx++;
+  }
+  return idx;
+}
+
+/* Check if Ptr at ptr_idx is the RHS head of a `type ... = Ptr[...](...) <facts>` declaration */
+static bool is_allowed_type_rhs_ptr(const StigiTok *toks, uint32_t count, uint32_t ptr_idx) {
+  uint32_t eq_idx = prev_sig_tok_nl(toks, ptr_idx);
+  if (eq_idx == UINT32_MAX || toks[eq_idx].kind != TOK_ASSIGN) return false;
+
+  /* Walk backwards over optional {...}, (...), [...] and type Name to verify `type` keyword */
+  uint32_t p = eq_idx;
+  for (;;) {
+    uint32_t prev = prev_sig_tok_nl(toks, p);
+    if (prev == UINT32_MAX) return false;
+    StigiTokKind k = toks[prev].kind;
+    if (k == TOK_RBRACE || k == TOK_RPAREN || k == TOK_RBRACKET) {
+      StigiTokKind open_k = (k == TOK_RBRACE) ? TOK_LBRACE
+                          : (k == TOK_RPAREN) ? TOK_LPAREN : TOK_LBRACKET;
+      int depth = 1;
+      uint32_t q = prev;
+      while (q > 0 && depth > 0) {
+        q--;
+        if (toks[q].kind == k) depth++;
+        else if (toks[q].kind == open_k) depth--;
+      }
+      if (depth != 0) return false;
+      p = q;
+      continue;
+    }
+    if (k == TOK_IDENT) {
+      uint32_t kw = prev_sig_tok(toks, prev);
+      if (kw == UINT32_MAX || toks[kw].kind != TOK_KW_TYPE) return false;
+      break;
+    }
+    return false;
+  }
+
+  /* Walk forwards over RHS type: Ptr [..] (..) {..}, then verify trailing <...> fact group */
+  uint32_t j = next_sig_tok(toks, count, ptr_idx + 1);
+  if (j < count && toks[j].kind == TOK_LBRACKET) {
+    j = next_sig_tok(toks, count, skip_balanced(toks, count, j, TOK_LBRACKET, TOK_RBRACKET));
+  }
+  if (j < count && toks[j].kind == TOK_LPAREN) {
+    j = next_sig_tok(toks, count, skip_balanced(toks, count, j, TOK_LPAREN, TOK_RPAREN));
+  }
+  if (j < count && toks[j].kind == TOK_LBRACE) {
+    j = next_sig_tok(toks, count, skip_balanced(toks, count, j, TOK_LBRACE, TOK_RBRACE));
+  }
+  uint32_t lt = next_sig_tok_nl(toks, count, j);
+  if (lt >= count || toks[lt].kind != TOK_LT) return false;
+
+  /* Verify matching '>' for the fact group */
+  int depth = 0;
+  for (uint32_t k = lt + 1; k < count && toks[k].kind != TOK_EOF; k++) {
+    StigiTokKind tk = toks[k].kind;
+    if (tk == TOK_LPAREN || tk == TOK_LBRACKET || tk == TOK_LBRACE) depth++;
+    else if (tk == TOK_RPAREN || tk == TOK_RBRACKET || tk == TOK_RBRACE) {
+      if (depth > 0) depth--;
+    } else if (tk == TOK_GT && depth == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool is_bodyless_extern_decl(const StigiTok *toks, uint32_t count, uint32_t kw_idx) {
+  uint32_t abi = prev_sig_tok(toks, kw_idx);
+  if (abi == UINT32_MAX || toks[abi].kind != TOK_STRING) return false;
+  uint32_t ext = prev_sig_tok(toks, abi);
+  if (ext == UINT32_MAX || toks[ext].kind != TOK_KW_EXTERN) return false;
+  if (toks[kw_idx].kind == TOK_KW_VAL) return true;
+  /* Scan to end of extern def head: if '=' follows at depth 0, it has a body (C-DSL kernel unit) */
+  int depth = 0;
+  uint32_t j = kw_idx + 1;
+  while (j < count && toks[j].kind != TOK_EOF) {
+    StigiTokKind k = toks[j].kind;
+    if (k == TOK_LPAREN || k == TOK_LBRACKET || k == TOK_LBRACE) depth++;
+    else if (k == TOK_RPAREN || k == TOK_RBRACKET || k == TOK_RBRACE) {
+      if (depth > 0) depth--;
+    } else if (depth == 0 && k == TOK_ASSIGN) {
+      return false;
+    } else if (depth == 0 && k == TOK_NEWLINE) {
+      uint32_t nxt = next_sig_tok_nl(toks, count, j + 1);
+      if (nxt >= count || toks[nxt].kind == TOK_EOF ||
+          (toks[nxt].kind != TOK_ASSIGN && toks[nxt].kind != TOK_LT &&
+           toks[nxt].kind != TOK_COLON && toks[nxt].kind != TOK_LPAREN &&
+           toks[nxt].kind != TOK_LBRACE && toks[nxt].kind != TOK_LBRACKET)) {
+        break;
+      }
+    }
+    j++;
+  }
+  return true;
+}
+
+static bool string_has_non_whitespace(const char *s, uint32_t len) {
+  if (len < 2 || s[0] != '"' || s[len - 1] != '"') return false;
+  uint32_t p = 1;
+  uint32_t end = len - 1;
+  while (p < end) {
+    unsigned char ch = (unsigned char)s[p++];
+    if (ch == '\\' && p < end) {
+      char esc = s[p++];
+      if (esc == 'n') ch = '\n';
+      else if (esc == 't') ch = '\t';
+      else if (esc == '0') ch = 0;
+      else if (esc == 'x' && p + 2 <= end) {
+        unsigned hi = (unsigned)(s[p] >= '0' && s[p] <= '9' ? s[p] - '0'
+                               : (s[p] >= 'a' && s[p] <= 'f' ? s[p] - 'a' + 10 : s[p] - 'A' + 10));
+        unsigned lo = (unsigned)(s[p + 1] >= '0' && s[p + 1] <= '9' ? s[p + 1] - '0'
+                               : (s[p + 1] >= 'a' && s[p + 1] <= 'f' ? s[p + 1] - 'a' + 10 : s[p + 1] - 'A' + 10));
+        ch = (unsigned char)((hi << 4) | lo);
+        p += 2;
+      } else {
+        ch = (unsigned char)esc;
+      }
+    }
+    if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+typedef struct {
+  StigiStr name;
+  StigiStr target;
+} GateAlias;
+
+static void resolve_gate_alias(const StigiTok *tok, const GateAlias *aliases, uint32_t nalias,
+                               char *buf, size_t cap) {
+  size_t cur_len = tok->len < cap - 1 ? tok->len : cap - 1;
+  memcpy(buf, tok->ptr, cur_len);
+  buf[cur_len] = '\0';
+
+  for (int step = 0; step < 8; step++) {
+    bool changed = false;
+    for (uint32_t a = 0; a < nalias; a++) {
+      const char *an = aliases[a].name.ptr;
+      size_t alen = aliases[a].name.len;
+      if (cur_len == alen && memcmp(buf, an, alen) == 0) {
+        size_t tlen = aliases[a].target.len < cap - 1 ? aliases[a].target.len : cap - 1;
+        memcpy(buf, aliases[a].target.ptr, tlen);
+        buf[tlen] = '\0';
+        cur_len = tlen;
+        changed = true;
+        break;
+      }
+      if (cur_len > alen && buf[alen] == '.' && memcmp(buf, an, alen) == 0) {
+        size_t rest_len = cur_len - alen;
+        size_t tlen = aliases[a].target.len;
+        if (tlen + rest_len < cap) {
+          char tmp[256];
+          if (tlen + rest_len < sizeof tmp) {
+            memcpy(tmp, aliases[a].target.ptr, tlen);
+            memcpy(tmp + tlen, buf + alen, rest_len);
+            cur_len = tlen + rest_len;
+            memcpy(buf, tmp, cur_len);
+            buf[cur_len] = '\0';
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!changed) break;
+  }
 }
 
 static bool is_decl_intro_kw(StigiTokKind k) {
@@ -324,6 +538,7 @@ static Status check_expect_call(const StigiTok *toks, uint32_t count, uint32_t i
   uint32_t last_arg_end = 0;
   bool any_in_cur = false;
 
+  bool found_rparen = false;
   uint32_t j = lp + 1;
   for (; j < count && toks[j].kind != TOK_EOF; j++) {
     StigiTokKind k = toks[j].kind;
@@ -338,6 +553,7 @@ static Status check_expect_call(const StigiTok *toks, uint32_t count, uint32_t i
           last_arg_start = cur_start;
           last_arg_end = j;
         }
+        found_rparen = true;
         break;
       }
       if (depth > 0) depth--;
@@ -352,13 +568,13 @@ static Status check_expect_call(const StigiTok *toks, uint32_t count, uint32_t i
     }
   }
 
-  if (arg_count != expected_args) {
+  if (!found_rparen || arg_count != expected_args) {
     return add_finding(out, STIGI_GATE_EXPECT_FORM, toks[idx].span, diag,
                        "%.*s requires %u arguments, got %u",
                        (int)toks[idx].len, toks[idx].ptr, expected_args, arg_count);
   }
 
-  /* Verify last argument (reason) is a single non-empty string literal */
+  /* Verify last argument (reason) is a single non-empty non-whitespace string literal */
   uint32_t str_count = 0;
   uint32_t non_str_count = 0;
   uint32_t str_tok_idx = 0;
@@ -371,7 +587,8 @@ static Status check_expect_call(const StigiTok *toks, uint32_t count, uint32_t i
       non_str_count++;
     }
   }
-  if (str_count != 1 || non_str_count != 0 || toks[str_tok_idx].len <= 2) {
+  if (str_count != 1 || non_str_count != 0 ||
+      !string_has_non_whitespace(toks[str_tok_idx].ptr, toks[str_tok_idx].len)) {
     return add_finding(out, STIGI_GATE_EXPECT_FORM, toks[idx].span, diag,
                        "%.*s reason must be a non-empty text literal",
                        (int)toks[idx].len, toks[idx].ptr);
@@ -409,37 +626,38 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
     if (st != STIGI_OK) return st;
   }
 
-  /* Pre-scan: determine if unit is a `type` declaration with a fact group on its RHS */
-  bool is_type_unit_with_facts = false;
-  uint32_t type_eq_idx = UINT32_MAX;
-  uint32_t type_end_idx = UINT32_MAX;
+  /* Collect unit-level aliases for expect-form resolution */
+  GateAlias *aliases = NULL;
+  uint32_t alias_count = 0;
+  uint32_t alias_cap = 0;
   for (uint32_t i = 0; i < count; i++) {
-    if (toks[i].kind == TOK_KW_TYPE) {
-      /* Find '=' on this declaration line, then check for '<' before newline/EOF */
-      uint32_t j = i + 1;
-      while (j < count && toks[j].kind != TOK_ASSIGN && toks[j].kind != TOK_NEWLINE &&
-             toks[j].kind != TOK_EOF) {
-        j++;
-      }
-      if (j < count && toks[j].kind == TOK_ASSIGN) {
-        type_eq_idx = j;
-        bool has_lt = false;
-        uint32_t k = j + 1;
-        while (k < count && toks[k].kind != TOK_NEWLINE && toks[k].kind != TOK_EOF) {
-          if (toks[k].kind == TOK_LT) has_lt = true;
-          k++;
+    if (toks[i].kind == TOK_KW_ALIAS) {
+      uint32_t n = next_sig_tok(toks, count, i + 1);
+      uint32_t eq = (n < count) ? next_sig_tok(toks, count, n + 1) : count;
+      uint32_t tgt = (eq < count) ? next_sig_tok(toks, count, eq + 1) : count;
+      if (n < count && toks[n].kind == TOK_IDENT &&
+          eq < count && toks[eq].kind == TOK_ASSIGN &&
+          tgt < count && toks[tgt].kind == TOK_IDENT) {
+        if (alias_count == alias_cap) {
+          uint32_t ncap = alias_cap == 0 ? 8U : alias_cap * 2U;
+          if (ncap <= alias_cap) {
+            free(aliases);
+            return diag_set(diag, STIGI_ERR_OVERFLOW, -1, "alias table overflow");
+          }
+          GateAlias *na = realloc(aliases, (size_t)ncap * sizeof *na);
+          if (na == NULL) {
+            free(aliases);
+            return diag_set(diag, STIGI_ERR_OOM, -1, "alias table OOM");
+          }
+          aliases = na;
+          alias_cap = ncap;
         }
-        type_end_idx = k;
-        is_type_unit_with_facts = has_lt;
+        aliases[alias_count].name.ptr = toks[n].ptr;
+        aliases[alias_count].name.len = toks[n].len;
+        aliases[alias_count].target.ptr = toks[tgt].ptr;
+        aliases[alias_count].target.len = toks[tgt].len;
+        alias_count++;
       }
-      break;
-    }
-    if (toks[i].kind == TOK_KW_DEF || toks[i].kind == TOK_KW_VAL ||
-        toks[i].kind == TOK_KW_ENUM || toks[i].kind == TOK_KW_CAPABILITY ||
-        toks[i].kind == TOK_KW_HANDLER || toks[i].kind == TOK_KW_EXTERN ||
-        toks[i].kind == TOK_KW_RELATION || toks[i].kind == TOK_KW_RULE ||
-        toks[i].kind == TOK_KW_LEMMA) {
-      break;
     }
   }
 
@@ -448,7 +666,8 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
   int bracket_depth = 0;
   int brace_depth = 0;
 
-  for (uint32_t i = 0; i < count; i++) {
+  Status loop_st = STIGI_OK;
+  for (uint32_t i = 0; i < count && loop_st == STIGI_OK; i++) {
     const StigiTok *t = &toks[i];
     if (t->kind == TOK_EOF) break;
 
@@ -462,8 +681,8 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
     /* 2. forbidden-word on identifiers, comments, prompts, string literals */
     if (t->kind == TOK_IDENT || t->kind == TOK_COMMENT ||
         t->kind == TOK_PROMPT || t->kind == TOK_STRING) {
-      Status st = scan_forbidden_subwords(t->ptr, t->len, t->span, out, diag);
-      if (st != STIGI_OK) return st;
+      loop_st = scan_forbidden_subwords(t->ptr, t->len, t->span, out, diag);
+      if (loop_st != STIGI_OK) break;
     }
 
     /* 2b. S117: exit / exits / exited / exiting ONLY on call targets (including exit[T](...), exit{r}(...)) */
@@ -472,22 +691,13 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
       uint32_t prv = prev_sig_tok(toks, i);
       bool prev_is_decl = (prv != UINT32_MAX && is_decl_intro_kw(toks[prv].kind));
       if (!prev_is_decl) {
-        /* Skip balanced [...] and {...} groups before checking '(' */
         while (nxt < count && (toks[nxt].kind == TOK_LBRACKET || toks[nxt].kind == TOK_LBRACE)) {
           StigiTokKind open_k = toks[nxt].kind;
           StigiTokKind close_k = (open_k == TOK_LBRACKET) ? TOK_RBRACKET : TOK_RBRACE;
-          int depth = 1;
-          nxt++;
-          while (nxt < count && depth > 0 && toks[nxt].kind != TOK_EOF) {
-            if (toks[nxt].kind == open_k) depth++;
-            else if (toks[nxt].kind == close_k) depth--;
-            nxt++;
-          }
-          nxt = next_sig_tok(toks, count, nxt);
+          nxt = next_sig_tok(toks, count, skip_balanced(toks, count, nxt, open_k, close_k));
         }
       }
       if (!prev_is_decl && nxt < count && toks[nxt].kind == TOK_LPAREN) {
-        /* Extract last dotted component */
         const char *last = t->ptr;
         uint32_t last_len = t->len;
         for (uint32_t k = 0; k < t->len; k++) {
@@ -497,39 +707,69 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
           }
         }
         if (is_exit_forbidden(last, last_len)) {
-          Status st = add_finding(out, STIGI_GATE_FORBIDDEN_WORD, t->span, diag,
-                                  "forbidden call target '%.*s' (S117)",
-                                  (int)t->len, t->ptr);
-          if (st != STIGI_OK) return st;
+          loop_st = add_finding(out, STIGI_GATE_FORBIDDEN_WORD, t->span, diag,
+                                "forbidden call target '%.*s' (S117)",
+                                (int)t->len, t->ptr);
+          if (loop_st != STIGI_OK) break;
         }
       }
     }
 
     /* 3. bare-pointer */
     if (t->kind == TOK_IDENT && tok_eq(t, "Ptr")) {
-      bool allowed = is_type_unit_with_facts && i > type_eq_idx && i < type_end_idx;
-      if (!allowed) {
-        Status st = add_finding(out, STIGI_GATE_BARE_POINTER, t->span, diag,
-                                "bare 'Ptr' is only allowed on the RHS of a 'type' with a fact group");
-        if (st != STIGI_OK) return st;
+      if (!is_allowed_type_rhs_ptr(toks, count, i)) {
+        loop_st = add_finding(out, STIGI_GATE_BARE_POINTER, t->span, diag,
+                              "bare 'Ptr' is only allowed on the RHS of a 'type' with a fact group");
+        if (loop_st != STIGI_OK) break;
       }
     }
 
-    /* 4. expect-form */
-    if (t->kind == TOK_IDENT && tok_eq(t, "Stigi.Test.expect")) {
-      Status st = check_expect_call(toks, count, i, 3, out, diag);
-      if (st != STIGI_OK) return st;
-    } else if (t->kind == TOK_IDENT && tok_eq(t, "Stigi.NegTest.expect")) {
-      Status st = check_expect_call(toks, count, i, 2, out, diag);
-      if (st != STIGI_OK) return st;
+    /* 4. expect-form (including local aliases) */
+    if (t->kind == TOK_IDENT) {
+      uint32_t prv = prev_sig_tok(toks, i);
+      bool is_alias_lhs = (prv != UINT32_MAX && toks[prv].kind == TOK_KW_ALIAS);
+      bool is_alias_rhs = (prv != UINT32_MAX && toks[prv].kind == TOK_ASSIGN &&
+                           prev_sig_tok(toks, prv) != UINT32_MAX &&
+                           prev_sig_tok(toks, prev_sig_tok(toks, prv)) != UINT32_MAX &&
+                           toks[prev_sig_tok(toks, prev_sig_tok(toks, prv))].kind == TOK_KW_ALIAS);
+      if (!is_alias_lhs && !is_alias_rhs) {
+        char resolved[256];
+        resolve_gate_alias(t, aliases, alias_count, resolved, sizeof resolved);
+        if (strcmp(resolved, "Stigi.Test.expect") == 0) {
+          loop_st = check_expect_call(toks, count, i, 3, out, diag);
+          if (loop_st != STIGI_OK) break;
+        } else if (strcmp(resolved, "Stigi.NegTest.expect") == 0) {
+          loop_st = check_expect_call(toks, count, i, 2, out, diag);
+          if (loop_st != STIGI_OK) break;
+        }
+      }
     }
 
     /* 5. cryptic-name & name-case on unit names and binders */
-    if (t->kind == TOK_KW_DEF || t->kind == TOK_KW_RELATION) {
+    if (t->kind == TOK_KW_ALIAS) {
+      uint32_t n = next_sig_tok(toks, count, i + 1);
+      uint32_t eq = (n < count) ? next_sig_tok(toks, count, n + 1) : count;
+      uint32_t tgt = (eq < count) ? next_sig_tok(toks, count, eq + 1) : count;
+      if (n < count && toks[n].kind == TOK_IDENT) {
+        bool expect_upper = false;
+        if (tgt < count && toks[tgt].kind == TOK_IDENT && toks[tgt].len > 0) {
+          const char *last = toks[tgt].ptr;
+          for (uint32_t k = 0; k < toks[tgt].len; k++) {
+            if (toks[tgt].ptr[k] == '.' && k + 1 < toks[tgt].len) last = toks[tgt].ptr + k + 1;
+          }
+          expect_upper = is_upper((unsigned char)last[0]);
+        } else if (toks[n].len > 0) {
+          expect_upper = is_upper((unsigned char)toks[n].ptr[0]);
+        }
+        loop_st = check_name_rules(&toks[n], expect_upper, true, out, diag);
+        if (loop_st != STIGI_OK) break;
+      }
+    } else if (t->kind == TOK_KW_DEF || t->kind == TOK_KW_RELATION) {
       uint32_t n = next_sig_tok(toks, count, i + 1);
       if (n < count && toks[n].kind == TOK_IDENT) {
-        Status st = check_name_rules(&toks[n], false, true, out, diag);
-        if (st != STIGI_OK) return st;
+        bool allow_c_abi = (t->kind == TOK_KW_DEF) && is_bodyless_extern_decl(toks, count, i);
+        loop_st = check_name_rules_ex(&toks[n], false, true, false, allow_c_abi, out, diag);
+        if (loop_st != STIGI_OK) break;
       }
     } else if (t->kind == TOK_KW_VAL || t->kind == TOK_KW_VAR) {
       uint32_t n = next_sig_tok(toks, count, i + 1);
@@ -537,30 +777,38 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
         uint32_t after = next_sig_tok(toks, count, n + 1);
         /* In `val Pair(a, b) = p`, `Pair` is a constructor pattern; check its binders */
         if (t->kind == TOK_KW_VAL && after < count && toks[after].kind == TOK_LPAREN) {
-          Status st = check_name_rules(&toks[n], true, false, out, diag);
-          if (st != STIGI_OK) return st;
+          loop_st = check_name_rules(&toks[n], true, false, out, diag);
+          if (loop_st != STIGI_OK) break;
           uint32_t b = next_sig_tok(toks, count, after + 1);
-          while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_EOF) {
+          while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_ASSIGN &&
+                 toks[b].kind != TOK_NEWLINE && toks[b].kind != TOK_EOF) {
             if (toks[b].kind == TOK_IDENT) {
-              st = check_name_rules(&toks[b], false, true, out, diag);
-              if (st != STIGI_OK) return st;
+              loop_st = check_name_rules(&toks[b], false, true, out, diag);
+              if (loop_st != STIGI_OK) break;
             }
             b = next_sig_tok(toks, count, b + 1);
           }
         } else {
-          Status st = check_name_rules(&toks[n], false, true, out, diag);
-          if (st != STIGI_OK) return st;
+          bool allow_c_abi = (t->kind == TOK_KW_VAL) && is_bodyless_extern_decl(toks, count, i);
+          loop_st = check_name_rules_ex(&toks[n], false, true, false, allow_c_abi, out, diag);
+          if (loop_st != STIGI_OK) break;
         }
+      }
+    } else if (t->kind == TOK_KW_HANDLE) {
+      uint32_t n = next_sig_tok(toks, count, i + 1);
+      uint32_t eq = (n < count) ? next_sig_tok(toks, count, n + 1) : count;
+      if (n < count && toks[n].kind == TOK_IDENT && eq < count && toks[eq].kind == TOK_ASSIGN) {
+        loop_st = check_name_rules(&toks[n], false, true, out, diag);
+        if (loop_st != STIGI_OK) break;
       }
     } else if (t->kind == TOK_KW_ENUM || t->kind == TOK_KW_TYPE ||
                t->kind == TOK_KW_CAPABILITY || t->kind == TOK_KW_HANDLER) {
       uint32_t n = next_sig_tok(toks, count, i + 1);
       if (n < count && toks[n].kind == TOK_IDENT) {
-        Status st = check_name_rules(&toks[n], true, true, out, diag);
-        if (st != STIGI_OK) return st;
+        loop_st = check_name_rules(&toks[n], true, true, out, diag);
+        if (loop_st != STIGI_OK) break;
       }
     } else if (t->kind == TOK_KW_CASE) {
-      /* Distinguish enum case vs match case: enum case has no '=>' on its line */
       uint32_t n = next_sig_tok(toks, count, i + 1);
       if (n < count && toks[n].kind == TOK_IDENT) {
         bool is_match_arm = false;
@@ -572,49 +820,78 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
           }
         }
         if (!is_match_arm) {
-          Status st = check_name_rules(&toks[n], true, true, out, diag);
-          if (st != STIGI_OK) return st;
+          loop_st = check_name_rules(&toks[n], true, true, out, diag);
+          if (loop_st != STIGI_OK) break;
         } else {
-          /* Match arm pattern: check ctor binders `case Ctor(bi, x2) =>` or var pattern `case bi =>` */
           uint32_t after = next_sig_tok(toks, count, n + 1);
           if (after < count && toks[after].kind == TOK_LPAREN) {
             uint32_t b = next_sig_tok(toks, count, after + 1);
-            while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_EOF) {
+            while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_ARROW &&
+                   toks[b].kind != TOK_NEWLINE && toks[b].kind != TOK_EOF) {
               if (toks[b].kind == TOK_IDENT) {
-                Status st = check_name_rules(&toks[b], false, true, out, diag);
-                if (st != STIGI_OK) return st;
+                loop_st = check_name_rules(&toks[b], false, true, out, diag);
+                if (loop_st != STIGI_OK) break;
               }
               b = next_sig_tok(toks, count, b + 1);
             }
           } else if (toks[n].len > 0 && is_lower((unsigned char)toks[n].ptr[0])) {
-            Status st = check_name_rules(&toks[n], false, true, out, diag);
-            if (st != STIGI_OK) return st;
+            loop_st = check_name_rules(&toks[n], false, true, out, diag);
+            if (loop_st != STIGI_OK) break;
           }
         }
       }
     } else if (t->kind == TOK_KW_STATE || t->kind == TOK_KW_START || t->kind == TOK_KW_STOP) {
-      uint32_t n = next_sig_tok(toks, count, i + 1);
-      while (n < count && toks[n].kind == TOK_IDENT) {
-        Status st = check_name_rules(&toks[n], true, true, out, diag);
-        if (st != STIGI_OK) return st;
-        uint32_t nxt = next_sig_tok(toks, count, n + 1);
-        if (nxt < count && toks[nxt].kind == TOK_COMMA) {
-          n = next_sig_tok(toks, count, nxt + 1);
-        } else {
-          break;
+      uint32_t prv = prev_sig_tok(toks, i);
+      if (prv != UINT32_MAX && toks[prv].kind == TOK_NEWLINE) {
+        uint32_t n = next_sig_tok(toks, count, i + 1);
+        while (n < count && toks[n].kind == TOK_IDENT) {
+          uint32_t after = next_sig_tok(toks, count, n + 1);
+          if (after < count && (toks[after].kind == TOK_COLON || toks[after].kind == TOK_ASSIGN)) {
+            break;
+          }
+          loop_st = check_name_rules(&toks[n], true, true, out, diag);
+          if (loop_st != STIGI_OK) break;
+          if (after < count && toks[after].kind == TOK_COMMA) {
+            n = next_sig_tok(toks, count, after + 1);
+          } else {
+            break;
+          }
         }
       }
-    } else if (t->kind == TOK_IDENT && paren_depth > 0 && bracket_depth == 0 && brace_depth == 0) {
-      /* Parameter / field / column binder: `name: Type` inside `(...)` */
+    } else if (t->kind == TOK_IDENT) {
       uint32_t nxt = next_sig_tok(toks, count, i + 1);
       if (nxt < count && toks[nxt].kind == TOK_COLON) {
-        Status st = check_name_rules(t, false, true, out, diag);
-        if (st != STIGI_OK) return st;
+        if (paren_depth > 0 && bracket_depth == 0 && brace_depth == 0) {
+          /* Parameter / field / column binder: `name: Type` inside `(...)` */
+          loop_st = check_name_rules(t, false, true, out, diag);
+          if (loop_st != STIGI_OK) break;
+        } else if (brace_depth > 0 && paren_depth == 0 && bracket_depth == 0) {
+          /* Capability binder: `{region: Stigi.Region}` */
+          loop_st = check_name_rules(t, false, true, out, diag);
+          if (loop_st != STIGI_OK) break;
+        } else if (bracket_depth > 0 && paren_depth == 0 && brace_depth == 0) {
+          /* Type parameter: `[A: Type]` */
+          loop_st = check_name_rules_ex(t, true, true, true, false, out, diag);
+          if (loop_st != STIGI_OK) break;
+        } else if (paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+          /* Evidence binder: `<proof: below(index, count)>` */
+          uint32_t prv = prev_sig_tok_nl(toks, i);
+          uint32_t atom = next_sig_tok(toks, count, nxt + 1);
+          uint32_t lp = (atom < count) ? next_sig_tok(toks, count, atom + 1) : count;
+          if (prv != UINT32_MAX &&
+              (toks[prv].kind == TOK_LT || toks[prv].kind == TOK_COMMA) &&
+              atom < count && toks[atom].kind == TOK_IDENT &&
+              lp < count && toks[lp].kind == TOK_LPAREN) {
+            loop_st = check_name_rules(t, false, true, out, diag);
+            if (loop_st != STIGI_OK) break;
+          }
+        }
       }
     }
   }
 
-  return STIGI_OK;
+  free(aliases);
+  return loop_st;
 }
 
 Status stigi_gate_check_source(const char *src, size_t len,
@@ -636,6 +913,26 @@ Status stigi_gate_check_source(const char *src, size_t len,
   return st;
 }
 
+static size_t skip_c_ws_and_comments(const char *src, size_t len, size_t k) {
+  while (k < len) {
+    char c = src[k];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') {
+      k++;
+    } else if (c == '/' && k + 1 < len && src[k + 1] == '/') {
+      k += 2;
+      while (k < len && src[k] != '\n') k++;
+    } else if (c == '/' && k + 1 < len && src[k + 1] == '*') {
+      k += 2;
+      while (k + 1 < len && !(src[k] == '*' && src[k + 1] == '/')) k++;
+      if (k + 1 < len) k += 2;
+      else k = len;
+    } else {
+      break;
+    }
+  }
+  return k;
+}
+
 Status stigi_gate_check_c_source(const char *src, size_t len,
                                  StigiGateFindings *out, Diag *diag) {
   if (src == NULL || out == NULL) {
@@ -644,12 +941,75 @@ Status stigi_gate_check_c_source(const char *src, size_t len,
   size_t i = 0;
   uint32_t line = 1;
   uint32_t col = 0;
+  uint32_t open_parens_before = 0;
+
   while (i < len) {
     unsigned char c = (unsigned char)src[i];
     if (c == '\n') {
       i++;
       line++;
       col = 0;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') {
+      i++;
+      col++;
+      continue;
+    }
+    /* C line comment */
+    if (c == '/' && i + 1 < len && src[i + 1] == '/') {
+      size_t start = i;
+      uint32_t scol = col;
+      i += 2;
+      col += 2;
+      while (i < len && src[i] != '\n') {
+        i++;
+        col++;
+      }
+      StigiSpan sp = {(uint32_t)start, (uint32_t)(i - start), line, scol};
+      Status st = scan_forbidden_subwords(src + start, i - start, sp, out, diag);
+      if (st != STIGI_OK) return st;
+      continue;
+    }
+    /* C block comment */
+    if (c == '/' && i + 1 < len && src[i + 1] == '*') {
+      size_t start = i;
+      uint32_t sline = line, scol = col;
+      i += 2;
+      col += 2;
+      while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) {
+        if (src[i] == '\n') { line++; col = 0; } else { col++; }
+        i++;
+      }
+      if (i + 1 < len) { i += 2; col += 2; }
+      else { i = len; }
+      StigiSpan sp = {(uint32_t)start, (uint32_t)(i - start), sline, scol};
+      Status st = scan_forbidden_subwords(src + start, i - start, sp, out, diag);
+      if (st != STIGI_OK) return st;
+      continue;
+    }
+    /* C string or char literal: skip so string payloads don't false-positive as C calls */
+    if (c == '"' || c == '\'') {
+      open_parens_before = 0;
+      unsigned char quote = c;
+      i++;
+      col++;
+      while (i < len && (unsigned char)src[i] != quote) {
+        if (src[i] == '\\' && i + 1 < len) {
+          if (src[i + 1] == '\n') { line++; col = 0; } else { col += 2; }
+          i += 2;
+          continue;
+        }
+        if (src[i] == '\n') { line++; col = 0; } else { col++; }
+        i++;
+      }
+      if (i < len) { i++; col++; }
+      continue;
+    }
+    if (c == '(') {
+      open_parens_before++;
+      i++;
+      col++;
       continue;
     }
     if (is_alpha(c) || c == '_') {
@@ -665,16 +1025,24 @@ Status stigi_gate_check_c_source(const char *src, size_t len,
       Status st = scan_forbidden_subwords(src + start, id_len, sp, out, diag);
       if (st != STIGI_OK) return st;
 
-      /* S117: check emitted C `exit(` / `exits(` / `exited(` / `exiting(` */
-      size_t k = i;
-      while (k < len && (src[k] == ' ' || src[k] == '\t')) k++;
-      if (k < len && src[k] == '(' && is_exit_forbidden(src + start, id_len)) {
-        st = add_finding(out, STIGI_GATE_FORBIDDEN_WORD, sp, diag,
-                         "forbidden C call '%.*s(' (S117)", (int)id_len, src + start);
-        if (st != STIGI_OK) return st;
+      /* S117: check emitted C exit(, newline/comment gaps, or (exit)( */
+      if (is_exit_forbidden(src + start, id_len)) {
+        size_t k = skip_c_ws_and_comments(src, len, i);
+        uint32_t close_avail = open_parens_before;
+        while (close_avail > 0 && k < len && src[k] == ')') {
+          close_avail--;
+          k = skip_c_ws_and_comments(src, len, k + 1);
+        }
+        if (k < len && src[k] == '(') {
+          st = add_finding(out, STIGI_GATE_FORBIDDEN_WORD, sp, diag,
+                           "forbidden C call '%.*s(' (S117)", (int)id_len, src + start);
+          if (st != STIGI_OK) return st;
+        }
       }
+      open_parens_before = 0;
       continue;
     }
+    open_parens_before = 0;
     i++;
     col++;
   }
@@ -796,6 +1164,39 @@ const char *stigi_help_not_in_language(const char *kw) {
   }
   if (strcmp(kw, "lambda") == 0) {
     return "Stigi.Help: L0 has no lambdas; write a named 'def' unit instead.";
+  }
+  if (strcmp(kw, "type-lambda") == 0) {
+    return "Stigi.Help: L0 has no type lambdas; declare a named parameterized 'type' unit.";
+  }
+  if (strcmp(kw, "string-interpolation") == 0) {
+    return "Stigi.Help: L0 has no string interpolation; text is Array[U8](n) assembled with proved writes.";
+  }
+  if (strcmp(kw, "varargs") == 0) {
+    return "Stigi.Help: L0 has no varargs; pass an Array[A](count) with its length.";
+  }
+  if (strcmp(kw, "ACell") == 0) {
+    return "Stigi.Help: ACell[A] arrives with concurrency (vic/growth/concurrency.md); use Cell[A] in L0.";
+  }
+  if (strcmp(kw, "Option") == 0) {
+    return "Stigi.Help: L0 has no built-in Option; define an enum with two cases (e.g. Found / Missing).";
+  }
+  if (strcmp(kw, "Vec.push") == 0 || strcmp(kw, "Vec") == 0) {
+    return "Stigi.Help: L0 has no Vec.push; use Array.tryGrow{region}(items, nextCap, fill) and handle GrowFailed.";
+  }
+  if (strcmp(kw, "Str") == 0) {
+    return "Stigi.Help: L0 has no Str type; text is Array[U8](n).";
+  }
+  if (strcmp(kw, "recursive-type") == 0) {
+    return "Stigi.Help: L0 has no recursive types; store nodes in an Array[Node](count) indexed by U64.";
+  }
+  if (strcmp(kw, "break") == 0 || strcmp(kw, "continue") == 0) {
+    return "Stigi.Help: L0 has no 'break'/'continue'; encode loop termination in the 'while' condition.";
+  }
+  if (strcmp(kw, "macro") == 0) {
+    return "Stigi.Help: L0 has no macros; use pure compile-time defs and top-level vals.";
+  }
+  if (strcmp(kw, "module") == 0) {
+    return "Stigi.Help: L0 has no modules; organize units by dotted namespaces (A.B.name).";
   }
   if (strcmp(kw, "float") == 0) {
     return "Stigi.Help: L0 has no floating-point literals; use exact integer types.";

@@ -19,6 +19,10 @@ typedef enum {
   TOK_STRING,      /* "abc" */
   TOK_FLOAT,       /* 1.5 -> not-in-language */
   TOK_HASH,        /* # -> not-in-language */
+  TOK_STR_INTERP,  /* s"..." -> not-in-language */
+  TOK_RARROW,      /* -> -> not-in-language */
+  TOK_TYPE_ARROW,  /* =>> -> not-in-language */
+  TOK_ELLIPSIS,    /* ... -> not-in-language */
   TOK_NOT_IN_LANG, /* class, trait, null, throw, try, catch, return, import, ... */
   TOK_ERROR,
 

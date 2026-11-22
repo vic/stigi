@@ -48,7 +48,8 @@ struct StigiType {
 typedef enum {
   STIGI_FACT_ATOM = 0,
   STIGI_FACT_CMP,
-  STIGI_FACT_ARITH
+  STIGI_FACT_ARITH,
+  STIGI_FACT_DENY
 } StigiFactKind;
 
 typedef enum {
@@ -69,19 +70,23 @@ typedef enum {
   STIGI_OP_NEG
 } StigiOp;
 
-typedef struct {
+typedef struct StigiFactItem StigiFactItem;
+
+struct StigiFactItem {
   StigiFactKind kind;
   StigiSpan span;
   bool is_negated;
-  StigiStr evidence_name; /* optional <p: atom> */
-  StigiStr atom_name;     /* for ATOM */
-  StigiExpr **args;       /* for ATOM */
+  StigiStr evidence_name;     /* optional <p: atom> */
+  StigiStr atom_name;         /* for ATOM */
+  StigiExpr **args;           /* for ATOM */
   uint32_t arg_count;
-  StigiStr lhs_var;       /* for ARITH: name = lhs op rhs */
-  StigiExpr *lhs;         /* for CMP / ARITH */
+  StigiStr lhs_var;           /* for ARITH: name = lhs op rhs */
+  StigiExpr *lhs;             /* for CMP / ARITH */
   StigiOp op;
   StigiExpr *rhs;
-} StigiFactItem;
+  StigiFactItem *deny_atoms;  /* for DENY: not (a1, a2, ...) */
+  uint32_t deny_atom_count;
+};
 
 typedef struct {
   StigiSpan span;
@@ -117,6 +122,7 @@ typedef enum {
   STIGI_PAT_WILD = 0,
   STIGI_PAT_VAR,
   STIGI_PAT_INT,
+  STIGI_PAT_BOOL,
   STIGI_PAT_CTOR
 } StigiPatKind;
 
@@ -125,6 +131,8 @@ typedef struct {
   StigiSpan span;
   StigiStr name;
   uint64_t int_val;
+  bool int_overflow;
+  bool bool_val;
   StigiStr *fields; /* for CTOR: name or "_" */
   uint32_t field_count;
   bool has_parens;
@@ -195,6 +203,7 @@ struct StigiExpr {
       uint32_t cap_arg_count;
       StigiExpr **args;
       uint32_t arg_count;
+      bool has_parens;
     } call;
     struct {
       StigiOp op;
@@ -244,6 +253,10 @@ struct StigiExpr {
     struct {
       StigiStr binder; /* optional */
       StigiStr handler_name;
+      StigiType **type_args;
+      uint32_t type_arg_count;
+      StigiStr *cap_args;
+      uint32_t cap_arg_count;
       StigiExpr **args;
       uint32_t arg_count;
       bool has_parens;
@@ -356,10 +369,13 @@ struct StigiDecl {
     struct {
       StigiParam *type_params;
       uint32_t type_param_count;
+      StigiCapParam *cap_params;
+      uint32_t cap_param_count;
       StigiParam *val_params;
       uint32_t val_param_count;
       bool has_val_parens;
       StigiStr for_cap;
+      StigiType *for_cap_type;
       StigiExpr **vars; /* STIGI_EXPR_VAR */
       uint32_t var_count;
       StigiDecl **defs; /* STIGI_DECL_DEF */

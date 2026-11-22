@@ -23,6 +23,7 @@ typedef struct {
   StigiUnit *unit;
 } StigiParseResult;
 
+StigiParseResult stigi_parse_tokens(const StigiTok *toks, uint32_t count, Arena *arena);
 StigiParseResult stigi_parse_unit(const char *src, size_t len, Arena *arena);
 
 #endif

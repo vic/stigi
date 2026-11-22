@@ -27,12 +27,19 @@
               root = ./.;
               fileset = pkgs.lib.fileset.unions [ ./Justfile ./src ./tests ];
             };
-            nativeBuildInputs = [ pkgs.just pkgs.gcc ];
+            nativeBuildInputs = [ pkgs.just pkgs.gcc pkgs.clang ];
             dontConfigure = true;
             buildPhase = ''
               runHook preBuild
               just --set tupu_inc "${tupuPkg}/include" --set tupu_lib "${tupuPkg}/lib/libtupu.a" build
               runHook postBuild
+            '';
+            doCheck = true;
+            checkPhase = ''
+              runHook preCheck
+              export TUPU_BIN="${tupuPkg}/bin/tupu"
+              just --set tupu_inc "${tupuPkg}/include" --set tupu_lib "${tupuPkg}/lib/libtupu.a" test
+              runHook postCheck
             '';
             installPhase = ''
               runHook preInstall

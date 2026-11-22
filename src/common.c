@@ -1,6 +1,7 @@
 #include "common.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,10 +53,11 @@ void arena_init(Arena *a) {
   a->cur = NULL;
 }
 
-void *arena_alloc(Arena *a, size_t size) {
-  if (a == NULL) return NULL;
+void *arena_alloc_aligned(Arena *a, size_t size, size_t align) {
+  if (a == NULL || align == 0 || (align & (align - 1U)) != 0 || align > _Alignof(max_align_t)) {
+    return NULL;
+  }
   size_t req = size == 0 ? 1 : size;
-  size_t align = _Alignof(max_align_t);
   size_t aligned = align_up(req, align);
   if (aligned == SIZE_MAX) return NULL;
 
@@ -68,18 +70,29 @@ void *arena_alloc(Arena *a, size_t size) {
     }
   }
 
-  size_t bcap = aligned > STIGI_ARENA_BLOCK_SIZE ? aligned : STIGI_ARENA_BLOCK_SIZE;
+  bool oversized = aligned > STIGI_ARENA_BLOCK_SIZE;
+  size_t bcap = oversized ? aligned : STIGI_ARENA_BLOCK_SIZE;
   ArenaBlock *nb = arena_new_block(bcap);
   if (nb == NULL) return NULL;
+  nb->used = aligned;
+
   if (a->head == NULL) {
     a->head = nb;
     a->cur = nb;
+  } else if (oversized) {
+    /* Splice oversized block after head without abandoning free space in a->cur */
+    nb->next = a->head->next;
+    a->head->next = nb;
   } else {
+    nb->next = a->cur->next;
     a->cur->next = nb;
     a->cur = nb;
   }
-  nb->used = aligned;
   return (uint8_t *)(nb + 1);
+}
+
+void *arena_alloc(Arena *a, size_t size) {
+  return arena_alloc_aligned(a, size, _Alignof(max_align_t));
 }
 
 void arena_reset(Arena *a) {
@@ -201,7 +214,7 @@ Status intern_str(InternPool *p, const char *s, size_t len, uint32_t *out_id, Di
     p->cap = ncap;
   }
 
-  char *copy = arena_alloc(&p->str_arena, len + 1U);
+  char *copy = arena_alloc_aligned(&p->str_arena, len + 1U, 1U);
   if (copy == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "intern_str: arena out of memory");
   if (len > 0) memcpy(copy, src, len);
   copy[len] = '\0';
