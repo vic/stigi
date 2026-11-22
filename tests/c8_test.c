@@ -4,6 +4,7 @@
 #include "door.h"
 #include "emit.h"
 #include "eval.h"
+#include "tenet_gate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,18 +103,65 @@ int main(void) {
       "  case Empty\n";
 
   const char *u_buf_enum =
-      "// prompt: an enum holding an Array field to lock 8-byte Array pointer layout.\n"
+      "// prompt: an enum holding an Array field to lock 1-word nullable-pointer layout.\n"
       "pub enum Demo.BufferWrap:\n"
       "  case Slice(data: Array[U8](4))\n"
       "  case Absent\n";
 
+  const char *u_tail_enum =
+      "// prompt: enum whose tag packs into 7 bytes of tail padding (sizeof == 16).\n"
+      "pub enum Demo.TailPack:\n"
+      "  case Wide(word: U64, flag: U8)\n"
+      "  case EmptyPack\n";
+
+  const char *u_region =
+      "// prompt: kernel region capability.\n"
+      "pub capability Stigi.Region:\n"
+      "  def regionMarker(): Unit\n";
+
+  const char *u_alloc_use =
+      "// prompt: allocate a 64-byte cache-line aligned stack buffer via Array.tryFill.\n"
+      "pub def Demo.allocAndRead {region: Stigi.Region} () <lessOrEqual(0, 1)>: U8 =\n"
+      "  Array.tryFill{region}(64, 'Z') match\n"
+      "    case Filled(buffer) => buffer(0)\n"
+      "    case FillFailed => 0\n";
+
+  const char *u_alloc_dyn =
+      "// prompt: allocate and deterministically free a dynamic 64-byte aligned buffer.\n"
+      "def Demo.allocDynamic {region: Stigi.Region} (count: U64) <below(0, count)>: U8 =\n"
+      "  Array.tryFill{region}(count, 'Y') match\n"
+      "    case Filled(buffer) => buffer(0)\n"
+      "    case FillFailed => 0\n";
+
+  const char *u_alloc_loop =
+      "// prompt: run repeated dynamic alloc and free cycles in a bounded loop.\n"
+      "pub def Demo.allocLoop {region: Stigi.Region} (rounds: U64, count: U64) <below(0, count)>: U8 =\n"
+      "  var step: U64 = 0\n"
+      "  var latest: U8 = 0\n"
+      "  while step < rounds do\n"
+      "    @<lessOrEqual(step, rounds)>\n"
+      "    latest = Demo.allocDynamic(count)\n"
+      "    step = step + 1\n"
+      "  latest\n";
+
   const char *u_extract =
-      "// prompt: extract value from tag.\n"
+      "// prompt: extract value from tag enum.\n"
       "pub def Demo.extractTag(item: Demo.Tag) <lessOrEqual(0, 1)>: U64 =\n"
       "  item match\n"
       "    case Number(value) => value\n"
       "    case Mixed(_, _, _) => 1\n"
       "    case Empty => 0\n";
+
+  const char *u_extract_tail =
+      "// prompt: extract word from tail-packed enum using expression-position and integer match.\n"
+      "pub def Demo.extractTail(packed: Demo.TailPack) <lessOrEqual(0, 1)>: U64 =\n"
+      "  val chosen: U64 = packed match\n"
+      "    case Wide(word, flag) =>\n"
+      "      flag match\n"
+      "        case 1 => word\n"
+      "        case _ => 0\n"
+      "    case EmptyPack => 0\n"
+      "  chosen\n";
 
   const char *u_signed =
       "// prompt: signed negative literal comparison.\n"
@@ -169,32 +217,37 @@ int main(void) {
 
   const char *u_main_ok =
       "// prompt: program entry exercising all lowered constructs.\n"
-      "pub def main {file: Stigi.File, mut: Stigi.Mut} () <lessOrEqual(0, 1)>: I32 =\n"
+      "pub def main {file: Stigi.File, mut: Stigi.Mut, region: Stigi.Region} () <lessOrEqual(0, 1)>: I32 =\n"
       "  Demo.zeroBound(5)\n"
       "  Demo.voidCount(3)\n"
       "  Demo.applyWrap(Absent)\n"
       "  val first: U8 = Demo.byteAt(3, \"abc\", 0)\n"
       "  val second: U8 = Demo.taintedAt(3, \"abc\", 1)\n"
       "  val guarded: U8 = Demo.taintedGuarded(3, \"abc\", 2)\n"
+      "  val filledByte: U8 = Demo.allocAndRead()\n"
+      "  val dynamicByte: U8 = Demo.allocLoop(200, 64)\n"
       "  val done: U64 = Demo.countDown(5)\n"
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
+      "  val tailVal: U64 = Demo.extractTail(Wide(9, 1))\n"
       "  val negInput: I32 = -5\n"
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
-      "  if done == 0 && tagVal == 7 && first == 'a' && second == 'b' && guarded == 'c' && signResult == negWant then 0 else 1\n";
+      "  val signedCompareTrue: Bool = (-5 < 0)\n"
+      "  if done == 0 && tagVal == 7 && tailVal == 9 && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[16] = {
-      u_file,            u_mut,         u_enum,          u_buf_enum,  u_extract,
-      u_signed,          u_at,          u_tainted,       u_tainted_guarded,
-      u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail, u_lemma,
+  const char *all_srcs[22] = {
+      u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
+      u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
+      u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
+      u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail,   u_lemma,
       u_test_ok,         u_main_ok
   };
-  size_t all_lens[16];
-  for (int i = 0; i < 16; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[22];
+  for (int i = 0; i < 22; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 16, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 22, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",
@@ -213,21 +266,46 @@ int main(void) {
   CHECK(c1 != NULL && c2 != NULL && l1 == l2 && memcmp(c1, c2, l1) == 0,
         "determinism: two emissions are byte-equal");
 
-  /* 2. CRASH LINE, stats, #line reset, S118 order, offsetof _Static_assert */
+  /* 2. CRASH LINE, tenet gate on emitted C, zero GNU builtins, 1-word nullable-ptr, tail-tag */
   CHECK(c1 != NULL && strstr(c1, "abort(") == NULL, "CRASH LINE: zero abort(");
   CHECK(c1 != NULL && strstr(c1, "exit(") == NULL, "CRASH LINE: zero exit(");
+  CHECK(c1 != NULL && strstr(c1, "__builtin_unreachable") == NULL,
+        "emitter.md 3: zero GNU builtins (__builtin_unreachable) in emitted C");
+  {
+    StigiGateFindings gf;
+    stigi_gate_findings_init(&gf);
+    CHECK(stigi_gate_check_c_source(c1, l1, &gf, &d) == STIGI_OK, "gate check C source ok");
+    if (gf.count > 0) {
+      for (uint32_t i = 0; i < gf.count; i++) {
+        fprintf(stderr, "  c_gate finding: %s\n", gf.items[i].msg);
+      }
+    }
+    CHECK(gf.count == 0, "stigi_gate_check_c_source: 0 findings on emitted C");
+    stigi_gate_findings_free(&gf);
+  }
   CHECK(c1 != NULL && strstr(c1, "#line 1 \"<stigi-runtime-main>\"") != NULL,
         "Defect 5: #line reset before main wrapper");
+  CHECK(c1 != NULL && strstr(c1, "sizeof(Stigi_Demo_BufferWrap) == 8ULL") != NULL,
+        "memory.md 8: 1-word nullable-pointer enum optimization (sizeof == 8)");
+  CHECK(c1 != NULL && strstr(c1, "sizeof(Stigi_Demo_TailPack) == 16ULL") != NULL &&
+        strstr(c1, "offsetof(Stigi_Demo_TailPack, _hdr.tag) == 9ULL") != NULL,
+        "memory.md 8: tail-padding tag placement (sizeof == 16, tag at offset 9)");
   CHECK(c1 != NULL && strstr(c1, "offsetof(Stigi_Demo_Tag, u.Mixed.mid) == 0ULL") != NULL &&
         strstr(c1, "offsetof(Stigi_Demo_Tag, u.Mixed.head) == 4ULL") != NULL,
         "Defect 3: _Static_assert(offsetof(...)) emitted for alignment-sorted enum fields");
   CHECK(c1 != NULL && strstr(c1, "stigi_rt_shutdown(&rt_state)") != NULL,
         "Defect 10: guard-paged stack/pool retained until stigi_rt_shutdown");
-  CHECK(st1.enums_emitted >= 2, "enums emitted");
-  CHECK(st1.defs_emitted >= 8, "defs emitted");
+  CHECK(st1.enums_emitted >= 3, "enums emitted");
+  CHECK(st1.defs_emitted >= 9, "defs emitted");
   CHECK(st1.lemmas_erased >= 1, "lemma erased");
   CHECK(st1.spectre_masks >= 3, "Datalog maskIndex masks taintedAt, taintedGuarded, and taintedWrite");
   CHECK(st1.tail_loops >= 2, "tail-recursive defs (value + void) lowered to loops");
+  CHECK(st1.pure_defs >= 4 && st1.parallel_safe_sites >= 4,
+        "T18: Datalog purity & parallel-safe call sites detected");
+  CHECK(st1.stack_objects >= 1 && st1.free_at_exit >= 1,
+        "T15: constant-size stack promotion & dynamic deterministic free emitted");
+  CHECK(c1 != NULL && strstr(c1, "_Alignas(64)") != NULL && strstr(c1, "free(_arr") != NULL,
+        "memory.md 1 & 8: 64B cache-aligned stack object and deterministic free in emitted C");
 
   /* 3. Write /tmp/stigi-c8-out.c and compile with gcc (-fstack-usage), clang, and -DSTIGI_PROFILE_RT_LOCKED */
   FILE *f = fopen("/tmp/stigi-c8-out.c", "w");
@@ -408,6 +486,21 @@ int main(void) {
   int rc_run_clang = run_cmd("/tmp/stigi-c8-bin-clang");
   CHECK(rc_run_clang == 0, "Clang compiled binary exits 0 (matches evaluator + embedded Tests pass)");
 
+  /* S47 Fil-C backstop: when FILCC is set, compile & run emitted C with Fil-C! */
+  const char *filcc = getenv("FILCC");
+  if (filcc != NULL && filcc[0] != '\0') {
+    char cmd[1024];
+    (void)snprintf(cmd, sizeof cmd,
+                   "%s -std=c11 -Wall -Wextra -Werror -pedantic -O2 -fno-strict-aliasing "
+                   "-fwrapv -fno-delete-null-pointer-checks -o /tmp/stigi-c8-bin-filc "
+                   "/tmp/stigi-c8-out.c",
+                   filcc);
+    CHECK(run_cmd(cmd) == 0, "S47 Fil-C compiles emitted C with 0 warnings");
+    CHECK(run_cmd("/tmp/stigi-c8-bin-filc") == 0,
+          "S47 Fil-C compiled binary exits 0 (zero memory/capability panics)");
+    (void)unlink("/tmp/stigi-c8-bin-filc");
+  }
+
   int32_t test_idx = stigi_image_find(&door.image, "Demo.Tests.checkAll",
                                       strlen("Demo.Tests.checkAll"));
   CHECK(test_idx >= 0, "find Demo.Tests.checkAll");
@@ -443,8 +536,9 @@ int main(void) {
   stigi_door_free(&door);
 
   if (g_failures == 0) {
-    printf("c8_test: ALL PASS (masks=%u tail_loops=%u lemmas_erased=%u)\n",
-           st1.spectre_masks, st1.tail_loops, st1.lemmas_erased);
+    printf("c8_test: ALL PASS (masks=%u tail_loops=%u lemmas_erased=%u pure_defs=%u par_sites=%u)\n",
+           st1.spectre_masks, st1.tail_loops, st1.lemmas_erased,
+           st1.pure_defs, st1.parallel_safe_sites);
     return 0;
   }
   fprintf(stderr, "c8_test: %d FAILURES\n", g_failures);

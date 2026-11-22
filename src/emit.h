@@ -15,6 +15,12 @@ typedef struct {
   uint32_t lemmas_erased;
   uint32_t spectre_masks;
   uint32_t tail_loops;
+  uint32_t free_edges;
+  uint32_t free_at_exit;
+  uint32_t reuses;
+  uint32_t stack_objects;
+  uint32_t pure_defs;
+  uint32_t parallel_safe_sites;
 } StigiEmitStats;
 
 /* Deterministically emit portable ISO C11 for all reached units (sorted by 32-byte runtime_id) */

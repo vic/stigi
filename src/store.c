@@ -6,6 +6,8 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,19 +123,32 @@ static Status ensure_parent_dirs(const char *path, char *err_buf, size_t err_cap
   return STIGI_OK;
 }
 
+static atomic_uint_fast64_t g_tmp_seq = 0;
+
 static Status atomic_write_file(const char *path, const void *data, size_t len,
                                 char *err_buf, size_t err_cap) {
   char tmp_path[1100];
-  int tn = snprintf(tmp_path, sizeof tmp_path, "%s.tmp.%ld", path, (long)getpid());
+  uint64_t seq = (uint64_t)atomic_fetch_add(&g_tmp_seq, 1U) + 1ULL;
+  int tn = snprintf(tmp_path, sizeof tmp_path, "%s.tmp.%ld.%llu",
+                    path, (long)getpid(), (unsigned long long)seq);
   if (tn < 0 || (size_t)tn >= sizeof tmp_path) {
     if (err_buf != NULL && err_cap > 0) (void)snprintf(err_buf, err_cap, "path too long");
     return STIGI_ERR_INVALID;
   }
 
-  FILE *f = fopen(tmp_path, "wb");
-  if (f == NULL) {
+  int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+  if (fd < 0) {
     if (err_buf != NULL && err_cap > 0) {
-      (void)snprintf(err_buf, err_cap, "cannot open temp file '%s'", tmp_path);
+      (void)snprintf(err_buf, err_cap, "cannot create temp file '%s'", tmp_path);
+    }
+    return STIGI_ERR_IO;
+  }
+  FILE *f = fdopen(fd, "wb");
+  if (f == NULL) {
+    (void)close(fd);
+    (void)unlink(tmp_path);
+    if (err_buf != NULL && err_cap > 0) {
+      (void)snprintf(err_buf, err_cap, "fdopen failed for '%s'", tmp_path);
     }
     return STIGI_ERR_IO;
   }
@@ -233,9 +248,19 @@ static Status collect_sc_files(const char *dir, PathList *pl, Diag *diag) {
 }
 
 static Status read_whole_file(const char *path, char **out_buf, size_t *out_len, Diag *diag) {
-  FILE *f = fopen(path, "rb");
-  if (f == NULL) {
+  int fd = open(path, O_RDONLY | O_NOFOLLOW);
+  if (fd < 0) {
     return diag_set(diag, STIGI_ERR_IO, errno, "cannot read '%s'", path);
+  }
+  struct stat fst;
+  if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode)) {
+    (void)close(fd);
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "'%s' is not a regular file", path);
+  }
+  FILE *f = fdopen(fd, "rb");
+  if (f == NULL) {
+    (void)close(fd);
+    return diag_set(diag, STIGI_ERR_IO, errno, "fdopen failed on '%s'", path);
   }
   if (fseek(f, 0, SEEK_END) != 0) {
     (void)fclose(f);
@@ -321,11 +346,46 @@ static Status write_cache_file(const StigiDoor *door, const char *dir,
   return st;
 }
 
-Status stigi_store_dir(const StigiDoor *door, const char *dir,
-                       char *err_buf, size_t err_cap) {
+static int cmp_cstr(const void *pa, const void *pb) {
+  return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+static bool sorted_path_contains(char *const *paths, uint32_t count, const char *key) {
+  uint32_t lo = 0, hi = count;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2U;
+    int c = strcmp(paths[mid], key);
+    if (c == 0) return true;
+    if (c < 0) lo = mid + 1U;
+    else hi = mid;
+  }
+  return false;
+}
+
+static bool unit_selected(const char *name, const char *const *names, uint32_t name_count) {
+  if (name_count == 0 || names == NULL) return true;
+  for (uint32_t i = 0; i < name_count; i++) {
+    if (names[i] != NULL && strcmp(name, names[i]) == 0) return true;
+  }
+  return false;
+}
+
+Status stigi_store_dir_subset(const StigiDoor *door, const char *dir,
+                              const char *const *names, uint32_t name_count,
+                              char *err_buf, size_t err_cap) {
   if (door == NULL || dir == NULL || dir[0] == '\0') {
     if (err_buf != NULL && err_cap > 0) (void)snprintf(err_buf, err_cap, "invalid arguments");
     return STIGI_ERR_INVALID;
+  }
+  /* Validate named subset entries exist in image before writing anything */
+  for (uint32_t i = 0; i < name_count; i++) {
+    if (names[i] == NULL ||
+        stigi_image_find(&door->image, names[i], strlen(names[i])) < 0) {
+      if (err_buf != NULL && err_cap > 0) {
+        (void)snprintf(err_buf, err_cap, "unknown unit '%s'", names[i] ? names[i] : "");
+      }
+      return STIGI_ERR_INVALID;
+    }
   }
   /* door.md:124: missing directory is a typed error (never auto-create dir) */
   struct stat st_dir;
@@ -336,30 +396,36 @@ Status stigi_store_dir(const StigiDoor *door, const char *dir,
     return STIGI_ERR_IO;
   }
 
-  /* Collect existing .sc files so stale files can be pruned after write */
+  /* Collect existing .sc files so stale files can be pruned when storing full image */
   PathList old_files = {NULL, 0, 0};
-  Diag tmp_diag;
-  diag_clear(&tmp_diag);
-  Status col_st = collect_sc_files(dir, &old_files, &tmp_diag);
-  if (col_st != STIGI_OK) {
-    pathlist_free(&old_files);
-    if (err_buf != NULL && err_cap > 0) (void)snprintf(err_buf, err_cap, "%s", tmp_diag.msg);
-    return col_st;
+  if (name_count == 0) {
+    Diag tmp_diag;
+    diag_clear(&tmp_diag);
+    Status col_st = collect_sc_files(dir, &old_files, &tmp_diag);
+    if (col_st != STIGI_OK) {
+      pathlist_free(&old_files);
+      if (err_buf != NULL && err_cap > 0) (void)snprintf(err_buf, err_cap, "%s", tmp_diag.msg);
+      return col_st;
+    }
   }
 
   const StigiImage *img = &door->image;
   const StigiImageUnit **sorted = NULL;
+  uint32_t sel_count = 0;
   if (img->unit_count > 0) {
     sorted = malloc((size_t)img->unit_count * sizeof *sorted);
     if (sorted == NULL) {
       pathlist_free(&old_files);
       return STIGI_ERR_OOM;
     }
-    for (uint32_t i = 0; i < img->unit_count; i++) sorted[i] = &img->units[i];
-    qsort(sorted, img->unit_count, sizeof *sorted, cmp_unit_name);
+    for (uint32_t i = 0; i < img->unit_count; i++) {
+      if (unit_selected(img->units[i].name, names, name_count)) {
+        sorted[sel_count++] = &img->units[i];
+      }
+    }
+    if (sel_count > 1U) qsort(sorted, sel_count, sizeof *sorted, cmp_unit_name);
   }
 
-  /* Build index in memory */
   size_t idx_cap = 1024U;
   size_t idx_len = 0;
   char *idx_buf = malloc(idx_cap);
@@ -375,7 +441,7 @@ Status stigi_store_dir(const StigiDoor *door, const char *dir,
   arena_init(&tmp);
   Status res = STIGI_OK;
 
-  for (uint32_t i = 0; i < img->unit_count && res == STIGI_OK; i++) {
+  for (uint32_t i = 0; i < sel_count && res == STIGI_OK; i++) {
     const StigiImageUnit *u = sorted[i];
     if (!is_safe_unit_name(u->name, u->name_len)) {
       if (err_buf != NULL && err_cap > 0) {
@@ -451,7 +517,7 @@ Status stigi_store_dir(const StigiDoor *door, const char *dir,
     idx_buf[idx_len] = '\0';
   }
 
-  if (res == STIGI_OK) {
+  if (res == STIGI_OK && name_count == 0) {
     char idx_path[1024];
     int in = snprintf(idx_path, sizeof idx_path, "%s/index", dir);
     if (in < 0 || (size_t)in >= sizeof idx_path) {
@@ -462,21 +528,19 @@ Status stigi_store_dir(const StigiDoor *door, const char *dir,
     }
   }
 
-  if (res == STIGI_OK) {
+  if (res == STIGI_OK && name_count == 0) {
     res = write_cache_file(door, dir, err_buf, err_cap);
   }
 
-  /* Prune stale .sc files not in the image */
-  if (res == STIGI_OK) {
+  /* O(N log N) prune of stale .sc files when storing full image */
+  if (res == STIGI_OK && name_count == 0 && old_files.count > 0) {
+    if (written_files.count > 1U) {
+      qsort(written_files.paths, written_files.count, sizeof *written_files.paths, cmp_cstr);
+    }
     for (uint32_t i = 0; i < old_files.count; i++) {
-      bool kept = false;
-      for (uint32_t j = 0; j < written_files.count; j++) {
-        if (strcmp(old_files.paths[i], written_files.paths[j]) == 0) {
-          kept = true;
-          break;
-        }
+      if (!sorted_path_contains(written_files.paths, written_files.count, old_files.paths[i])) {
+        (void)unlink(old_files.paths[i]);
       }
-      if (!kept) (void)unlink(old_files.paths[i]);
     }
   }
 
@@ -488,8 +552,9 @@ Status stigi_store_dir(const StigiDoor *door, const char *dir,
   return res;
 }
 
-static int cmp_cstr(const void *pa, const void *pb) {
-  return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+Status stigi_store_dir(const StigiDoor *door, const char *dir,
+                       char *err_buf, size_t err_cap) {
+  return stigi_store_dir_subset(door, dir, NULL, 0, err_buf, err_cap);
 }
 
 static Status verify_index_file(const char *dir, Diag *diag) {
@@ -611,6 +676,17 @@ static Status load_and_verify_cache(StigiDoor *door, const char *dir, Diag *diag
   return is;
 }
 
+static Status snapshot_keyset(const StigiKeySet *src, StigiKeySet *dst, Diag *diag) {
+  memset(dst, 0, sizeof *dst);
+  if (src->cap == 0 || src->slots == NULL) return STIGI_OK;
+  dst->slots = malloc((size_t)src->cap * sizeof *dst->slots);
+  if (dst->slots == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "cache snapshot OOM");
+  memcpy(dst->slots, src->slots, (size_t)src->cap * sizeof *dst->slots);
+  dst->cap = src->cap;
+  dst->count = src->count;
+  return STIGI_OK;
+}
+
 Status stigi_load_dir(StigiDoor *door, const char *dir,
                       StigiDoorResult *out, Diag *diag) {
   if (door == NULL || dir == NULL || out == NULL) {
@@ -618,9 +694,6 @@ Status stigi_load_dir(StigiDoor *door, const char *dir,
   }
 
   Status vs = verify_index_file(dir, diag);
-  if (vs != STIGI_OK) return vs;
-
-  vs = load_and_verify_cache(door, dir, diag);
   if (vs != STIGI_OK) return vs;
 
   PathList pl = {NULL, 0, 0};
@@ -644,8 +717,36 @@ Status stigi_load_dir(StigiDoor *door, const char *dir,
     st = read_whole_file(pl.paths[i], &srcs[i], &lens[i], diag);
   }
 
+  /* T0 atomicity: snapshot caches before loading disk cache; restore verbatim on any error/reject */
+  StigiKeySet saved_vc = {NULL, 0, 0};
+  StigiKeySet saved_tc = {NULL, 0, 0};
+  bool snapped = false;
+  if (st == STIGI_OK) {
+    st = snapshot_keyset(&door->verdict_cache, &saved_vc, diag);
+    if (st == STIGI_OK) st = snapshot_keyset(&door->test_cache, &saved_tc, diag);
+    if (st == STIGI_OK) {
+      snapped = true;
+      st = load_and_verify_cache(door, dir, diag);
+    }
+  }
+
   if (st == STIGI_OK) {
     st = stigi_door_replace_all(door, (const char *const *)srcs, lens, pl.count, out, diag);
+  }
+
+  if (snapped) {
+    if (st != STIGI_OK || !out->accepted) {
+      free(door->verdict_cache.slots);
+      free(door->test_cache.slots);
+      door->verdict_cache = saved_vc;
+      door->test_cache = saved_tc;
+    } else {
+      free(saved_vc.slots);
+      free(saved_tc.slots);
+    }
+  } else {
+    free(saved_vc.slots);
+    free(saved_tc.slots);
   }
 
   for (uint32_t i = 0; i < pl.count; i++) {

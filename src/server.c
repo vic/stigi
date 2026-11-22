@@ -176,27 +176,72 @@ static const char *decl_kind_label(StigiDeclKind k) {
   return "unit";
 }
 
-/* Extract signature line (without body) for `summary` and `laws` */
+/* Extract full header signature (multi-line safe, zero body leak) for `summary` and `laws` */
 static void append_unit_signature(StigiServerCtx *ctx, ReplyBuf *rb, const StigiImageUnit *u) {
   arena_reset(&ctx->scratch);
   char *printed = NULL;
   size_t plen = 0;
   Diag d;
   diag_clear(&d);
-  if (stigi_print_unit(u->ast, &printed, &plen, &ctx->scratch, &d) == STIGI_OK && printed != NULL) {
-    const char *p = printed;
-    while (*p != '\0') {
-      const char *nl = strchr(p, '\n');
-      size_t llen = nl != NULL ? (size_t)(nl - p) : strlen(p);
-      if (strncmp(p, "// prompt:", 10) != 0 && strncmp(p, "alias ", 6) != 0) {
-        if (llen >= 2U && p[llen - 1U] == '=' && p[llen - 2U] == ' ') llen -= 2U;
-        rb_mem(rb, p, llen);
-        rb_cstr(rb, "\n");
-        break;
-      }
-      if (nl == NULL) break;
-      p = nl + 1;
+  if (stigi_print_unit(u->ast, &printed, &plen, &ctx->scratch, &d) != STIGI_OK || printed == NULL) {
+    return;
+  }
+  const char *p = printed;
+  const char *end = printed + plen;
+  /* Skip leading prompt comments and local alias lines */
+  while (p < end) {
+    const char *nl = memchr(p, '\n', (size_t)(end - p));
+    size_t llen = nl != NULL ? (size_t)(nl - p) : (size_t)(end - p);
+    if (llen == 0 || strncmp(p, "//", 2) == 0 || strncmp(p, "alias ", 6) == 0) {
+      p = nl != NULL ? nl + 1 : end;
+      continue;
     }
+    break;
+  }
+  /* Emit header lines up to top-level '=' (for def/val/type) or ':' (for enum/cap/handler) */
+  int paren = 0, brace = 0, angle = 0;
+  bool in_str = false;
+  bool emitted = false;
+  while (p < end) {
+    const char *nl = memchr(p, '\n', (size_t)(end - p));
+    const char *lend = nl != NULL ? nl : end;
+    const char *cut = lend;
+    bool stop = false;
+    for (const char *c = p; c < lend; c++) {
+      if (in_str) {
+        if (*c == '\\' && c + 1 < lend) { c++; continue; }
+        if (*c == '"') in_str = false;
+        continue;
+      }
+      if (*c == '"') { in_str = true; continue; }
+      if (*c == '(') paren++;
+      else if (*c == ')' && paren > 0) paren--;
+      else if (*c == '{') brace++;
+      else if (*c == '}' && brace > 0) brace--;
+      else if (*c == '<') angle++;
+      else if (*c == '>' && angle > 0) angle--;
+      else if (paren == 0 && brace == 0 && angle == 0) {
+        if (*c == '=' && !(c + 1 < lend && c[1] == '=') && !(c > p && (c[-1] == '=' || c[-1] == '!' || c[-1] == '<' || c[-1] == '>' || c[-1] == ':'))) {
+          cut = c;
+          while (cut > p && cut[-1] == ' ') cut--;
+          stop = true;
+          break;
+        }
+        if (*c == ':' && c + 1 == lend) {
+          cut = lend;
+          stop = true;
+          break;
+        }
+      }
+    }
+    rb_mem(rb, p, (size_t)(cut - p));
+    rb_cstr(rb, "\n");
+    emitted = true;
+    if (stop || nl == NULL) break;
+    p = nl + 1;
+  }
+  if (!emitted && u->name != NULL) {
+    rb_fmt(rb, "%s\n", u->name);
   }
 }
 
@@ -359,7 +404,39 @@ static const char *memmem_bounded(const char *hay, size_t hlen, const char *need
   return NULL;
 }
 
-/* Splice `edit <Name>.body[<i>..<j>] := <statements>` into existing unit text */
+/* Find top-level '==' outside strings and nested delimiters for `test <lhs> == <rhs>` */
+static const char *find_top_level_eqeq(const char *s, size_t len) {
+  int paren = 0, brack = 0, brace = 0;
+  bool in_str = false;
+  bool in_chr = false;
+  for (size_t i = 0; i + 1U < len; i++) {
+    char c = s[i];
+    if (in_str) {
+      if (c == '\\' && i + 1U < len) { i++; continue; }
+      if (c == '"') in_str = false;
+      continue;
+    }
+    if (in_chr) {
+      if (c == '\\' && i + 1U < len) { i++; continue; }
+      if (c == '\'') in_chr = false;
+      continue;
+    }
+    if (c == '"') { in_str = true; continue; }
+    if (c == '\'') { in_chr = true; continue; }
+    if (c == '(') paren++;
+    else if (c == ')' && paren > 0) paren--;
+    else if (c == '[') brack++;
+    else if (c == ']' && brack > 0) brack--;
+    else if (c == '{') brace++;
+    else if (c == '}' && brace > 0) brace--;
+    else if (paren == 0 && brack == 0 && brace == 0 && c == '=' && s[i + 1U] == '=') {
+      return s + i;
+    }
+  }
+  return NULL;
+}
+
+/* Splice `edit <Name>.body[<i>..<j>] := <statements>` using AST body span (skips comments/headers) */
 static Status splice_body_edit(StigiServerCtx *ctx, const char *uname, size_t ulen,
                                uint32_t line_lo, uint32_t line_hi,
                                const char *repl, size_t repl_len,
@@ -371,12 +448,35 @@ static Status splice_body_edit(StigiServerCtx *ctx, const char *uname, size_t ul
   const char *orig = ctx->door->unit_srcs[idx];
   size_t orig_len = ctx->door->unit_lens[idx];
 
-  /* Find the '=' introducing the body on the declaration header */
-  const char *eq = memchr(orig, '=', orig_len);
   const char *body_start = orig;
-  if (eq != NULL) {
-    const char *nl = memchr(eq, '\n', (size_t)((orig + orig_len) - eq));
-    body_start = nl != NULL ? nl + 1 : eq + 1;
+  const StigiDecl *decl = ctx->door->image.units[idx].ast != NULL
+                              ? ctx->door->image.units[idx].ast->decl
+                              : NULL;
+  const StigiExpr *body_e = NULL;
+  if (decl != NULL) {
+    if (decl->kind == STIGI_DECL_DEF || decl->kind == STIGI_DECL_LEMMA_DEF) {
+      body_e = decl->u.def_decl.body;
+    } else if (decl->kind == STIGI_DECL_VAL || decl->kind == STIGI_DECL_TEST ||
+               decl->kind == STIGI_DECL_NEG_TEST) {
+      body_e = decl->u.val_decl.body;
+    }
+  }
+  if (body_e != NULL && body_e->span.offset < orig_len) {
+    /* Rewind to start of body's first line (preserving indentation) or right after '=' */
+    size_t off = body_e->span.offset;
+    while (off > 0 && orig[off - 1U] != '\n') off--;
+    if (off > 0) {
+      body_start = orig + off;
+    } else {
+      body_start = orig + body_e->span.offset;
+    }
+  } else {
+    size_t decl_off = (decl != NULL && decl->span.offset < orig_len) ? decl->span.offset : 0U;
+    const char *eq = memchr(orig + decl_off, '=', orig_len - decl_off);
+    if (eq != NULL) {
+      const char *nl = memchr(eq, '\n', (size_t)((orig + orig_len) - eq));
+      body_start = nl != NULL ? nl + 1 : eq + 1;
+    }
   }
 
   ReplyBuf rb = {NULL, 0, 0, false};
@@ -520,8 +620,8 @@ static Status parse_batch_ops(StigiServerCtx *ctx, const char *body, size_t len,
       ops[cnt].unit_name = NULL;
 
       if (is_test) {
-        /* Synthesize a Stigi Test unit for `test <lhs> == <rhs>` */
-        const char *eqeq = memmem_bounded(start, olen, "==", 2U);
+        /* Synthesize a tenet-gate-clean Stigi Test unit for `test <lhs> == <rhs>` */
+        const char *eqeq = find_top_level_eqeq(start, olen);
         if (eqeq == NULL) {
           ops[cnt].text = dup_span_cstr(start, olen);
           ops[cnt].len = olen;
@@ -532,13 +632,16 @@ static Status parse_batch_ops(StigiServerCtx *ctx, const char *body, size_t len,
           const char *rhs = eqeq + 2;
           size_t rhsl = (size_t)((start + olen) - rhs);
           while (rhsl > 0 && *rhs == ' ') { rhs++; rhsl--; }
-          synth_test_idx++;
+          uint32_t sidx = synth_test_idx++;
+          char c0 = (char)('A' + ((sidx / 676U) % 26U));
+          char c1 = (char)('a' + ((sidx / 26U) % 26U));
+          char c2 = (char)('a' + (sidx % 26U));
           ReplyBuf tb = {NULL, 0, 0, false};
           rb_fmt(&tb,
-                 "// prompt: batch inline test %u\n"
-                 "val Batch.Tests.t%u {Stigi.Test}: Stigi.Test.Result =\n"
-                 "  Stigi.Test.expect(%.*s, %.*s, \"batch test %u\")\n",
-                 synth_test_idx, synth_test_idx, (int)lhsl, lhs, (int)rhsl, rhs, synth_test_idx);
+                 "// prompt: batch inline test %c%c%c.\n"
+                 "val Batch.Tests.inlineTest%c%c%c {Stigi.Test}: Stigi.Test.Result =\n"
+                 "  Stigi.Test.expect(%.*s, %.*s, \"batch test %c%c%c\")\n",
+                 c0, c1, c2, c0, c1, c2, (int)lhsl, lhs, (int)rhsl, rhs, c0, c1, c2);
           if (tb.oom || tb.buf == NULL) {
             free(tb.buf);
             free_batch_ops(ops, cnt);
@@ -614,15 +717,17 @@ static bool text_mentions_name(const char *text, size_t tlen, const char *name) 
   return false;
 }
 
-static bool same_namespace(const char *a, const char *b) {
-  if (a == NULL || b == NULL) return false;
-  const char *da = strrchr(a, '.');
-  const char *db = strrchr(b, '.');
-  if (da == NULL && db == NULL) return true;
-  if (da == NULL || db == NULL) return false;
-  size_t la = (size_t)(da - a);
-  size_t lb = (size_t)(db - b);
-  return la == lb && memcmp(a, b, la) == 0;
+static bool same_or_ancestor_namespace(const char *child, const char *cand) {
+  if (child == NULL || cand == NULL) return false;
+  const char *dc = strrchr(child, '.');
+  const char *da = strrchr(cand, '.');
+  if (da == NULL) return true; /* top-level cand is visible in all namespaces */
+  if (dc == NULL) return false;
+  size_t lc = (size_t)(dc - child);
+  size_t la = (size_t)(da - cand);
+  if (la == lc && memcmp(child, cand, la) == 0) return true;
+  if (la < lc && memcmp(child, cand, la) == 0 && child[la] == '.') return true;
+  return false;
 }
 
 static Status finalize_reply(const StigiServerCtx *ctx, ReplyBuf *rb, const char *status_tag,
@@ -665,12 +770,22 @@ static Status finalize_reply(const StigiServerCtx *ctx, ReplyBuf *rb, const char
     if (diag_res != NULL) {
       for (uint32_t i = 0; i < diag_res->reject_count; i++) {
         if (i > 0) rb_cstr(&jb, ",");
+        const char *code = diag_res->rejects[i].code;
+        const char *subj = diag_res->rejects[i].subject;
+        const char *msg = diag_res->rejects[i].msg;
         rb_cstr(&jb, "{\"code\":");
-        rb_json_escaped(&jb, diag_res->rejects[i].code, strlen(diag_res->rejects[i].code));
+        rb_json_escaped(&jb, code, strlen(code));
         rb_cstr(&jb, ",\"subject\":");
-        rb_json_escaped(&jb, diag_res->rejects[i].subject, strlen(diag_res->rejects[i].subject));
+        rb_json_escaped(&jb, subj, strlen(subj));
+        rb_cstr(&jb, ",\"unit\":");
+        rb_json_escaped(&jb, subj, strlen(subj));
+        rb_cstr(&jb, ",\"line\":1,\"col\":1,\"expected\":");
+        rb_json_escaped(&jb, code, strlen(code));
+        rb_cstr(&jb, ",\"found\":");
+        rb_json_escaped(&jb, msg, strlen(msg));
+        rb_cstr(&jb, ",\"help\":\"see Stigi.Code and vic/spec/obligations.md\"");
         rb_cstr(&jb, ",\"message\":");
-        rb_json_escaped(&jb, diag_res->rejects[i].msg, strlen(diag_res->rejects[i].msg));
+        rb_json_escaped(&jb, msg, strlen(msg));
         rb_cstr(&jb, "}");
       }
     }
@@ -1016,19 +1131,59 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
   }
 
   if (cmd_len == 5 && memcmp(frame, "store", 5) == 0) {
-    char *dir_cstr = dup_span_cstr(arg, arg_len);
+    /* door.md:113: `store DIR [NAME...]` */
+    const char *p = arg;
+    const char *end = arg + arg_len;
+    while (p < end && *p == ' ') p++;
+    const char *dstart = p;
+    while (p < end && *p != ' ') p++;
+    char *dir_cstr = dup_span_cstr(dstart, (size_t)(p - dstart));
     if (dir_cstr == NULL) {
       free(rb.buf);
       return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
     }
+    char **snames = NULL;
+    uint32_t sncnt = 0, sncap = 0;
+    while (p < end) {
+      while (p < end && *p == ' ') p++;
+      if (p >= end) break;
+      const char *ns = p;
+      while (p < end && *p != ' ') p++;
+      if (sncnt == sncap) {
+        uint32_t nn = sncap == 0 ? 8U : sncap * 2U;
+        char **na = realloc(snames, (size_t)nn * sizeof *na);
+        if (na == NULL) {
+          for (uint32_t k = 0; k < sncnt; k++) free(snames[k]);
+          free(snames);
+          free(dir_cstr);
+          free(rb.buf);
+          return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+        }
+        snames = na;
+        sncap = nn;
+      }
+      snames[sncnt] = dup_span_cstr(ns, (size_t)(p - ns));
+      if (snames[sncnt] == NULL) {
+        for (uint32_t k = 0; k < sncnt; k++) free(snames[k]);
+        free(snames);
+        free(dir_cstr);
+        free(rb.buf);
+        return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+      }
+      sncnt++;
+    }
     char ebuf[256] = {0};
-    Status st = stigi_store_dir(ctx->door, dir_cstr, ebuf, sizeof ebuf);
+    Status st = stigi_store_dir_subset(ctx->door, dir_cstr,
+                                       (const char *const *)snames, sncnt,
+                                       ebuf, sizeof ebuf);
     if (st != STIGI_OK) {
       status_tag = "error";
       rb_fmt(&rb, "error store: %s\n", ebuf);
     } else {
-      rb_fmt(&rb, "accepted store %s (%u units)\n", dir_cstr, img->unit_count);
+      rb_fmt(&rb, "accepted store %s (%u units)\n", dir_cstr, sncnt > 0 ? sncnt : img->unit_count);
     }
+    for (uint32_t k = 0; k < sncnt; k++) free(snames[k]);
+    free(snames);
     free(dir_cstr);
     return finalize_reply(ctx, &rb, status_tag, NULL, out_reply, out_len, diag);
   }
@@ -1259,8 +1414,14 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
             continue;
           }
           const char *dot = strrchr(ops[j].unit_name, '.');
-          if (dot != NULL && same_namespace(ops[i].unit_name, ops[j].unit_name) &&
+          if (dot != NULL && same_or_ancestor_namespace(ops[i].unit_name, ops[j].unit_name) &&
               text_mentions_name(ops[i].text, ops[i].len, dot + 1)) {
+            dsu_union(parent, i, j);
+            continue;
+          }
+          /* Rules and relations affect all units in the batch */
+          if (memmem_bounded(ops[i].text, ops[i].len, "rule ", 5U) != NULL ||
+              memmem_bounded(ops[i].text, ops[i].len, "relation ", 9U) != NULL) {
             dsu_union(parent, i, j);
             continue;
           }
@@ -1514,7 +1675,10 @@ static Status read_all_fd(int fd, char **out_buf, size_t *out_len, Diag *diag) {
   for (;;) {
     if (len >= STIGI_MAX_FRAME_BYTES) {
       char extra;
-      ssize_t probe = read(fd, &extra, 1U);
+      ssize_t probe;
+      do {
+        probe = read(fd, &extra, 1U);
+      } while (probe < 0 && errno == EINTR);
       if (probe > 0) {
         free(buf);
         return diag_set(diag, STIGI_ERR_OVERFLOW, -1, "frame exceeds max bytes");
@@ -1675,8 +1839,19 @@ static Status serve_unix_loop(StigiServerCtx *ctx, const char *sock_path,
                        : stigi_handle_frame(ctx, req, rlen, &rep, &rep_len, diag);
       if (hst == STIGI_OK && rep != NULL) {
         (void)write_all_fd(cfd, rep, rep_len, diag);
+      } else {
+        const char *emsg = "error frame processing failed\n";
+        (void)write_all_fd(cfd, emsg, strlen(emsg), diag);
       }
       free(rep);
+    } else if (rst != STIGI_OK) {
+      char ebuf[256];
+      int en = snprintf(ebuf, sizeof ebuf, "error %s\n",
+                        (diag != NULL && diag->msg[0] != '\0') ? diag->msg : "frame read error");
+      if (en > 0) {
+        size_t el = (size_t)en < sizeof ebuf ? (size_t)en : sizeof ebuf - 1U;
+        (void)write_all_fd(cfd, ebuf, el, diag);
+      }
     }
     free(req);
     (void)close(cfd);

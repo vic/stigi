@@ -334,6 +334,12 @@ typedef struct {
 } ExtDenial;
 
 typedef struct {
+  const char *ty;
+  TupuI128 num;
+  const char *sym;
+} ExtLitCache;
+
+typedef struct {
   const StigiImage *img;
   uint32_t uidx;
   const char *unit_sym;
@@ -368,15 +374,21 @@ typedef struct {
   ExtDenial *denials;
   uint32_t denial_count;
   uint32_t denial_cap;
+
+  ExtLitCache *lits;
+  uint32_t lit_count;
+  uint32_t lit_cap;
 } ExtCtx;
 
 static void ext_ctx_free(ExtCtx *ctx) {
   free(ctx->vars);
   free(ctx->caps);
   free(ctx->denials);
+  free(ctx->lits);
   ctx->vars = NULL;
   ctx->caps = NULL;
   ctx->denials = NULL;
+  ctx->lits = NULL;
 }
 
 static bool str_eq_c(StigiStr s, const char *lit) {
@@ -584,6 +596,37 @@ static ExtVal ext_new_val(ExtCtx *ctx, const char *ty_sym) {
   return ext_val_zero(v, ty);
 }
 
+/* Deduplicate pure integer literals per (type, exact 128-bit value) inside one def instance.
+ * Eliminates duplicate lit(a, n) rows in bounds.dl without losing any precision. */
+static ExtVal ext_lit_val(ExtCtx *ctx, const char *ty_sym, TupuI128 num) {
+  const char *ty = (ty_sym != NULL && ty_sym[0] != '\0') ? ty_sym : "U64";
+  for (uint32_t i = 0; i < ctx->lit_count; i++) {
+    if (ctx->lits[i].num.lo == num.lo && ctx->lits[i].num.hi == num.hi &&
+        strcmp(ctx->lits[i].ty, ty) == 0) {
+      return ext_val_zero(ctx->lits[i].sym, ty);
+    }
+  }
+  ExtVal v = ext_new_val(ctx, ty);
+  ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
+  if (ctx->err == STIGI_OK) {
+    if (ctx->lit_count == ctx->lit_cap) {
+      uint32_t ncap = ctx->lit_cap == 0 ? 16U : ctx->lit_cap * 2U;
+      ExtLitCache *nl = realloc(ctx->lits, (size_t)ncap * sizeof *nl);
+      if (nl != NULL) {
+        ctx->lits = nl;
+        ctx->lit_cap = ncap;
+      }
+    }
+    if (ctx->lit_count < ctx->lit_cap) {
+      ctx->lits[ctx->lit_count].ty = ty;
+      ctx->lits[ctx->lit_count].num = num;
+      ctx->lits[ctx->lit_count].sym = v.sym;
+      ctx->lit_count++;
+    }
+  }
+  return v;
+}
+
 /* ---- String literal decoded length ---- */
 
 static uint64_t decoded_str_len(StigiStr raw) {
@@ -744,26 +787,20 @@ static const char *ext_resolve_fact_val(ExtCtx *ctx, const StigiExpr *e, const c
       TupuI128 num;
       const char *vty = "U64";
       if (eval_top_val_int(ctx->img, (uint32_t)uidx, &num, &vty)) {
-        ExtVal v = ext_new_val(ctx, vty);
-        ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
-        return v.sym;
+        return ext_lit_val(ctx, vty, num).sym;
       }
     }
     return ctx_fmt(ctx, "%s:sym:%.*s", ctx->inst_sym, (int)e->u.ident.name.len,
                    e->u.ident.name.ptr);
   }
   if (e->kind == STIGI_EXPR_LIT_INT) {
-    ExtVal v = ext_new_val(ctx, "U64");
     TupuI128 num = e->u.lit_int.overflow ? (TupuI128){0ULL, 1} : tupu_i128_from_u64(e->u.lit_int.value);
-    ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
-    return v.sym;
+    return ext_lit_val(ctx, "U64", num).sym;
   }
   if (e->kind == STIGI_EXPR_UNOP && e->u.unop.op == STIGI_OP_NEG &&
       e->u.unop.operand != NULL && e->u.unop.operand->kind == STIGI_EXPR_LIT_INT) {
-    ExtVal v = ext_new_val(ctx, "I64");
     TupuI128 num = i128_neg_u64(e->u.unop.operand->u.lit_int.value);
-    ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
-    return v.sym;
+    return ext_lit_val(ctx, "I64", num).sym;
   }
   if (e->kind == STIGI_EXPR_BINOP &&
       (e->u.binop.op == STIGI_OP_ADD || e->u.binop.op == STIGI_OP_SUB ||
@@ -1354,9 +1391,7 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
         TupuI128 num;
         const char *vty = "U64";
         if (eval_top_val_int(ctx->img, (uint32_t)uidx, &num, &vty)) {
-          ExtVal out = ext_new_val(ctx, vty);
-          ctx_emit2(ctx, "lit", col_sym(out.sym), col_i128(num));
-          return out;
+          return ext_lit_val(ctx, vty, num);
         }
       }
       /* Nullary enum constructor (qualified or unqualified) */
@@ -1387,35 +1422,30 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
       const char *pt = ext_new_pt(ctx);
       const char *op = ext_new_op(ctx);
       const char *ty = is_int_type_name(hint_ty) ? hint_ty : "U64";
-      ExtVal v = ext_new_val(ctx, ty);
       ctx_emit4(ctx, "operation", col_sym(op), col_sym("Lit"), col_sym(pt), col_sym(ctx->cur_sc));
       ctx_emit2(ctx, "operationOf", col_sym(op), col_sym(ctx->inst_sym));
       ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Lit"));
       TupuI128 num = e->u.lit_int.overflow ? (TupuI128){0ULL, 1}
                                            : tupu_i128_from_u64(e->u.lit_int.value);
-      ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
-      return v;
+      return ext_lit_val(ctx, ty, num);
     }
 
     case STIGI_EXPR_LIT_CHAR: {
       const char *pt = ext_new_pt(ctx);
       const char *op = ext_new_op(ctx);
-      ExtVal v = ext_new_val(ctx, "U8");
       uint8_t ch = e->u.lit_char.value;
       ctx_emit4(ctx, "operation", col_sym(op), col_sym("Lit"), col_sym(pt), col_sym(ctx->cur_sc));
       ctx_emit2(ctx, "operationOf", col_sym(op), col_sym(ctx->inst_sym));
       ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Lit"));
-      ctx_emit2(ctx, "lit", col_sym(v.sym), col_u64((uint64_t)ch));
-      return v;
+      return ext_lit_val(ctx, "U8", tupu_i128_from_u64((uint64_t)ch));
     }
 
     case STIGI_EXPR_LIT_STR: {
       const char *pt = ext_new_pt(ctx);
       const char *op = ext_new_op(ctx);
       ExtVal v = ext_new_val(ctx, "Array");
-      ExtVal lv = ext_new_val(ctx, "U64");
       uint64_t slen = decoded_str_len(e->u.lit_str.raw);
-      ctx_emit2(ctx, "lit", col_sym(lv.sym), col_u64(slen));
+      ExtVal lv = ext_lit_val(ctx, "U64", tupu_i128_from_u64(slen));
       ctx_emit1(ctx, "staticObject", col_sym(v.sym));
       ctx_emit4(ctx, "operation", col_sym(op), col_sym("Lit"), col_sym(pt), col_sym(ctx->cur_sc));
       ctx_emit2(ctx, "operationOf", col_sym(op), col_sym(ctx->inst_sym));
@@ -1703,18 +1733,15 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
           ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Operand"));
           ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Result"));
           if (str_eq_c(cn, "U8.ofU64")) {
-            ExtVal lim = ext_new_val(ctx, "U64");
-            ctx_emit2(ctx, "lit", col_sym(lim.sym), col_i64(256));
+            ExtVal lim = ext_lit_val(ctx, "U64", tupu_i128_from_u64(256ULL));
             ctx_emit5(ctx, "belowOwed", col_sym(op), col_sym(av.sym), col_sym(lim.sym),
                       col_sym(ctx->cur_sc), col_sym("precondition-unproved"));
           } else if (str_eq_c(cn, "U32.ofU64")) {
-            ExtVal lim = ext_new_val(ctx, "U64");
-            ctx_emit2(ctx, "lit", col_sym(lim.sym), col_u64(4294967296ULL));
+            ExtVal lim = ext_lit_val(ctx, "U64", tupu_i128_from_u64(4294967296ULL));
             ctx_emit5(ctx, "belowOwed", col_sym(op), col_sym(av.sym), col_sym(lim.sym),
                       col_sym(ctx->cur_sc), col_sym("precondition-unproved"));
           } else if (str_eq_c(cn, "U64.ofI64")) {
-            ExtVal z = ext_new_val(ctx, "I64");
-            ctx_emit2(ctx, "lit", col_sym(z.sym), col_i64(0));
+            ExtVal z = ext_lit_val(ctx, "I64", tupu_i128_from_i64(0));
             ctx_emit5(ctx, "leqOwed", col_sym(op), col_sym(z.sym), col_sym(av.sym),
                       col_sym(ctx->cur_sc), col_sym("precondition-unproved"));
           }
@@ -1970,14 +1997,12 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
         const char *pt = ext_new_pt(ctx);
         const char *op = ext_new_op(ctx);
         const char *ty = is_int_type_name(hint_ty) ? hint_ty : "I64";
-        ExtVal v = ext_new_val(ctx, ty);
         TupuI128 num = i128_neg_u64(e->u.unop.operand->u.lit_int.value);
         ctx_emit4(ctx, "operation", col_sym(op), col_sym("Lit"), col_sym(pt),
                   col_sym(ctx->cur_sc));
         ctx_emit2(ctx, "operationOf", col_sym(op), col_sym(ctx->inst_sym));
         ctx_emit2(ctx, "emitted", col_sym(op), col_sym("Lit"));
-        ctx_emit2(ctx, "lit", col_sym(v.sym), col_i128(num));
-        return v;
+        return ext_lit_val(ctx, ty, num);
       }
 
       ExtVal opnd = ext_expr(ctx, e->u.unop.operand, hint_ty, false);
@@ -1985,8 +2010,7 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
       const char *op = ext_new_op(ctx);
       if (e->u.unop.op == STIGI_OP_NEG) {
         const char *ty = opnd.ty != NULL ? opnd.ty : "I64";
-        ExtVal zero = ext_new_val(ctx, ty);
-        ctx_emit2(ctx, "lit", col_sym(zero.sym), col_i64(0));
+        ExtVal zero = ext_lit_val(ctx, ty, tupu_i128_from_i64(0));
         ExtVal res = ext_new_val(ctx, ty);
         ctx_emit4(ctx, "operation", col_sym(op), col_sym("Sub"), col_sym(pt),
                   col_sym(ctx->cur_sc));
@@ -2936,8 +2960,269 @@ static const char *decl_kind_sym(StigiDeclKind k) {
   return "Def";
 }
 
+/* Lightweight interprocedural summary extractor for callees (i != unit_idx in stigi_extract_unit_closed).
+ * Emits call graph, stack frame/depth, lemma totality, and handle-param mutation summaries with ZERO
+ * scope/value/lit/operation rows — eliminating cross-unit O(N_units^3) blowup in bounds.dl (performance.md 5). */
+static void summary_walk_calls(const StigiImage *img, uint32_t unit_idx, const char *inst_sym,
+                               const StigiDefHead *h, const StigiExpr *e, bool in_tail,
+                               uint32_t *stub_seq, bool *has_undec_loop, bool *has_fact,
+                               bool *param_overwrites, bool *param_returns, bool *param_consumes,
+                               StigiFactSet *fs, Diag *diag, Status *err) {
+  if (*err != STIGI_OK || e == NULL) return;
+  switch (e->kind) {
+    case STIGI_EXPR_LOCAL:
+    case STIGI_EXPR_GLOBAL:
+      if (in_tail && param_returns != NULL) {
+        for (uint32_t k = 0; k < h->param_count; k++) {
+          if (h->params[k].name.len == e->u.ident.name.len &&
+              memcmp(h->params[k].name.ptr, e->u.ident.name.ptr, h->params[k].name.len) == 0) {
+            param_returns[k] = true;
+            break;
+          }
+        }
+      }
+      break;
+    case STIGI_EXPR_INDEX_WRITE:
+      if (param_overwrites != NULL && e->u.index_expr.target != NULL &&
+          e->u.index_expr.target->kind == STIGI_EXPR_LOCAL) {
+        for (uint32_t k = 0; k < h->param_count; k++) {
+          if (h->params[k].name.len == e->u.index_expr.target->u.ident.name.len &&
+              memcmp(h->params[k].name.ptr, e->u.index_expr.target->u.ident.name.ptr,
+                     h->params[k].name.len) == 0) {
+            param_overwrites[k] = true;
+            break;
+          }
+        }
+      }
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.index_expr.target, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.index_expr.index, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.index_expr.value, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_INDEX_READ:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.index_expr.target, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.index_expr.index, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_CALL:
+      if (e->u.call.callee != NULL &&
+          (e->u.call.callee->kind == STIGI_EXPR_LOCAL || e->u.call.callee->kind == STIGI_EXPR_GLOBAL)) {
+        StigiStr cn = e->u.call.callee->u.ident.name;
+        if (str_eq_c(cn, "Array.tryGrow") && e->u.call.arg_count == 3 &&
+            param_consumes != NULL && e->u.call.args[0]->kind == STIGI_EXPR_LOCAL) {
+          for (uint32_t k = 0; k < h->param_count; k++) {
+            if (h->params[k].name.len == e->u.call.args[0]->u.ident.name.len &&
+                memcmp(h->params[k].name.ptr, e->u.call.args[0]->u.ident.name.ptr,
+                       h->params[k].name.len) == 0) {
+              param_consumes[k] = true;
+              break;
+            }
+          }
+        }
+        int32_t tgt = stigi_image_resolve_name(img, unit_idx, cn.ptr, cn.len);
+        if (tgt >= 0) {
+          const StigiDecl *td = img->units[tgt].ast->decl;
+          if (td->kind == STIGI_DECL_DEF || td->kind == STIGI_DECL_LEMMA_DEF ||
+              (td->kind == STIGI_DECL_EXTERN && !td->u.extern_decl.is_val)) {
+            const char *sop = fs_fmt(fs, "%s:sumcall%u", inst_sym, (*stub_seq)++);
+            const char *cinst = fs_fmt(fs, "%s#0", img->units[tgt].name);
+            if (sop == NULL || cinst == NULL) {
+              *err = diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+              return;
+            }
+            const char *ck = (in_tail && (uint32_t)tgt == unit_idx) ? "Tail" : "Normal";
+            *err = emit3(fs, "callOf", col_sym(sop), col_sym(cinst), col_sym(ck), diag);
+            if (*err != STIGI_OK) return;
+            *err = emit2(fs, "operationOf", col_sym(sop), col_sym(inst_sym), diag);
+            if (*err != STIGI_OK) return;
+          }
+        }
+      }
+      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+        summary_walk_calls(img, unit_idx, inst_sym, h, e->u.call.args[i], false, stub_seq,
+                           has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      }
+      break;
+    case STIGI_EXPR_UNOP:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.unop.operand, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_BINOP:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.binop.lhs, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.binop.rhs, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_IF:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.if_expr.cond, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.if_expr.then_br, in_tail, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.if_expr.else_br, in_tail, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_WHILE: {
+      bool has_dec = (e->u.while_expr.decreases != NULL);
+      if (!has_dec && e->u.while_expr.body != NULL &&
+          e->u.while_expr.body->kind == STIGI_EXPR_BLOCK &&
+          e->u.while_expr.body->u.block.count > 0 &&
+          e->u.while_expr.body->u.block.stmts[0]->kind == STIGI_EXPR_ASSERT &&
+          e->u.while_expr.body->u.block.stmts[0]->u.assert_expr.expr == NULL) {
+        has_dec = (find_decreases_in_fg(&e->u.while_expr.body->u.block.stmts[0]->u.assert_expr.facts) != NULL);
+      }
+      if (!has_dec && has_undec_loop != NULL) *has_undec_loop = true;
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.while_expr.cond, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.while_expr.body, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    }
+    case STIGI_EXPR_MATCH:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.match_expr.scrutinee, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        summary_walk_calls(img, unit_idx, inst_sym, h, e->u.match_expr.arms[i].body, in_tail,
+                           stub_seq, has_undec_loop, has_fact, param_overwrites, param_returns,
+                           param_consumes, fs, diag, err);
+      }
+      break;
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        bool last = (i + 1U == e->u.block.count);
+        summary_walk_calls(img, unit_idx, inst_sym, h, e->u.block.stmts[i], in_tail && last,
+                           stub_seq, has_undec_loop, has_fact, param_overwrites, param_returns,
+                           param_consumes, fs, diag, err);
+      }
+      break;
+    case STIGI_EXPR_VAL:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.val_stmt.init, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_VAR:
+      if (e->u.var_stmt.has_inv && fact_group_has_safety(&e->u.var_stmt.inv) && has_fact != NULL) {
+        *has_fact = true;
+      }
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.var_stmt.init, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_ASSIGN:
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.assign_stmt.value, false, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_HANDLE:
+      for (uint32_t i = 0; i < e->u.handle_stmt.arg_count; i++) {
+        summary_walk_calls(img, unit_idx, inst_sym, h, e->u.handle_stmt.args[i], false, stub_seq,
+                           has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      }
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.handle_stmt.body, in_tail, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    case STIGI_EXPR_ASSERT:
+      if (fact_group_has_safety(&e->u.assert_expr.facts) && has_fact != NULL) *has_fact = true;
+      summary_walk_calls(img, unit_idx, inst_sym, h, e->u.assert_expr.expr, in_tail, stub_seq,
+                         has_undec_loop, has_fact, param_overwrites, param_returns, param_consumes, fs, diag, err);
+      break;
+    default:
+      break;
+  }
+}
+
+static Status extract_def_summary(const StigiImage *img, uint32_t unit_idx, const char *u_sym,
+                                  const char *inst_sym, const StigiDefHead *h,
+                                  const StigiExpr *body, bool is_lemma, uint64_t frame_bytes,
+                                  StigiFactSet *fs, Diag *diag) {
+  Status st = emit2(fs, "instanceOf", col_sym(inst_sym), col_sym(u_sym), diag);
+  if (st != STIGI_OK) return st;
+  st = emit1(fs, "defHasBody", col_sym(u_sym), diag);
+  if (st != STIGI_OK) return st;
+  st = emit2(fs, "frameBytes", col_sym(inst_sym), col_u64(frame_bytes), diag);
+  if (st != STIGI_OK) return st;
+  if (is_lemma) {
+    st = emit1(fs, "lemmaUnit", col_sym(u_sym), diag);
+    if (st != STIGI_OK) return st;
+    if (body != NULL) {
+      st = emit1(fs, "lemmaHasBody", col_sym(u_sym), diag);
+      if (st != STIGI_OK) return st;
+    }
+  }
+  bool has_fact = false;
+  const StigiExpr *dec_expr = h->decreases;
+  for (uint32_t i = 0; i < h->pre_group_count; i++) {
+    if (h->pre_groups[i].is_fact) {
+      if (fact_group_has_safety(&h->pre_groups[i].facts)) has_fact = true;
+      if (dec_expr == NULL) dec_expr = find_decreases_in_fg(&h->pre_groups[i].facts);
+    } else {
+      for (uint32_t c = 0; c < h->pre_groups[i].cap_count; c++) {
+        StigiStr cn = h->pre_groups[i].caps[c].cap_type->name;
+        const char *cs = fs_strdup(fs, cn.ptr, cn.len);
+        if (cs == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+        st = emit2(fs, "rowOf", col_sym(u_sym), col_sym(cs), diag);
+        if (st != STIGI_OK) return st;
+      }
+    }
+  }
+  for (uint32_t i = 0; i < h->post_val_fact_count; i++) {
+    if (fact_group_has_safety(&h->post_val_facts[i])) has_fact = true;
+    if (dec_expr == NULL) dec_expr = find_decreases_in_fg(&h->post_val_facts[i]);
+  }
+  for (uint32_t i = 0; i < h->exit_fact_count; i++) {
+    if (fact_group_has_safety(&h->exit_facts[i])) has_fact = true;
+  }
+  if (dec_expr != NULL && (dec_expr->kind == STIGI_EXPR_LOCAL || dec_expr->kind == STIGI_EXPR_GLOBAL)) {
+    for (uint32_t i = 0; i < h->param_count; i++) {
+      if (h->params[i].name.len == dec_expr->u.ident.name.len &&
+          memcmp(h->params[i].name.ptr, dec_expr->u.ident.name.ptr,
+                 dec_expr->u.ident.name.len) == 0) {
+        int64_t lim = 0;
+        if (try_extract_depth_bound(img, unit_idx, h, h->params[i].name, &lim)) {
+          st = emit2(fs, "depthBound", col_sym(inst_sym), col_i64(lim), diag);
+          if (st != STIGI_OK) return st;
+        }
+        break;
+      }
+    }
+  }
+
+  uint32_t stub_seq = 0;
+  bool has_undec_loop = false;
+  uint32_t pc = h->param_count;
+  bool *p_ow = pc > 0 ? calloc(pc, sizeof *p_ow) : NULL;
+  bool *p_ret = pc > 0 ? calloc(pc, sizeof *p_ret) : NULL;
+  bool *p_con = pc > 0 ? calloc(pc, sizeof *p_con) : NULL;
+  summary_walk_calls(img, unit_idx, inst_sym, h, body, true, &stub_seq, &has_undec_loop, &has_fact,
+                     p_ow, p_ret, p_con, fs, diag, &st);
+  if (st == STIGI_OK && has_fact) {
+    st = emit2(fs, "statesFact", col_sym(u_sym), col_sym("Entry"), diag);
+  }
+  if (st == STIGI_OK && has_undec_loop) {
+    const char *lsite = fs_fmt(fs, "%s:sumloop", inst_sym);
+    if (lsite == NULL) st = diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+    else st = emit2(fs, "loopOf", col_sym(lsite), col_sym(inst_sym), diag);
+  }
+  for (uint32_t k = 0; k < pc && st == STIGI_OK; k++) {
+    bool needs_sum = (p_ow != NULL && p_ow[k]) || (p_ret != NULL && p_ret[k]) ||
+                     (p_con != NULL && p_con[k]);
+    if (!needs_sum || !type_is_handle_carrying(img, unit_idx, h->params[k].type, 0)) continue;
+    const char *ps = fs_fmt(fs, "%s:sp:%u", inst_sym, k);
+    const char *sp = fs_fmt(fs, "%s:spt", inst_sym);
+    if (ps == NULL || sp == NULL) { st = diag_set(diag, STIGI_ERR_OOM, -1, "OOM"); break; }
+    st = emit3(fs, "param", col_sym(inst_sym), col_i64((int64_t)k), col_sym(ps), diag);
+    if (st == STIGI_OK && p_ow != NULL && p_ow[k]) st = emit2(fs, "overwrite", col_sym(sp), col_sym(ps), diag);
+    if (st == STIGI_OK && p_ret != NULL && p_ret[k]) st = emit2(fs, "returnOf", col_sym(sp), col_sym(ps), diag);
+    if (st == STIGI_OK && p_con != NULL && p_con[k]) st = emit2(fs, "consume", col_sym(sp), col_sym(ps), diag);
+  }
+  free(p_ow);
+  free(p_ret);
+  free(p_con);
+  return st;
+}
+
 static Status extract_one_unit_inner(const StigiImage *img, uint32_t unit_idx,
-                                     bool force_root, StigiFactSet *fs, Diag *diag) {
+                                     bool force_root, bool summary_only,
+                                     StigiFactSet *fs, Diag *diag) {
   const StigiImageUnit *u = &img->units[unit_idx];
   const StigiDecl *d = u->ast->decl;
   const char *u_sym = fs_strdup(fs, u->name, u->name_len);
@@ -3079,6 +3364,10 @@ static Status extract_one_unit_inner(const StigiImage *img, uint32_t unit_idx,
       }
       return STIGI_OK;
     }
+    if (summary_only) {
+      return extract_def_summary(img, unit_idx, u_sym, inst_sym, eh, d->u.extern_decl.body,
+                                 false, 64ULL, fs, diag);
+    }
     return extract_def_body(img, unit_idx, u_sym, inst_sym, eh, d->u.extern_decl.body,
                             false, false, 64ULL, fs, diag);
   }
@@ -3164,7 +3453,7 @@ static Status extract_one_unit_inner(const StigiImage *img, uint32_t unit_idx,
   /* Handler: handlerUnit + extract each handler operation def */
   if (d->kind == STIGI_DECL_HANDLER) {
     st = emit1(fs, "handlerUnit", col_sym(u_sym), diag);
-    if (st != STIGI_OK) return st;
+    if (st != STIGI_OK || summary_only) return st;
     for (uint32_t i = 0; i < d->u.handler_decl.def_count; i++) {
       const StigiDecl *opd = d->u.handler_decl.defs[i];
       if (opd->kind != STIGI_DECL_DEF || opd->u.def_decl.body == NULL) continue;
@@ -3191,6 +3480,10 @@ static Status extract_one_unit_inner(const StigiImage *img, uint32_t unit_idx,
   if (!is_lemma) {
     if (stigi_def_frame_bytes(img, unit_idx, &fbytes) != STIGI_OK) fbytes = 64ULL;
   }
+  if (summary_only) {
+    return extract_def_summary(img, unit_idx, u_sym, inst_sym, &d->u.def_decl.head,
+                               d->u.def_decl.body, is_lemma, fbytes, fs, diag);
+  }
   bool is_root_def = (!is_lemma && u->is_root);
   return extract_def_body(img, unit_idx, u_sym, inst_sym, &d->u.def_decl.head,
                           d->u.def_decl.body, is_lemma, is_root_def, fbytes, fs, diag);
@@ -3205,7 +3498,20 @@ Status stigi_extract_unit(const StigiImage *img, uint32_t unit_idx,
   }
   Status st = emit_kernel_tables(fs, diag);
   if (st != STIGI_OK) return st;
-  return extract_one_unit_inner(img, unit_idx, true, fs, diag);
+  return extract_one_unit_inner(img, unit_idx, true, false, fs, diag);
+}
+
+static bool def_has_decreases(const StigiDefHead *h) {
+  if (h->decreases != NULL) return true;
+  for (uint32_t i = 0; i < h->pre_group_count; i++) {
+    if (h->pre_groups[i].is_fact && find_decreases_in_fg(&h->pre_groups[i].facts) != NULL) {
+      return true;
+    }
+  }
+  for (uint32_t i = 0; i < h->post_val_fact_count; i++) {
+    if (find_decreases_in_fg(&h->post_val_facts[i]) != NULL) return true;
+  }
+  return false;
 }
 
 Status stigi_extract_unit_closed(const StigiImage *img, uint32_t unit_idx,
@@ -3241,12 +3547,18 @@ Status stigi_extract_unit_closed(const StigiImage *img, uint32_t unit_idx,
   }
   free(q);
 
+  bool checking_lemma = (img->units[unit_idx].ast->decl->kind == STIGI_DECL_LEMMA_DEF);
   for (uint32_t i = 0; i < n && st == STIGI_OK; i++) {
     if (!vis[i]) continue;
     /* Do not pull unrelated Test/NegTest units into a non-test unit's Datalog check */
     StigiDeclKind dk = img->units[i].ast->decl->kind;
     if (i != unit_idx && (dk == STIGI_DECL_TEST || dk == STIGI_DECL_NEG_TEST)) continue;
-    st = extract_one_unit_inner(img, i, i == unit_idx, fs, diag);
+    bool sum_only = (i != unit_idx);
+    if (sum_only && checking_lemma && dk == STIGI_DECL_DEF &&
+        def_has_decreases(&img->units[i].ast->decl->u.def_decl.head)) {
+      sum_only = false;
+    }
+    st = extract_one_unit_inner(img, i, i == unit_idx, sum_only, fs, diag);
   }
   for (uint32_t e = 0; e < img->edge_count && st == STIGI_OK; e++) {
     uint32_t f = img->edges[e].from;
@@ -3272,7 +3584,7 @@ Status stigi_extract_image(const StigiImage *img, StigiFactSet *fs, Diag *diag) 
   Status st = emit_kernel_tables(fs, diag);
   if (st != STIGI_OK) return st;
   for (uint32_t i = 0; i < img->unit_count; i++) {
-    st = extract_one_unit_inner(img, i, false, fs, diag);
+    st = extract_one_unit_inner(img, i, false, false, fs, diag);
     if (st != STIGI_OK) return st;
   }
   for (uint32_t e = 0; e < img->edge_count; e++) {

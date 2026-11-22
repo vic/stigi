@@ -276,6 +276,10 @@ JsonStatus stigi_json_decode_string(const char *raw, size_t raw_len,
               }
             }
           }
+          if (cp == 0U) {
+            free(buf);
+            return JSON_ERR_SYNTAX; /* reject embedded NUL \u0000 */
+          }
           if (!append_utf8(&buf, &len, &cap, cp)) {
             free(buf);
             return JSON_ERR_OOM;

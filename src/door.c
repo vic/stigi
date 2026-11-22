@@ -10,6 +10,7 @@
 #include "types.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1061,6 +1062,75 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
   return STIGI_OK;
 }
 
+/* Lock-free embarrassingly parallel unit verdict worker (T18: byte-identical to sequential) */
+typedef struct {
+  uint32_t unit_idx;
+  uint8_t vkey[32];
+  StigiDoorResult res;
+  Status st;
+  Diag diag;
+} ParallelUnitTask;
+
+typedef struct {
+  const char *rules_src;
+  size_t rules_len;
+  uint64_t row_budget;
+  bool kernel_mode;
+  const StigiImage *cand;
+  ParallelUnitTask *tasks;
+  uint32_t task_count;
+  uint32_t worker_id;
+  uint32_t worker_count;
+  StigiDl *shared_dl; /* non-NULL only on worker 0 */
+} ParallelWorkerArg;
+
+static void *parallel_verdict_worker(void *arg_p) {
+  ParallelWorkerArg *w = (ParallelWorkerArg *)arg_p;
+  StigiDl local_dl;
+  memset(&local_dl, 0, sizeof local_dl);
+  StigiDl *dl = w->shared_dl;
+  if (dl == NULL) {
+    Diag od;
+    diag_clear(&od);
+    Status ost = stigi_dl_open(&local_dl, w->rules_src, w->rules_len, "parallel.dl",
+                               w->row_budget, 1, &od);
+    if (ost != STIGI_OK) {
+      for (uint32_t k = w->worker_id; k < w->task_count; k += w->worker_count) {
+        w->tasks[k].st = ost;
+        w->tasks[k].diag = od;
+      }
+      return NULL;
+    }
+    dl = &local_dl;
+  }
+  for (uint32_t k = w->worker_id; k < w->task_count; k += w->worker_count) {
+    ParallelUnitTask *t = &w->tasks[k];
+    diag_clear(&t->diag);
+    t->st = eval_unit_datalog(dl, w->kernel_mode, w->cand, t->unit_idx, &t->res, &t->diag);
+  }
+  if (w->shared_dl == NULL) {
+    stigi_dl_close(&local_dl);
+  }
+  return NULL;
+}
+
+static uint32_t choose_door_threads(uint32_t task_count) {
+  if (task_count < 4U) return 1U;
+  const char *env = getenv("STIGI_THREADS");
+  if (env != NULL && env[0] != '\0') {
+    long v = strtol(env, NULL, 10);
+    if (v <= 1) return 1U;
+    uint32_t req = v > 16 ? 16U : (uint32_t)v;
+    return req > task_count ? task_count : req;
+  }
+  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu <= 1) return 1U;
+  uint32_t nt = ncpu > 8 ? 8U : (uint32_t)ncpu;
+  uint32_t max_useful = task_count / 2U;
+  if (nt > max_useful) nt = max_useful;
+  return nt < 1U ? 1U : nt;
+}
+
 /* ---- Atomic transaction pipeline ---- */
 
 static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
@@ -1312,24 +1382,105 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
     tx_st = compute_active_rules_hash(door, &cand, rules_hash, diag);
   }
 
-  /* Steps 4 & 5: Extract dependency-closed facts + run Datalog per unit (including Test rows) */
+  /* Steps 4 & 5: Extract dependency-closed facts + run Datalog per unit (lock-free parallel T18!) */
   if (tx_st == STIGI_OK && out->reject_count == 0) {
-    for (uint32_t i = 0; i < cand.unit_count && tx_st == STIGI_OK; i++) {
-      StigiDeclKind k = cand.units[i].ast->decl->kind;
-      if (k == STIGI_DECL_NEG_TEST) continue;
-      uint8_t vkey[32];
-      effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->row_budget,
-                            door->kernel_mode, vkey);
-      if (keyset_contains(&door->verdict_cache, vkey)) {
-        out->verdicts_cached++;
-        continue;
+    uint32_t todo_cnt = 0;
+    ParallelUnitTask *tasks = cand.unit_count > 0
+                                  ? calloc(cand.unit_count, sizeof *tasks)
+                                  : NULL;
+    if (cand.unit_count > 0 && tasks == NULL) {
+      tx_st = diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+    } else {
+      for (uint32_t i = 0; i < cand.unit_count; i++) {
+        StigiDeclKind k = cand.units[i].ast->decl->kind;
+        if (k == STIGI_DECL_NEG_TEST) continue;
+        uint8_t vkey[32];
+        effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->row_budget,
+                              door->kernel_mode, vkey);
+        if (keyset_contains(&door->verdict_cache, vkey)) {
+          out->verdicts_cached++;
+          continue;
+        }
+        out->verdicts_computed++;
+        tasks[todo_cnt].unit_idx = i;
+        memcpy(tasks[todo_cnt].vkey, vkey, 32U);
+        stigi_door_result_init(&tasks[todo_cnt].res);
+        tasks[todo_cnt].st = STIGI_OK;
+        todo_cnt++;
       }
-      out->verdicts_computed++;
-      uint32_t before = out->reject_count;
-      tx_st = eval_unit_datalog(eval_dl, door->kernel_mode, &cand, i, out, diag);
-      if (tx_st == STIGI_OK && out->reject_count == before) {
-        tx_st = keyset_insert(&staged_vkeys, vkey, diag);
+
+      size_t active_rules_len = cand_rules_dl != NULL ? cand_rules_len : door->rules_dl_len;
+      uint32_t nthreads = choose_door_threads(todo_cnt);
+      if (nthreads <= 1U) {
+        ParallelWorkerArg w0 = {
+            active_rules_src, active_rules_len, door->row_budget, door->kernel_mode,
+            &cand, tasks, todo_cnt, 0U, 1U, eval_dl
+        };
+        (void)parallel_verdict_worker(&w0);
+      } else {
+        ParallelWorkerArg *wargs = calloc(nthreads, sizeof *wargs);
+        pthread_t *tids = calloc(nthreads, sizeof *tids);
+        if (wargs == NULL || tids == NULL) {
+          free(wargs);
+          free(tids);
+          ParallelWorkerArg w0 = {
+              active_rules_src, active_rules_len, door->row_budget, door->kernel_mode,
+              &cand, tasks, todo_cnt, 0U, 1U, eval_dl
+          };
+          (void)parallel_verdict_worker(&w0);
+        } else {
+          uint32_t spawned = 0;
+          for (uint32_t t = 0; t < nthreads; t++) {
+            wargs[t].rules_src = active_rules_src;
+            wargs[t].rules_len = active_rules_len;
+            wargs[t].row_budget = door->row_budget;
+            wargs[t].kernel_mode = door->kernel_mode;
+            wargs[t].cand = &cand;
+            wargs[t].tasks = tasks;
+            wargs[t].task_count = todo_cnt;
+            wargs[t].worker_id = t;
+            wargs[t].worker_count = nthreads;
+            wargs[t].shared_dl = (t == 0U) ? eval_dl : NULL;
+          }
+          for (uint32_t t = 1U; t < nthreads; t++) {
+            if (pthread_create(&tids[t], NULL, parallel_verdict_worker, &wargs[t]) != 0) {
+              /* Fallback: run remaining shards synchronously on main thread */
+              (void)parallel_verdict_worker(&wargs[t]);
+              tids[t] = 0;
+            } else {
+              spawned++;
+            }
+          }
+          (void)parallel_verdict_worker(&wargs[0]);
+          for (uint32_t t = 1U; t < nthreads; t++) {
+            if (tids[t] != 0) (void)pthread_join(tids[t], NULL);
+          }
+          (void)spawned;
+          free(wargs);
+          free(tids);
+        }
       }
+
+      /* Deterministic merge strictly in original unit order 0..todo_cnt-1 (T18 Seq oracle) */
+      for (uint32_t k = 0; k < todo_cnt; k++) {
+        if (tx_st == STIGI_OK && tasks[k].st != STIGI_OK) {
+          tx_st = tasks[k].st;
+          if (diag != NULL) *diag = tasks[k].diag;
+        }
+        if (tx_st == STIGI_OK) {
+          if (tasks[k].res.reject_count == 0) {
+            tx_st = keyset_insert(&staged_vkeys, tasks[k].vkey, diag);
+          } else {
+            for (uint32_t r = 0; r < tasks[k].res.reject_count && tx_st == STIGI_OK; r++) {
+              tx_st = add_reject(out, tasks[k].res.rejects[r].subject,
+                                 tasks[k].res.rejects[r].code,
+                                 tasks[k].res.rejects[r].msg, diag);
+            }
+          }
+        }
+        stigi_door_result_free(&tasks[k].res);
+      }
+      free(tasks);
     }
   }
 

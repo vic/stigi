@@ -25,10 +25,13 @@ void diag_clear(Diag *d);
 Status diag_set(Diag *d, Status code, int dl_code, const char *fmt, ...);
 
 typedef struct ArenaBlock {
-  _Alignas(max_align_t) struct ArenaBlock *next;
+  struct ArenaBlock *next;
   size_t cap;
   size_t used;
+  uint8_t _pad[64U - sizeof(struct ArenaBlock *) - 2U * sizeof(size_t)];
 } ArenaBlock;
+
+_Static_assert(sizeof(ArenaBlock) == 64U, "ArenaBlock header must be 64-byte cache-line aligned");
 
 typedef struct {
   ArenaBlock *head;

@@ -25,9 +25,9 @@
             version = "0.1.0";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
-              fileset = pkgs.lib.fileset.unions [ ./Justfile ./src ./tests ];
+              fileset = pkgs.lib.fileset.unions [ ./Justfile ./src ./tests ./vic/spec ];
             };
-            nativeBuildInputs = [ pkgs.just pkgs.gcc pkgs.clang ];
+            nativeBuildInputs = [ pkgs.just pkgs.gcc pkgs.clang pkgs.b3sum ];
             dontConfigure = true;
             buildPhase = ''
               runHook preBuild

@@ -1,5 +1,6 @@
 #include "emit.h"
 #include "datalog.h"
+#include "eval.h"
 #include "extract.h"
 #include "types.h"
 
@@ -19,12 +20,24 @@ typedef struct {
 
 static void eb_grow(EmitBuf *b, size_t add) {
   if (b->oom) return;
-  if (add > SIZE_MAX - b->len - 1U) { b->oom = true; return; }
+  if (add > SIZE_MAX - b->len - 1U) {
+    b->oom = true;
+    return;
+  }
   if (b->len + add + 1U <= b->cap) return;
   size_t ncap = b->cap == 0 ? 4096U : b->cap;
-  while (ncap < b->len + add + 1U) ncap *= 2U;
+  while (ncap < b->len + add + 1U) {
+    if (ncap > SIZE_MAX / 2U) {
+      ncap = b->len + add + 1U;
+      break;
+    }
+    ncap *= 2U;
+  }
   char *nb = realloc(b->buf, ncap);
-  if (nb == NULL) { b->oom = true; return; }
+  if (nb == NULL) {
+    b->oom = true;
+    return;
+  }
   b->buf = nb;
   b->cap = ncap;
 }
@@ -46,16 +59,51 @@ static void eb_str(EmitBuf *b, StigiStr s) {
   if (s.ptr != NULL && s.len > 0) eb_mem(b, s.ptr, s.len);
 }
 
+/* Two-pass exact formatting (zero truncation regardless of length) */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
 static void eb_fmt(EmitBuf *b, const char *fmt, ...) {
-  char tmp[512];
-  va_list ap;
+  if (b->oom) return;
+  va_list ap, ap2;
   va_start(ap, fmt);
-  int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+  va_copy(ap2, ap);
+  int n = vsnprintf(NULL, 0, fmt, ap);
   va_end(ap);
-  if (n > 0) {
-    size_t len = (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1U;
-    eb_mem(b, tmp, len);
+  if (n <= 0) {
+    va_end(ap2);
+    return;
   }
+  eb_grow(b, (size_t)n);
+  if (b->oom) {
+    va_end(ap2);
+    return;
+  }
+  (void)vsnprintf(b->buf + b->len, (size_t)n + 1U, fmt, ap2);
+  va_end(ap2);
+  b->len += (size_t)n;
+}
+
+static bool is_c_reserved_ident(const char *s, size_t n) {
+  static const char *const k_kw[] = {
+      "auto", "break", "case", "char", "const", "continue", "default", "do",
+      "double", "else", "enum", "extern", "float", "for", "goto", "if",
+      "inline", "int", "long", "register", "restrict", "return", "short",
+      "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+      "unsigned", "void", "volatile", "while", "_Alignas", "_Alignof",
+      "_Atomic", "_Bool", "_Complex", "_Generic", "_Imaginary", "_Noreturn",
+      "_Static_assert", "_Thread_local", "bool", "true", "false", "NULL", "main"
+  };
+  for (size_t i = 0; i < sizeof(k_kw) / sizeof(k_kw[0]); i++) {
+    if (strlen(k_kw[i]) == n && memcmp(k_kw[i], s, n) == 0) return true;
+  }
+  return false;
+}
+
+static void eb_c_ident(EmitBuf *b, StigiStr s) {
+  if (s.ptr == NULL || s.len == 0) return;
+  if (is_c_reserved_ident(s.ptr, s.len)) eb_cstr(b, "sv_");
+  eb_mem(b, s.ptr, s.len);
 }
 
 static void eb_mangle_name(EmitBuf *b, const char *name, size_t len) {
@@ -80,9 +128,22 @@ static void eb_line_dir(EmitBuf *b, uint32_t line, const char *unit_name, size_t
   eb_cstr(b, "\"\n");
 }
 
+static StigiStr extern_c_sym(StigiStr full_name) {
+  for (size_t i = full_name.len; i > 0; i--) {
+    if (full_name.ptr[i - 1U] == '.') {
+      return (StigiStr){full_name.ptr + i, full_name.len - i};
+    }
+  }
+  return full_name;
+}
+
 static bool str_eq_c(StigiStr s, const char *lit) {
   size_t n = strlen(lit);
   return s.len == n && memcmp(s.ptr, lit, n) == 0;
+}
+
+static bool str_eq_ss(StigiStr a, StigiStr b) {
+  return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, a.len) == 0);
 }
 
 static uint64_t emit_align_up(uint64_t n, uint64_t align) {
@@ -133,10 +194,6 @@ static bool ast_type_is_void(const StigiImage *img, uint32_t from_idx, const Sti
   return st == ETY_UNIT || st == ETY_NEVER;
 }
 
-static bool ast_type_is_never(const StigiImage *img, uint32_t from_idx, const StigiType *ty) {
-  return ast_type_to_scalar(img, from_idx, ty, 0) == ETY_NEVER;
-}
-
 static const StigiType *resolve_typedef_type(const StigiImage *img, uint32_t *from_idx,
                                              const StigiType *ty, int depth) {
   if (ty == NULL || depth > 16) return ty;
@@ -173,11 +230,7 @@ static StigiLayout ast_type_layout(const StigiImage *img, uint32_t from_idx,
       return ast_type_layout(img, (uint32_t)tgt, d->u.type_decl.rhs, depth + 1);
     }
     if (d->kind == STIGI_DECL_ENUM) {
-      StigiTy ety;
-      memset(&ety, 0, sizeof ety);
-      ety.kind = STIGI_TY_ENUM;
-      ety.unit_idx = (uint32_t)tgt;
-      return stigi_ty_layout(img, &ety);
+      return stigi_enum_layout_info(img, (uint32_t)tgt, NULL, 0).layout;
     }
   }
   return (StigiLayout){8, 8};
@@ -185,7 +238,10 @@ static StigiLayout ast_type_layout(const StigiImage *img, uint32_t from_idx,
 
 static void emit_c_type(EmitBuf *b, const StigiImage *img, uint32_t from_idx,
                         const StigiType *ty, int depth) {
-  if (ty == NULL || depth > 16) { eb_cstr(b, "uint64_t"); return; }
+  if (ty == NULL || depth > 16) {
+    eb_cstr(b, "uint64_t");
+    return;
+  }
   if (str_eq_c(ty->name, "U8")) { eb_cstr(b, "uint8_t"); return; }
   if (str_eq_c(ty->name, "U32")) { eb_cstr(b, "uint32_t"); return; }
   if (str_eq_c(ty->name, "U64")) { eb_cstr(b, "uint64_t"); return; }
@@ -318,12 +374,13 @@ static const char *c_op_str(StigiOp op) {
   return "+";
 }
 
-/* ---- Datalog maskIndex decision set (Defect 7) ---- */
+/* ---- Datalog maskIndex decision set ---- */
 
 typedef struct {
   bool *access_masked;
   uint32_t access_count;
   uint32_t access_cap;
+  bool is_pure_def;
 } UnitMaskInfo;
 
 static int cmp_cstr_ptr(const void *pa, const void *pb) {
@@ -357,7 +414,8 @@ static void free_unit_masks(UnitMaskInfo *info, uint32_t count) {
 }
 
 static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_info,
-                                    uint32_t *out_total_masks, Diag *diag) {
+                                    uint32_t *out_total_masks, StigiEmitStats *stats,
+                                    Diag *diag) {
   const StigiImage *img = &door->image;
   *out_info = NULL;
   *out_total_masks = 0;
@@ -371,55 +429,91 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
     return STIGI_OK;
   }
 
-  StigiFactSet fs;
-  stigi_facts_init(&fs);
-  Status st = stigi_extract_image(img, &fs, diag);
-  if (st != STIGI_OK) {
-    stigi_facts_free(&fs);
-    free_unit_masks(info, img->unit_count);
-    return st;
-  }
-
+  /* Open ONE Datalog instance and reset per reachable def unit -> O(N_units) linear scaling */
   StigiDl dl;
   memset(&dl, 0, sizeof dl);
-  st = stigi_dl_open(&dl, door->rules_dl, door->rules_dl_len, "emit_mask.dl",
-                     door->row_budget, 1, diag);
+  Status st = stigi_dl_open(&dl, door->rules_dl, door->rules_dl_len, "emit_mask.dl",
+                            door->row_budget, 1, diag);
   if (st != STIGI_OK) {
-    stigi_facts_free(&fs);
     free_unit_masks(info, img->unit_count);
     return st;
   }
 
-  st = stigi_facts_load_into_dl(&fs, &dl, diag);
-  if (st != STIGI_OK) {
-    stigi_dl_close(&dl);
-    stigi_facts_free(&fs);
-    free_unit_masks(info, img->unit_count);
-    return st;
-  }
-
-  /* Seed taint source operationCall + result for defs holding Stigi.File/Socket/Clock capabilities */
   int rel_opcall = stigi_dl_rel_id(&dl, "operationCall");
   int rel_result = stigi_dl_rel_id(&dl, "result");
-  if (rel_opcall >= 0 && rel_result >= 0) {
-    for (uint32_t i = 0; i < img->unit_count; i++) {
-      const StigiImageUnit *u = &img->units[i];
-      const StigiDecl *d = u->ast->decl;
-      if (d->kind != STIGI_DECL_DEF) continue;
-      const StigiDefHead *h = &d->u.def_decl.head;
-      int32_t taint_cap_idx = -1;
-      uint32_t cap_ord = 0;
-      for (uint32_t g = 0; g < h->pre_group_count; g++) {
-        if (h->pre_groups[g].is_fact) continue;
-        for (uint32_t c = 0; c < h->pre_groups[g].cap_count; c++) {
-          if (is_taint_cap_name(h->pre_groups[g].caps[c].cap_type->name) && taint_cap_idx < 0) {
-            taint_cap_idx = (int32_t)cap_ord;
-          }
-          cap_ord++;
-        }
-      }
-      if (taint_cap_idx < 0) continue;
+  int rel_tobj = stigi_dl_rel_id(&dl, "taintedObject");
+  int rel_mask = stigi_dl_rel_id(&dl, "maskIndex");
+  int rel_fe = stigi_dl_rel_id(&dl, "freeEdge");
+  int rel_fae = stigi_dl_rel_id(&dl, "freeAtExit");
+  int rel_ru = stigi_dl_rel_id(&dl, "reuseAt");
+  int rel_so = stigi_dl_rel_id(&dl, "stackObject");
 
+  uint32_t total_masked = 0;
+  for (uint32_t i = 0; i < img->unit_count; i++) {
+    if (!img->units[i].reachable) continue;
+    const StigiImageUnit *u = &img->units[i];
+    const StigiDecl *d = u->ast->decl;
+    if (d->kind != STIGI_DECL_DEF) continue;
+
+    const StigiDefHead *h = &d->u.def_decl.head;
+    bool has_cap = false;
+    int32_t taint_cap_idx = -1;
+    uint32_t cap_ord = 0;
+    for (uint32_t g = 0; g < h->pre_group_count; g++) {
+      if (h->pre_groups[g].is_fact) continue;
+      if (h->pre_groups[g].cap_count > 0) has_cap = true;
+      for (uint32_t c = 0; c < h->pre_groups[g].cap_count; c++) {
+        if (is_taint_cap_name(h->pre_groups[g].caps[c].cap_type->name) && taint_cap_idx < 0) {
+          taint_cap_idx = (int32_t)cap_ord;
+        }
+        cap_ord++;
+      }
+    }
+    if (!has_cap) {
+      info[i].is_pure_def = true;
+      if (stats != NULL) stats->pure_defs++;
+    }
+
+    StigiFactSet fs;
+    stigi_facts_init(&fs);
+    st = stigi_extract_unit_closed(img, i, door->kernel_mode, &fs, diag);
+    if (st != STIGI_OK) {
+      stigi_facts_free(&fs);
+      stigi_dl_close(&dl);
+      free_unit_masks(info, img->unit_count);
+      return st;
+    }
+
+    bool has_access_or_alloc = false;
+    for (uint32_t r = 0; r < fs.count; r++) {
+      const char *rn = fs.rows[r].rel;
+      if (strcmp(rn, "indexRead") == 0 || strcmp(rn, "indexWrite") == 0 ||
+          strcmp(rn, "alloc") == 0) {
+        has_access_or_alloc = true;
+        break;
+      }
+    }
+    if (!has_access_or_alloc) {
+      stigi_facts_free(&fs);
+      continue;
+    }
+
+    st = stigi_dl_reset(&dl, diag);
+    if (st != STIGI_OK) {
+      stigi_facts_free(&fs);
+      stigi_dl_close(&dl);
+      free_unit_masks(info, img->unit_count);
+      return st;
+    }
+    st = stigi_facts_load_into_dl(&fs, &dl, diag);
+    if (st != STIGI_OK) {
+      stigi_facts_free(&fs);
+      stigi_dl_close(&dl);
+      free_unit_masks(info, img->unit_count);
+      return st;
+    }
+
+    if (taint_cap_idx >= 0 && rel_opcall >= 0 && rel_result >= 0) {
       char cap_sym[256], pt_sym[256];
       (void)snprintf(cap_sym, sizeof cap_sym, "%s#0:cap%d", u->name, taint_cap_idx);
       (void)snprintf(pt_sym, sizeof pt_sym, "%s#0:p0", u->name);
@@ -427,16 +521,14 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
       if (stigi_dl_intern(&dl, cap_sym, strlen(cap_sym), &cap_id, diag) != STIGI_OK ||
           stigi_dl_intern(&dl, "read", 4, &opname_id, diag) != STIGI_OK ||
           stigi_dl_intern(&dl, pt_sym, strlen(pt_sym), &pt_id, diag) != STIGI_OK) {
-        stigi_dl_close(&dl);
         stigi_facts_free(&fs);
+        stigi_dl_close(&dl);
         free_unit_masks(info, img->unit_count);
         return STIGI_ERR_OOM;
       }
-
       for (uint32_t p = 0; p < h->param_count; p++) {
         uint32_t from_tmp = i;
         const StigiType *pty = resolve_typedef_type(img, &from_tmp, h->params[p].type, 0);
-        if (pty->kind == STIGI_TYPE_ARRAY) continue;
         char op_sym[256], val_sym[256];
         (void)snprintf(op_sym, sizeof op_sym, "%s#0:taint_seed_%u", u->name, p);
         (void)snprintf(val_sym, sizeof val_sym, "%s#0:p:%.*s", u->name,
@@ -444,10 +536,17 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
         uint32_t op_id = 0, val_id = 0;
         if (stigi_dl_intern(&dl, op_sym, strlen(op_sym), &op_id, diag) != STIGI_OK ||
             stigi_dl_intern(&dl, val_sym, strlen(val_sym), &val_id, diag) != STIGI_OK) {
-          stigi_dl_close(&dl);
           stigi_facts_free(&fs);
+          stigi_dl_close(&dl);
           free_unit_masks(info, img->unit_count);
           return STIGI_ERR_OOM;
+        }
+        if (pty != NULL && pty->kind == STIGI_TYPE_ARRAY) {
+          if (rel_tobj >= 0) {
+            int64_t to_row[1] = {(int64_t)val_id};
+            (void)stigi_dl_add(&dl, rel_tobj, to_row, 1, diag);
+          }
+          continue;
         }
         int64_t oc_row[4] = {(int64_t)op_id, (int64_t)cap_id, (int64_t)opname_id, (int64_t)pt_id};
         int64_t res_row[2] = {(int64_t)op_id, (int64_t)val_id};
@@ -455,136 +554,181 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
         (void)stigi_dl_add(&dl, rel_result, res_row, 2, diag);
       }
     }
-  }
 
-  st = stigi_dl_eval(&dl, diag);
-  if (st != STIGI_OK) {
-    stigi_dl_close(&dl);
-    stigi_facts_free(&fs);
-    free_unit_masks(info, img->unit_count);
-    return st;
-  }
+    st = stigi_dl_eval(&dl, diag);
+    if (st != STIGI_OK) {
+      stigi_facts_free(&fs);
+      stigi_dl_close(&dl);
+      free_unit_masks(info, img->unit_count);
+      return st;
+    }
 
-  char **mask_ops = NULL;
-  uint32_t mask_op_count = 0;
-  int rel_mask = stigi_dl_rel_id(&dl, "maskIndex");
-  if (rel_mask >= 0) {
-    uint32_t cnt = stigi_dl_count(&dl, rel_mask);
-    if (cnt > 0) {
-      mask_ops = calloc(cnt, sizeof *mask_ops);
-      if (mask_ops == NULL) {
-        stigi_dl_close(&dl);
-        stigi_facts_free(&fs);
-        free_unit_masks(info, img->unit_count);
-        return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops OOM");
-      }
-      for (uint32_t r = 0; r < cnt; r++) {
-        int64_t row[1] = {0};
-        if (stigi_dl_read(&dl, rel_mask, r, row, 1, diag) == STIGI_OK) {
-          size_t slen = 0;
-          const char *s = stigi_dl_sym_str(&dl, (uint32_t)row[0], &slen);
-          if (s != NULL) {
-            char *cp = malloc(slen + 1U);
-            if (cp == NULL) {
-              for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-              free(mask_ops);
-              stigi_dl_close(&dl);
-              stigi_facts_free(&fs);
-              free_unit_masks(info, img->unit_count);
-              return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops strdup OOM");
+    char **mask_ops = NULL;
+    uint32_t mask_op_count = 0;
+    if (rel_mask >= 0) {
+      uint32_t cnt = stigi_dl_count(&dl, rel_mask);
+      if (cnt > 0) {
+        mask_ops = calloc(cnt, sizeof *mask_ops);
+        if (mask_ops == NULL) {
+          stigi_facts_free(&fs);
+          stigi_dl_close(&dl);
+          free_unit_masks(info, img->unit_count);
+          return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops OOM");
+        }
+        for (uint32_t r = 0; r < cnt; r++) {
+          int64_t row[1] = {0};
+          if (stigi_dl_read(&dl, rel_mask, r, row, 1, diag) == STIGI_OK) {
+            size_t slen = 0;
+            const char *s = stigi_dl_sym_str(&dl, (uint32_t)row[0], &slen);
+            if (s != NULL) {
+              char *cp = malloc(slen + 1U);
+              if (cp == NULL) {
+                for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
+                free(mask_ops);
+                stigi_facts_free(&fs);
+                stigi_dl_close(&dl);
+                free_unit_masks(info, img->unit_count);
+                return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops strdup OOM");
+              }
+              memcpy(cp, s, slen);
+              cp[slen] = '\0';
+              mask_ops[mask_op_count++] = cp;
             }
-            memcpy(cp, s, slen);
-            cp[slen] = '\0';
-            mask_ops[mask_op_count++] = cp;
           }
         }
+        qsort(mask_ops, mask_op_count, sizeof *mask_ops, cmp_cstr_ptr);
       }
-      qsort(mask_ops, mask_op_count, sizeof *mask_ops, cmp_cstr_ptr);
     }
+
+    UnitMaskInfo *ui = &info[i];
+    for (uint32_t r = 0; r < fs.count; r++) {
+      const StigiFactRow *fr = &fs.rows[r];
+      if (strcmp(fr->rel, "indexRead") != 0 && strcmp(fr->rel, "indexWrite") != 0) continue;
+      if (fr->ncols < 1 || fr->cols[0].is_num || fr->cols[0].sym == NULL) continue;
+      const char *op_sym = fr->cols[0].sym;
+      if (ui->access_count == ui->access_cap) {
+        uint32_t ncap = ui->access_cap == 0 ? 8U : ui->access_cap * 2U;
+        bool *nb = realloc(ui->access_masked, (size_t)ncap * sizeof *nb);
+        if (nb == NULL) {
+          for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
+          free(mask_ops);
+          stigi_facts_free(&fs);
+          stigi_dl_close(&dl);
+          free_unit_masks(info, img->unit_count);
+          return diag_set(diag, STIGI_ERR_OOM, -1, "access_masked OOM");
+        }
+        ui->access_masked = nb;
+        ui->access_cap = ncap;
+      }
+      bool is_m = (mask_op_count > 0) &&
+                  sorted_cstr_contains((const char *const *)mask_ops, mask_op_count, op_sym);
+      ui->access_masked[ui->access_count++] = is_m;
+      if (is_m) total_masked++;
+    }
+
+    if (stats != NULL) {
+      if (rel_fe >= 0) stats->free_edges += stigi_dl_count(&dl, rel_fe);
+      if (rel_fae >= 0) stats->free_at_exit += stigi_dl_count(&dl, rel_fae);
+      if (rel_ru >= 0) stats->reuses += stigi_dl_count(&dl, rel_ru);
+      if (rel_so >= 0) stats->stack_objects += stigi_dl_count(&dl, rel_so);
+    }
+
+    for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
+    free(mask_ops);
+    stigi_facts_free(&fs);
   }
 
-  /* Map each indexRead/indexWrite fact row in extraction order to its unit's access ordinal */
-  uint32_t total_masked = 0;
-  for (uint32_t r = 0; r < fs.count; r++) {
-    const StigiFactRow *fr = &fs.rows[r];
-    if (strcmp(fr->rel, "indexRead") != 0 && strcmp(fr->rel, "indexWrite") != 0) continue;
-    if (fr->ncols < 1 || fr->cols[0].is_num || fr->cols[0].sym == NULL) continue;
-    const char *op_sym = fr->cols[0].sym;
-    const char *hash = strstr(op_sym, "#0:");
-    if (hash == NULL) continue;
-    size_t ulen = (size_t)(hash - op_sym);
-    int32_t uidx = stigi_image_find(img, op_sym, ulen);
-    if (uidx < 0) continue;
-
-    UnitMaskInfo *ui = &info[uidx];
-    if (ui->access_count == ui->access_cap) {
-      uint32_t ncap = ui->access_cap == 0 ? 8U : ui->access_cap * 2U;
-      bool *nb = realloc(ui->access_masked, (size_t)ncap * sizeof *nb);
-      if (nb == NULL) {
-        for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-        free(mask_ops);
-        stigi_dl_close(&dl);
-        stigi_facts_free(&fs);
-        free_unit_masks(info, img->unit_count);
-        return diag_set(diag, STIGI_ERR_OOM, -1, "access_masked OOM");
-      }
-      ui->access_masked = nb;
-      ui->access_cap = ncap;
-    }
-    bool is_m = (mask_op_count > 0) &&
-                sorted_cstr_contains((const char *const *)mask_ops, mask_op_count, op_sym);
-    ui->access_masked[ui->access_count++] = is_m;
-    if (is_m) total_masked++;
-  }
-
-  for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-  free(mask_ops);
   stigi_dl_close(&dl);
-  stigi_facts_free(&fs);
   *out_info = info;
   *out_total_masks = total_masked;
   return STIGI_OK;
 }
 
-/* ---- Emitter context & deterministic enum resolution (Defect 1) ---- */
+/* ---- Emitter context (dynamic vars, shadowing hygiene, handler binders) ---- */
 
 typedef struct {
   StigiStr name;
+  char *c_name;
   const StigiType *ast_type;
-  const StigiExpr *len_expr; /* for Array[A](n): any expr (LOCAL, LIT_INT, GLOBAL, BINOP) */
+  const StigiExpr *len_expr;
   uint32_t type_uidx;
   EmitScalarTy scalar_ty;
   EmitScalarTy elem_scalar_ty;
   bool is_array;
-  bool is_param_array;
-  int32_t enum_uidx; /* >= 0 if enum type */
+  bool is_cell;
+  bool is_ptr;
+  bool is_handler_state_field;
+  int32_t enum_uidx;
+  int32_t handler_uidx; /* >= 0 if capability binder bound by `handle` */
+  char *handler_state_var;
 } EmitVar;
 
 typedef struct {
   const StigiImage *img;
   uint32_t uidx;
   const StigiDecl *cur_def;
+  const StigiDefHead *cur_head;
   EmitBuf *b;
-  EmitBuf *pre; /* statement-level hoist buffer for left-to-right call args */
+  EmitBuf *pre;
   StigiEmitStats *stats;
   const UnitMaskInfo *mask_info;
   uint32_t access_seq;
-  EmitVar vars[128];
+  EmitVar *vars;
   uint32_t var_count;
+  uint32_t var_cap;
+  char **param_cnames; /* original parameter C names for tail-loop updates */
+  uint32_t param_cname_count;
   uint32_t tmp_id;
+  uint32_t shadow_seq;
   bool is_tail_loop;
   bool is_never_def;
+  bool in_extern_dsl;
+  bool fail_closed;
+  char fail_msg[256];
   EmitScalarTy ret_scalar;
+  const StigiType *ret_ast_type;
+  uint32_t ret_type_uidx;
 } EmitCtx;
+
+static void emit_ctx_pop_vars(EmitCtx *ctx, uint32_t saved_count) {
+  while (ctx->var_count > saved_count) {
+    ctx->var_count--;
+    free(ctx->vars[ctx->var_count].c_name);
+    free(ctx->vars[ctx->var_count].handler_state_var);
+    ctx->vars[ctx->var_count].c_name = NULL;
+    ctx->vars[ctx->var_count].handler_state_var = NULL;
+  }
+}
+
+static void emit_ctx_free(EmitCtx *ctx) {
+  emit_ctx_pop_vars(ctx, 0);
+  free(ctx->vars);
+  ctx->vars = NULL;
+  ctx->var_cap = 0;
+  for (uint32_t i = 0; i < ctx->param_cname_count; i++) free(ctx->param_cnames[i]);
+  free(ctx->param_cnames);
+  ctx->param_cnames = NULL;
+  ctx->param_cname_count = 0;
+}
 
 static const EmitVar *emit_find_var(const EmitCtx *ctx, StigiStr name) {
   for (uint32_t i = ctx->var_count; i > 0; i--) {
-    if (ctx->vars[i - 1].name.len == name.len &&
-        memcmp(ctx->vars[i - 1].name.ptr, name.ptr, name.len) == 0) {
+    if (str_eq_ss(ctx->vars[i - 1].name, name)) {
       return &ctx->vars[i - 1];
     }
   }
   return NULL;
+}
+
+static void emit_var_cname(EmitBuf *b, const EmitVar *v) {
+  if (v->is_handler_state_field) {
+    eb_cstr(b, "_hstate->");
+  }
+  if (v->c_name != NULL) {
+    eb_cstr(b, v->c_name);
+  } else {
+    eb_c_ident(b, v->name);
+  }
 }
 
 static bool ctx_next_access_masked(EmitCtx *ctx) {
@@ -595,26 +739,53 @@ static bool ctx_next_access_masked(EmitCtx *ctx) {
   return false;
 }
 
-static void emit_register_var(EmitCtx *ctx, StigiStr name, const StigiType *ty,
-                              uint32_t type_uidx, bool is_param) {
-  if (ctx->var_count >= 128) return;
+static EmitVar *emit_push_var_raw(EmitCtx *ctx, StigiStr name, bool allow_shadow_suffix) {
+  if (ctx->var_count == ctx->var_cap) {
+    uint32_t ncap = ctx->var_cap == 0 ? 32U : ctx->var_cap * 2U;
+    EmitVar *nv = realloc(ctx->vars, (size_t)ncap * sizeof *nv);
+    if (nv == NULL) {
+      if (ctx->b != NULL) ctx->b->oom = true;
+      return NULL;
+    }
+    ctx->vars = nv;
+    ctx->var_cap = ncap;
+  }
+  bool shadowed = allow_shadow_suffix && (emit_find_var(ctx, name) != NULL);
+  EmitBuf cn;
+  memset(&cn, 0, sizeof cn);
+  eb_c_ident(&cn, name);
+  if (shadowed) {
+    eb_fmt(&cn, "_%u", ++ctx->shadow_seq);
+  }
   EmitVar *v = &ctx->vars[ctx->var_count++];
   memset(v, 0, sizeof *v);
   v->name = name;
+  v->c_name = cn.buf;
+  v->enum_uidx = -1;
+  v->handler_uidx = -1;
+  return v;
+}
+
+static EmitVar *emit_register_var(EmitCtx *ctx, StigiStr name, const StigiType *ty,
+                                  uint32_t type_uidx, bool is_param) {
+  EmitVar *v = emit_push_var_raw(ctx, name, !is_param);
+  if (v == NULL) return NULL;
   v->ast_type = ty;
   v->type_uidx = type_uidx;
-  v->enum_uidx = -1;
-  if (ty == NULL) return;
+  if (ty == NULL) return v;
 
   uint32_t r_uidx = type_uidx;
   const StigiType *rty = resolve_typedef_type(ctx->img, &r_uidx, ty, 0);
   v->scalar_ty = ast_type_to_scalar(ctx->img, type_uidx, ty, 0);
-  if (rty != NULL && rty->kind == STIGI_TYPE_ARRAY) {
+  if (rty != NULL && (rty->kind == STIGI_TYPE_ARRAY || rty->kind == STIGI_TYPE_PTR)) {
     v->is_array = true;
-    v->is_param_array = is_param;
-    if (rty->len_arg_count > 0) {
-      v->len_expr = rty->len_args[0];
+    v->is_ptr = (rty->kind == STIGI_TYPE_PTR);
+    if (rty->len_arg_count > 0) v->len_expr = rty->len_args[0];
+    if (rty->type_arg_count > 0) {
+      v->elem_scalar_ty = ast_type_to_scalar(ctx->img, r_uidx, rty->type_args[0], 0);
     }
+  } else if (rty != NULL && rty->kind == STIGI_TYPE_CELL) {
+    v->is_cell = true;
     if (rty->type_arg_count > 0) {
       v->elem_scalar_ty = ast_type_to_scalar(ctx->img, r_uidx, rty->type_args[0], 0);
     }
@@ -624,6 +795,7 @@ static void emit_register_var(EmitCtx *ctx, StigiStr name, const StigiType *ty,
       v->enum_uidx = et;
     }
   }
+  return v;
 }
 
 static size_t unit_ns_prefix_len(const char *name, size_t len) {
@@ -634,12 +806,19 @@ static size_t unit_ns_prefix_len(const char *name, size_t len) {
   return last;
 }
 
-/* Search ONLY inside a specific resolved enum declaration (Defect 1) */
 static bool find_case_in_enum(const StigiDecl *ed, StigiStr case_name, uint32_t *out_cidx) {
   if (ed == NULL || ed->kind != STIGI_DECL_ENUM) return false;
+  /* Support both short `CaseName` and qualified `EnumName.CaseName` */
+  StigiStr short_n = case_name;
+  for (size_t i = case_name.len; i > 0; i--) {
+    if (case_name.ptr[i - 1] == '.') {
+      short_n.ptr = case_name.ptr + i;
+      short_n.len = case_name.len - i;
+      break;
+    }
+  }
   for (uint32_t c = 0; c < ed->u.enum_decl.case_count; c++) {
-    if (ed->u.enum_decl.cases[c].name.len == case_name.len &&
-        memcmp(ed->u.enum_decl.cases[c].name.ptr, case_name.ptr, case_name.len) == 0) {
+    if (str_eq_ss(ed->u.enum_decl.cases[c].name, short_n)) {
       if (out_cidx != NULL) *out_cidx = c;
       return true;
     }
@@ -647,9 +826,18 @@ static bool find_case_in_enum(const StigiDecl *ed, StigiStr case_name, uint32_t 
   return false;
 }
 
-/* Deterministic enum case lookup: visibility -> same namespace -> 32-byte unit_id -> name (Defect 1) */
+/* Deterministic enum case lookup: qualified first, then visibility -> same ns -> unit_id -> name */
 static int32_t find_enum_case_owner_det(const StigiImage *img, uint32_t from_idx,
                                         StigiStr case_name, uint32_t *out_cidx) {
+  uint32_t rc = 0;
+  bool amb = false;
+  int32_t direct = stigi_image_resolve_enum_case(img, from_idx, case_name.ptr, case_name.len,
+                                                 &rc, &amb);
+  if (direct >= 0 && !amb) {
+    if (out_cidx != NULL) *out_cidx = rc;
+    return direct;
+  }
+
   int32_t best_idx = -1;
   uint32_t best_cidx = 0;
   int best_rank = -1;
@@ -700,7 +888,6 @@ static bool is_self_tail_call(const EmitCtx *ctx, const StigiExpr *e) {
   return false;
 }
 
-/* Defect 4: recurse into MATCH arms and HANDLE bodies */
 static bool has_self_tail_call(const EmitCtx *ctx, const StigiExpr *e) {
   if (e == NULL) return false;
   if (is_self_tail_call(ctx, e)) return true;
@@ -740,24 +927,66 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
         if (d->kind == STIGI_DECL_VAL) {
           return ast_type_to_scalar(ctx->img, (uint32_t)tgt, d->u.val_decl.type, 0);
         }
+        if (d->kind == STIGI_DECL_EXTERN && d->u.extern_decl.is_val) {
+          return ast_type_to_scalar(ctx->img, (uint32_t)tgt, d->u.extern_decl.val_type, 0);
+        }
       }
       return ETY_UNKNOWN;
     }
     case STIGI_EXPR_CALL: {
+      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL &&
+          str_eq_c(e->u.call.callee->u.ident.name, "size") && e->u.call.type_arg_count == 1) {
+        return ETY_U64;
+      }
       if (e->u.call.callee->kind == STIGI_EXPR_LOCAL && e->u.call.arg_count == 1) {
         const EmitVar *av = emit_find_var(ctx, e->u.call.callee->u.ident.name);
-        if (av != NULL && av->is_array) return av->elem_scalar_ty;
+        if (av != NULL && (av->is_array || av->is_cell)) return av->elem_scalar_ty;
       }
       if (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
           e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
-        if (str_eq_c(e->u.call.callee->u.ident.name, "Stigi.Test.expect")) return ETY_I32;
-        int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx,
-                                               e->u.call.callee->u.ident.name.ptr,
-                                               e->u.call.callee->u.ident.name.len);
+        StigiStr cn = e->u.call.callee->u.ident.name;
+        if (str_eq_c(cn, "Stigi.Test.expect")) return ETY_I32;
+        if (str_eq_c(cn, "U8.ofU64")) return ETY_U8;
+        if (str_eq_c(cn, "U32.ofU64") || str_eq_c(cn, "U32.wrappingAdd") ||
+            str_eq_c(cn, "U32.wrappingMultiply") || str_eq_c(cn, "U32.rotateRight") ||
+            str_eq_c(cn, "U32.bitwiseXor") || str_eq_c(cn, "U32.bitwiseAnd") ||
+            str_eq_c(cn, "U32.bitwiseOr") || str_eq_c(cn, "U32.shiftLeft") ||
+            str_eq_c(cn, "U32.shiftRight")) {
+          return ETY_U32;
+        }
+        if (str_eq_c(cn, "U64.ofU8") || str_eq_c(cn, "U64.ofU32") ||
+            str_eq_c(cn, "U64.ofI64") || str_eq_c(cn, "U64.bitwiseAnd") ||
+            str_eq_c(cn, "U64.bitwiseOr") || str_eq_c(cn, "U64.bitwiseXor") ||
+            str_eq_c(cn, "U64.shiftLeft") || str_eq_c(cn, "U64.shiftRight") ||
+            str_eq_c(cn, "U64.wrappingAdd") || str_eq_c(cn, "U64.wrappingMultiply") ||
+            str_eq_c(cn, "U64.mix")) {
+          return ETY_U64;
+        }
+        /* Capability operation call `binder.op(...)` */
+        const char *dot = memchr(cn.ptr, '.', cn.len);
+        if (dot != NULL) {
+          StigiStr bname = {cn.ptr, (size_t)(dot - cn.ptr)};
+          StigiStr opname = {dot + 1, cn.len - bname.len - 1U};
+          const EmitVar *bv = emit_find_var(ctx, bname);
+          if (bv != NULL && bv->handler_uidx >= 0) {
+            const StigiDecl *hd = ctx->img->units[bv->handler_uidx].ast->decl;
+            for (uint32_t m = 0; m < hd->u.handler_decl.def_count; m++) {
+              const StigiDecl *md = hd->u.handler_decl.defs[m];
+              if (md->kind == STIGI_DECL_DEF && str_eq_ss(md->name, opname)) {
+                return ast_type_to_scalar(ctx->img, (uint32_t)bv->handler_uidx,
+                                          md->u.def_decl.head.ret_type, 0);
+              }
+            }
+          }
+        }
+        int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx, cn.ptr, cn.len);
         if (tgt >= 0) {
           const StigiDecl *d = ctx->img->units[tgt].ast->decl;
           if (d->kind == STIGI_DECL_DEF) {
             return ast_type_to_scalar(ctx->img, (uint32_t)tgt, d->u.def_decl.head.ret_type, 0);
+          }
+          if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val) {
+            return ast_type_to_scalar(ctx->img, (uint32_t)tgt, d->u.extern_decl.head.ret_type, 0);
           }
         }
       }
@@ -766,12 +995,16 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
     case STIGI_EXPR_INDEX_READ: {
       if (e->u.index_expr.target->kind == STIGI_EXPR_LOCAL) {
         const EmitVar *av = emit_find_var(ctx, e->u.index_expr.target->u.ident.name);
-        if (av != NULL && av->is_array) return av->elem_scalar_ty;
+        if (av != NULL && (av->is_array || av->is_cell)) return av->elem_scalar_ty;
       }
       return ETY_UNKNOWN;
     }
     case STIGI_EXPR_UNOP:
       if (e->u.unop.op == STIGI_OP_NOT) return ETY_BOOL;
+      if (e->u.unop.op == STIGI_OP_NEG && e->u.unop.operand != NULL &&
+          e->u.unop.operand->kind == STIGI_EXPR_LIT_INT) {
+        return ETY_I64; /* ensures `-5 < 0` lowers as signed int64_t comparison */
+      }
       return infer_expr_scalar(ctx, e->u.unop.operand);
     case STIGI_EXPR_BINOP:
       if (e->u.binop.op >= STIGI_OP_LT && e->u.binop.op <= STIGI_OP_OR) return ETY_BOOL;
@@ -785,6 +1018,12 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
       if (tt != ETY_UNKNOWN) return tt;
       return infer_expr_scalar(ctx, e->u.if_expr.else_br);
     }
+    case STIGI_EXPR_MATCH:
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        EmitScalarTy at = infer_expr_scalar(ctx, e->u.match_expr.arms[i].body);
+        if (at != ETY_UNKNOWN) return at;
+      }
+      return ETY_UNKNOWN;
     case STIGI_EXPR_ASSERT:
       return infer_expr_scalar(ctx, e->u.assert_expr.expr);
     case STIGI_EXPR_BLOCK:
@@ -794,6 +1033,14 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
       return ETY_UNIT;
     case STIGI_EXPR_HANDLE:
       return infer_expr_scalar(ctx, e->u.handle_stmt.body);
+    case STIGI_EXPR_WHILE:
+    case STIGI_EXPR_VAL:
+    case STIGI_EXPR_VAR:
+    case STIGI_EXPR_ASSIGN:
+    case STIGI_EXPR_INDEX_WRITE:
+    case STIGI_EXPR_DENY:
+    case STIGI_EXPR_LOCAL_DECL:
+      return ETY_UNIT;
     default:
       return ETY_UNKNOWN;
   }
@@ -801,12 +1048,11 @@ static EmitScalarTy infer_expr_scalar(const EmitCtx *ctx, const StigiExpr *e) {
 
 static int32_t infer_expr_enum_uidx(const EmitCtx *ctx, const StigiExpr *e) {
   if (e == NULL) return -1;
-  if (e->kind == STIGI_EXPR_LOCAL) {
-    const EmitVar *sv = emit_find_var(ctx, e->u.ident.name);
-    if (sv != NULL && sv->enum_uidx >= 0) return sv->enum_uidx;
-    return find_enum_case_owner_det(ctx->img, ctx->uidx, e->u.ident.name, NULL);
-  }
-  if (e->kind == STIGI_EXPR_GLOBAL) {
+  if (e->kind == STIGI_EXPR_LOCAL || e->kind == STIGI_EXPR_GLOBAL) {
+    if (e->kind == STIGI_EXPR_LOCAL) {
+      const EmitVar *sv = emit_find_var(ctx, e->u.ident.name);
+      if (sv != NULL) return sv->enum_uidx;
+    }
     int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx,
                                            e->u.ident.name.ptr, e->u.ident.name.len);
     if (tgt >= 0) {
@@ -819,28 +1065,97 @@ static int32_t infer_expr_enum_uidx(const EmitCtx *ctx, const StigiExpr *e) {
           if (et >= 0 && ctx->img->units[et].ast->decl->kind == STIGI_DECL_ENUM) return et;
         }
       }
+      return -1;
     }
+    return find_enum_case_owner_det(ctx->img, ctx->uidx, e->u.ident.name, NULL);
   }
   if (e->kind == STIGI_EXPR_CALL &&
       (e->u.call.callee->kind == STIGI_EXPR_LOCAL || e->u.call.callee->kind == STIGI_EXPR_GLOBAL)) {
-    int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx,
-                                           e->u.call.callee->u.ident.name.ptr,
-                                           e->u.call.callee->u.ident.name.len);
+    StigiStr cn = e->u.call.callee->u.ident.name;
+    const char *dot = memchr(cn.ptr, '.', cn.len);
+    if (dot != NULL) {
+      StigiStr bname = {cn.ptr, (size_t)(dot - cn.ptr)};
+      StigiStr opname = {dot + 1, cn.len - bname.len - 1U};
+      const EmitVar *bv = emit_find_var(ctx, bname);
+      if (bv != NULL && bv->handler_uidx >= 0) {
+        const StigiDecl *hd = ctx->img->units[bv->handler_uidx].ast->decl;
+        for (uint32_t m = 0; m < hd->u.handler_decl.def_count; m++) {
+          const StigiDecl *md = hd->u.handler_decl.defs[m];
+          if (md->kind == STIGI_DECL_DEF && str_eq_ss(md->name, opname) &&
+              md->u.def_decl.head.ret_type != NULL) {
+            uint32_t ru = (uint32_t)bv->handler_uidx;
+            const StigiType *rt = resolve_typedef_type(ctx->img, &ru, md->u.def_decl.head.ret_type, 0);
+            if (rt != NULL && rt->kind == STIGI_TYPE_NAMED) {
+              int32_t et = stigi_image_resolve_name(ctx->img, ru, rt->name.ptr, rt->name.len);
+              if (et >= 0 && ctx->img->units[et].ast->decl->kind == STIGI_DECL_ENUM) return et;
+            }
+          }
+        }
+      }
+    }
+    int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx, cn.ptr, cn.len);
     if (tgt >= 0) {
       const StigiDecl *d = ctx->img->units[tgt].ast->decl;
-      if (d->kind == STIGI_DECL_DEF && d->u.def_decl.head.ret_type != NULL) {
+      const StigiType *rty = NULL;
+      if (d->kind == STIGI_DECL_DEF) rty = d->u.def_decl.head.ret_type;
+      else if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val) rty = d->u.extern_decl.head.ret_type;
+      if (rty != NULL) {
         uint32_t ru = (uint32_t)tgt;
-        const StigiType *rt = resolve_typedef_type(ctx->img, &ru, d->u.def_decl.head.ret_type, 0);
+        const StigiType *rt = resolve_typedef_type(ctx->img, &ru, rty, 0);
         if (rt != NULL && rt->kind == STIGI_TYPE_NAMED) {
           int32_t et = stigi_image_resolve_name(ctx->img, ru, rt->name.ptr, rt->name.len);
           if (et >= 0 && ctx->img->units[et].ast->decl->kind == STIGI_DECL_ENUM) return et;
         }
       }
-    } else if (e->u.call.callee->kind == STIGI_EXPR_LOCAL) {
-      return find_enum_case_owner_det(ctx->img, ctx->uidx, e->u.call.callee->u.ident.name, NULL);
+      return -1;
+    }
+    return find_enum_case_owner_det(ctx->img, ctx->uidx, cn, NULL);
+  }
+  if (e->kind == STIGI_EXPR_IF) {
+    int32_t et = infer_expr_enum_uidx(ctx, e->u.if_expr.then_br);
+    if (et >= 0) return et;
+    return infer_expr_enum_uidx(ctx, e->u.if_expr.else_br);
+  }
+  if (e->kind == STIGI_EXPR_MATCH) {
+    for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+      int32_t et = infer_expr_enum_uidx(ctx, e->u.match_expr.arms[i].body);
+      if (et >= 0) return et;
     }
   }
+  if (e->kind == STIGI_EXPR_BLOCK && e->u.block.count > 0) {
+    return infer_expr_enum_uidx(ctx, e->u.block.stmts[e->u.block.count - 1]);
+  }
+  if (e->kind == STIGI_EXPR_HANDLE) {
+    return infer_expr_enum_uidx(ctx, e->u.handle_stmt.body);
+  }
   return -1;
+}
+
+static bool emit_inferred_expr_c_type(EmitBuf *out, const EmitCtx *ctx, const StigiExpr *e,
+                                      EmitScalarTy hint) {
+  if (e != NULL && e->kind == STIGI_EXPR_LIT_STR) {
+    eb_cstr(out, "uint8_t *");
+    return true;
+  }
+  if (e != NULL && (e->kind == STIGI_EXPR_LOCAL || e->kind == STIGI_EXPR_GLOBAL)) {
+    const EmitVar *v = emit_find_var(ctx, e->u.ident.name);
+    if (v != NULL && v->ast_type != NULL) {
+      emit_c_type(out, ctx->img, v->type_uidx, v->ast_type, 0);
+      return true;
+    }
+  }
+  int32_t euidx = infer_expr_enum_uidx(ctx, e);
+  if (euidx >= 0) {
+    eb_mangle_name(out, ctx->img->units[euidx].name, ctx->img->units[euidx].name_len);
+    return true;
+  }
+  EmitScalarTy st = hint != ETY_UNKNOWN ? hint : infer_expr_scalar(ctx, e);
+  if (st != ETY_UNKNOWN) {
+    emit_scalar_c_type(out, st);
+    return true;
+  }
+  eb_cstr(out, "uint64_t");
+  return false;
 }
 
 static bool expr_is_complex_stmt(const StigiExpr *e) {
@@ -849,6 +1164,11 @@ static bool expr_is_complex_stmt(const StigiExpr *e) {
     case STIGI_EXPR_MATCH:
     case STIGI_EXPR_BLOCK:
     case STIGI_EXPR_HANDLE:
+    case STIGI_EXPR_WHILE:
+    case STIGI_EXPR_VAL:
+    case STIGI_EXPR_VAR:
+    case STIGI_EXPR_ASSIGN:
+    case STIGI_EXPR_INDEX_WRITE:
       return true;
     case STIGI_EXPR_IF:
       return expr_is_complex_stmt(e->u.if_expr.then_br) ||
@@ -891,6 +1211,8 @@ static const StigiExpr *find_array_len_expr(const EmitCtx *ctx, const StigiExpr 
 
 static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint);
 static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, bool is_void);
+static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var,
+                           EmitScalarTy hint);
 
 /* Helper: evaluate expression with its own pre-hoist buffer, flushing pre into ctx->b */
 static void emit_expr_with_pre(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint,
@@ -914,7 +1236,7 @@ static void emit_expr_with_pre(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hi
   free(local_pre.buf);
 }
 
-/* Helper: hoist a single argument into ctx->pre for strict left-to-right call evaluation (Defect 5) */
+/* Helper: hoist a single argument into ctx->pre for strict left-to-right call evaluation */
 static uint32_t hoist_arg(EmitCtx *ctx, const StigiExpr *arg, const StigiType *param_ty,
                           uint32_t param_uidx, EmitScalarTy hint) {
   uint32_t tid = ctx->tmp_id++;
@@ -929,17 +1251,7 @@ static uint32_t hoist_arg(EmitCtx *ctx, const StigiExpr *arg, const StigiType *p
   if (param_ty != NULL) {
     emit_c_type(ctx->pre, ctx->img, param_uidx, param_ty, 0);
   } else {
-    EmitScalarTy st = hint != ETY_UNKNOWN ? hint : infer_expr_scalar(ctx, arg);
-    if (st == ETY_UNKNOWN) {
-      int32_t euidx = infer_expr_enum_uidx(ctx, arg);
-      if (euidx >= 0) {
-        eb_mangle_name(ctx->pre, ctx->img->units[euidx].name, ctx->img->units[euidx].name_len);
-      } else {
-        eb_cstr(ctx->pre, "uint64_t");
-      }
-    } else {
-      emit_scalar_c_type(ctx->pre, st);
-    }
+    (void)emit_inferred_expr_c_type(ctx->pre, ctx, arg, hint);
   }
   eb_fmt(ctx->pre, " _a%u = ", tid);
   eb_mem(ctx->pre, val_buf.buf, val_buf.len);
@@ -949,7 +1261,757 @@ static uint32_t hoist_arg(EmitCtx *ctx, const StigiExpr *arg, const StigiType *p
   return tid;
 }
 
-/* Lower value-producing complex expressions (MATCH/BLOCK/HANDLE/IF) into an assignment to lhs_var */
+/* Helper: emit handler state setup for `handle binder = Handler(args...)` */
+static void emit_handle_setup(EmitCtx *ctx, const StigiExpr *e) {
+  if (e == NULL || e->kind != STIGI_EXPR_HANDLE) return;
+  int32_t hidx = stigi_image_resolve_name(ctx->img, ctx->uidx,
+                                          e->u.handle_stmt.handler_name.ptr,
+                                          e->u.handle_stmt.handler_name.len);
+  if (hidx < 0 || ctx->img->units[hidx].ast->decl->kind != STIGI_DECL_HANDLER) return;
+  const StigiImageUnit *hu = &ctx->img->units[hidx];
+  const StigiDecl *hd = hu->ast->decl;
+
+  uint32_t hid = ctx->tmp_id++;
+  char sname[32];
+  (void)snprintf(sname, sizeof sname, "_hs%u", hid);
+
+  uint32_t argc = e->u.handle_stmt.arg_count;
+  EmitBuf *abufs = argc > 0 ? calloc(argc, sizeof *abufs) : NULL;
+  for (uint32_t i = 0; i < argc && abufs != NULL; i++) {
+    EmitScalarTy ph = (i < hd->u.handler_decl.val_param_count)
+                          ? ast_type_to_scalar(ctx->img, (uint32_t)hidx,
+                                               hd->u.handler_decl.val_params[i].type, 0)
+                          : ETY_UNKNOWN;
+    emit_expr_with_pre(ctx, e->u.handle_stmt.args[i], ph, &abufs[i]);
+  }
+  eb_cstr(ctx->b, "  ");
+  eb_mangle_name(ctx->b, hu->name, hu->name_len);
+  eb_fmt(ctx->b, "_State %s = ", sname);
+  eb_mangle_name(ctx->b, hu->name, hu->name_len);
+  eb_cstr(ctx->b, "_init(");
+  for (uint32_t i = 0; i < argc && abufs != NULL; i++) {
+    if (i > 0) eb_cstr(ctx->b, ", ");
+    eb_mem(ctx->b, abufs[i].buf, abufs[i].len);
+    free(abufs[i].buf);
+  }
+  free(abufs);
+  eb_cstr(ctx->b, ");\n");
+  eb_fmt(ctx->b, "  (void)%s;\n", sname);
+
+  if (e->u.handle_stmt.binder.len > 0) {
+    EmitVar *hv = emit_push_var_raw(ctx, e->u.handle_stmt.binder, true);
+    if (hv != NULL) {
+      hv->handler_uidx = hidx;
+      size_t sl = strlen(sname);
+      hv->handler_state_var = malloc(sl + 1U);
+      if (hv->handler_state_var != NULL) memcpy(hv->handler_state_var, sname, sl + 1U);
+    }
+  }
+}
+
+/* Helper: detect Array.tryFill / Array.tryGrow / Cell.tryMake scrutinee */
+static int detect_alloc_scrutinee(const StigiExpr *scr) {
+  if (scr == NULL || scr->kind != STIGI_EXPR_CALL) return 0;
+  if (scr->u.call.callee->kind != STIGI_EXPR_GLOBAL &&
+      scr->u.call.callee->kind != STIGI_EXPR_LOCAL) {
+    return 0;
+  }
+  StigiStr cn = scr->u.call.callee->u.ident.name;
+  if (str_eq_c(cn, "Array.tryFill") && scr->u.call.arg_count == 2) return 1;
+  if (str_eq_c(cn, "Array.tryGrow") && scr->u.call.arg_count == 3) return 2;
+  if (str_eq_c(cn, "Cell.tryMake") && scr->u.call.arg_count == 1) return 3;
+  return 0;
+}
+
+static void emit_alloc_elem_ctype(EmitBuf *b, const EmitCtx *ctx, const StigiExpr *scr, int akind) {
+  if (scr->u.call.type_arg_count > 0) {
+    emit_c_type(b, ctx->img, ctx->uidx, scr->u.call.type_args[0], 0);
+    return;
+  }
+  if (akind == 2) {
+    /* Array.tryGrow(arr, nextCap, fill): element type from arr */
+    if (scr->u.call.args[0]->kind == STIGI_EXPR_LOCAL) {
+      const EmitVar *av = emit_find_var(ctx, scr->u.call.args[0]->u.ident.name);
+      if (av != NULL && av->ast_type != NULL) {
+        uint32_t ru = av->type_uidx;
+        const StigiType *rt = resolve_typedef_type(ctx->img, &ru, av->ast_type, 0);
+        if (rt != NULL && rt->kind == STIGI_TYPE_ARRAY && rt->type_arg_count > 0) {
+          emit_c_type(b, ctx->img, ru, rt->type_args[0], 0);
+          return;
+        }
+      }
+    }
+    (void)emit_inferred_expr_c_type(b, ctx, scr->u.call.args[2], ETY_UNKNOWN);
+    return;
+  }
+  const StigiExpr *init_e = (akind == 1) ? scr->u.call.args[1] : scr->u.call.args[0];
+  (void)emit_inferred_expr_c_type(b, ctx, init_e, ETY_UNKNOWN);
+}
+
+/* Conservatively returns false ONLY when `binder` is used strictly for element read/write
+ * inside `e` (never returned, aliased, stored, or passed to a call) — 100% sound for stack
+ * promotion and deterministic arm-exit free without risking UAF or double-free. */
+static bool alloc_binder_escapes(const StigiExpr *e, StigiStr binder) {
+  if (e == NULL || binder.len == 0) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_LOCAL:
+    case STIGI_EXPR_GLOBAL:
+      return str_eq_ss(e->u.ident.name, binder);
+    case STIGI_EXPR_INDEX_READ:
+      if (e->u.index_expr.target->kind == STIGI_EXPR_LOCAL &&
+          str_eq_ss(e->u.index_expr.target->u.ident.name, binder)) {
+        return alloc_binder_escapes(e->u.index_expr.index, binder);
+      }
+      return alloc_binder_escapes(e->u.index_expr.target, binder) ||
+             alloc_binder_escapes(e->u.index_expr.index, binder);
+    case STIGI_EXPR_INDEX_WRITE:
+      if (e->u.index_expr.target->kind == STIGI_EXPR_LOCAL &&
+          str_eq_ss(e->u.index_expr.target->u.ident.name, binder)) {
+        return alloc_binder_escapes(e->u.index_expr.index, binder) ||
+               alloc_binder_escapes(e->u.index_expr.value, binder);
+      }
+      return alloc_binder_escapes(e->u.index_expr.target, binder) ||
+             alloc_binder_escapes(e->u.index_expr.index, binder) ||
+             alloc_binder_escapes(e->u.index_expr.value, binder);
+    case STIGI_EXPR_CALL:
+      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL &&
+          str_eq_ss(e->u.call.callee->u.ident.name, binder) && e->u.call.arg_count == 1) {
+        return alloc_binder_escapes(e->u.call.args[0], binder);
+      }
+      if (alloc_binder_escapes(e->u.call.callee, binder)) return true;
+      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+        if (alloc_binder_escapes(e->u.call.args[i], binder)) return true;
+      }
+      return false;
+    case STIGI_EXPR_UNOP:
+      return alloc_binder_escapes(e->u.unop.operand, binder);
+    case STIGI_EXPR_BINOP:
+      return alloc_binder_escapes(e->u.binop.lhs, binder) ||
+             alloc_binder_escapes(e->u.binop.rhs, binder);
+    case STIGI_EXPR_IF:
+      return alloc_binder_escapes(e->u.if_expr.cond, binder) ||
+             alloc_binder_escapes(e->u.if_expr.then_br, binder) ||
+             alloc_binder_escapes(e->u.if_expr.else_br, binder);
+    case STIGI_EXPR_WHILE:
+      return alloc_binder_escapes(e->u.while_expr.cond, binder) ||
+             alloc_binder_escapes(e->u.while_expr.body, binder);
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        if (alloc_binder_escapes(e->u.block.stmts[i], binder)) return true;
+      }
+      return false;
+    case STIGI_EXPR_VAL:
+      if (alloc_binder_escapes(e->u.val_stmt.init, binder)) return true;
+      if (e->u.val_stmt.pat.kind == STIGI_PAT_VAR && str_eq_ss(e->u.val_stmt.pat.name, binder)) {
+        return false;
+      }
+      return false;
+    case STIGI_EXPR_VAR:
+      return alloc_binder_escapes(e->u.var_stmt.init, binder);
+    case STIGI_EXPR_ASSIGN:
+      return alloc_binder_escapes(e->u.assign_stmt.value, binder);
+    case STIGI_EXPR_MATCH:
+      if (alloc_binder_escapes(e->u.match_expr.scrutinee, binder)) return true;
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        if (alloc_binder_escapes(e->u.match_expr.arms[i].body, binder)) return true;
+      }
+      return false;
+    case STIGI_EXPR_HANDLE:
+      for (uint32_t i = 0; i < e->u.handle_stmt.arg_count; i++) {
+        if (alloc_binder_escapes(e->u.handle_stmt.args[i], binder)) return true;
+      }
+      return alloc_binder_escapes(e->u.handle_stmt.body, binder);
+    case STIGI_EXPR_ASSERT:
+      return alloc_binder_escapes(e->u.assert_expr.expr, binder);
+    default:
+      return false;
+  }
+}
+
+static uint64_t alloc_elem_size_bytes(const EmitCtx *ctx, const StigiExpr *scr, int akind) {
+  if (scr->u.call.type_arg_count > 0) {
+    StigiLayout l = ast_type_layout(ctx->img, ctx->uidx, scr->u.call.type_args[0], 0);
+    return l.size > 0 ? l.size : 8ULL;
+  }
+  const StigiExpr *init_e = (akind == 1) ? scr->u.call.args[1]
+                          : (akind == 2) ? scr->u.call.args[2]
+                                         : scr->u.call.args[0];
+  EmitScalarTy st = infer_expr_scalar(ctx, init_e);
+  if (st == ETY_U8 || st == ETY_BOOL) return 1ULL;
+  if (st == ETY_U32 || st == ETY_I32) return 4ULL;
+  return 8ULL;
+}
+
+static void emit_alloc_arm_with_cleanup(EmitCtx *ctx, const StigiExpr *body,
+                                        const char *ptr_name, bool free_always,
+                                        bool free_filc_only, const char *lhs_var,
+                                        EmitScalarTy hint, bool is_tail, bool is_void,
+                                        uint32_t sid) {
+  if (!free_always && !free_filc_only) {
+    if (lhs_var != NULL) emit_assign_to(ctx, body, lhs_var, hint);
+    else emit_stmt_or_ret(ctx, body, is_tail, is_void);
+    return;
+  }
+  if (lhs_var != NULL) {
+    emit_assign_to(ctx, body, lhs_var, hint);
+    if (free_filc_only) eb_cstr(ctx->b, "#if defined(__FILC__)\n");
+    eb_fmt(ctx->b, "    free(%s);\n", ptr_name);
+    if (free_filc_only) eb_cstr(ctx->b, "#endif\n");
+    return;
+  }
+  if (is_void) {
+    emit_stmt_or_ret(ctx, body, false, true);
+    if (free_filc_only) eb_cstr(ctx->b, "#if defined(__FILC__)\n");
+    eb_fmt(ctx->b, "    free(%s);\n", ptr_name);
+    if (free_filc_only) eb_cstr(ctx->b, "#endif\n");
+    if (is_tail) eb_cstr(ctx->b, "    return;\n");
+    return;
+  }
+  if (is_tail) {
+    char rvar[32];
+    (void)snprintf(rvar, sizeof rvar, "_ar%u", sid);
+    eb_cstr(ctx->b, "    ");
+    if (ctx->ret_ast_type != NULL) {
+      emit_c_type(ctx->b, ctx->img, ctx->ret_type_uidx, ctx->ret_ast_type, 0);
+    } else {
+      (void)emit_inferred_expr_c_type(ctx->b, ctx, body, hint);
+    }
+    eb_fmt(ctx->b, " %s = {0};\n", rvar);
+    emit_assign_to(ctx, body, rvar, ctx->ret_scalar != ETY_UNKNOWN ? ctx->ret_scalar : hint);
+    if (free_filc_only) eb_cstr(ctx->b, "#if defined(__FILC__)\n");
+    eb_fmt(ctx->b, "    free(%s);\n", ptr_name);
+    if (free_filc_only) eb_cstr(ctx->b, "#endif\n");
+    eb_fmt(ctx->b, "    return %s;\n", rvar);
+    return;
+  }
+  emit_stmt_or_ret(ctx, body, false, false);
+  if (free_filc_only) eb_cstr(ctx->b, "#if defined(__FILC__)\n");
+  eb_fmt(ctx->b, "    free(%s);\n", ptr_name);
+  if (free_filc_only) eb_cstr(ctx->b, "#endif\n");
+}
+
+static void emit_alloc_match(EmitCtx *ctx, const StigiExpr *e, int akind,
+                             const char *lhs_var, EmitScalarTy hint,
+                             bool is_tail, bool is_void) {
+  const StigiExpr *scr = e->u.match_expr.scrutinee;
+  const StigiImageUnit *u = &ctx->img->units[ctx->uidx];
+  uint32_t sid = ctx->tmp_id++;
+
+  EmitBuf elem_ct;
+  memset(&elem_ct, 0, sizeof elem_ct);
+  emit_alloc_elem_ctype(&elem_ct, ctx, scr, akind);
+
+  eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
+  if (akind == 1) {
+    /* Array.tryFill{region}(cap, init) */
+    const StigiMatchArm *filled_arm = NULL;
+    const StigiMatchArm *fail_arm = NULL;
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      if (str_eq_c(pat->name, "Filled")) filled_arm = &e->u.match_expr.arms[a];
+      else if (str_eq_c(pat->name, "FillFailed")) fail_arm = &e->u.match_expr.arms[a];
+    }
+    bool escapes = true;
+    StigiStr binder = {NULL, 0};
+    if (filled_arm != NULL) {
+      if (filled_arm->pat.field_count == 1 &&
+          !(filled_arm->pat.fields[0].len == 1 && filled_arm->pat.fields[0].ptr[0] == '_')) {
+        binder = filled_arm->pat.fields[0];
+        escapes = alloc_binder_escapes(filled_arm->body, binder);
+      } else {
+        escapes = false;
+      }
+    }
+    bool stack_promote = false;
+    uint64_t stack_n = 0;
+    uint64_t stack_bytes = 0;
+    if (!escapes && scr->u.call.args[0]->kind == STIGI_EXPR_LIT_INT) {
+      uint64_t n = scr->u.call.args[0]->u.lit_int.value;
+      uint64_t esz = alloc_elem_size_bytes(ctx, scr, akind);
+      if (n > 0 && n <= 256ULL && n * esz <= 256ULL) {
+        stack_promote = true;
+        stack_n = n;
+        stack_bytes = n * esz;
+        if (ctx->stats != NULL) ctx->stats->stack_objects++;
+      }
+    }
+    if (!escapes && !stack_promote && ctx->stats != NULL) {
+      ctx->stats->free_at_exit++;
+    }
+
+    EmitBuf cap_b, init_b;
+    emit_expr_with_pre(ctx, scr->u.call.args[0], ETY_U64, &cap_b);
+    emit_expr_with_pre(ctx, scr->u.call.args[1], ETY_UNKNOWN, &init_b);
+    eb_fmt(ctx->b, "  uint64_t _cap%u = (uint64_t)(", sid);
+    eb_mem(ctx->b, cap_b.buf, cap_b.len);
+    eb_cstr(ctx->b, ");\n  ");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " _iv%u = (", sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_cstr(ctx->b, ")(");
+    eb_mem(ctx->b, init_b.buf, init_b.len);
+    eb_cstr(ctx->b, ");\n");
+    if (stack_promote) {
+      /* memory.md 1 & 8 + S47: 64B cache-aligned stack object in release; per-object heap in Fil-C */
+      eb_cstr(ctx->b, "#if defined(__FILC__)\n  ");
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " *_arr%u = (", sid);
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " *)stigi_rt_try_alloc(_cap%u, sizeof(", sid);
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, "));\n  if (_arr%u != NULL) {\n#else\n  %s",
+             sid, stack_bytes >= 64ULL ? "_Alignas(64) " : "");
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " _sarr%u[%llu];\n  ", sid, (unsigned long long)stack_n);
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " *_arr%u = _sarr%u;\n  {\n#endif\n"
+                     "    for (uint64_t _fi%u = 0; _fi%u < _cap%u; _fi%u++) _arr%u[_fi%u] = _iv%u;\n",
+             sid, sid, sid, sid, sid, sid, sid, sid, sid);
+    } else {
+      eb_cstr(ctx->b, "  ");
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " *_arr%u = (", sid);
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, " *)stigi_rt_try_alloc(_cap%u, sizeof(", sid);
+      eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+      eb_fmt(ctx->b, "));\n  if (_arr%u != NULL) {\n"
+                     "    for (uint64_t _fi%u = 0; _fi%u < _cap%u; _fi%u++) _arr%u[_fi%u] = _iv%u;\n",
+             sid, sid, sid, sid, sid, sid, sid, sid);
+    }
+    free(cap_b.buf);
+    free(init_b.buf);
+
+    if (filled_arm != NULL) {
+      uint32_t saved = ctx->var_count;
+      if (binder.len > 0) {
+        EmitVar *v = emit_push_var_raw(ctx, binder, true);
+        if (v != NULL) {
+          v->is_array = true;
+          v->len_expr = scr->u.call.args[0];
+          eb_cstr(ctx->b, "    ");
+          eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+          eb_cstr(ctx->b, " *");
+          emit_var_cname(ctx->b, v);
+          eb_fmt(ctx->b, " = _arr%u;\n", sid);
+        }
+      }
+      char ptrn[32];
+      (void)snprintf(ptrn, sizeof ptrn, "_arr%u", sid);
+      emit_alloc_arm_with_cleanup(ctx, filled_arm->body, ptrn,
+                                  !escapes && !stack_promote,
+                                  !escapes && stack_promote,
+                                  lhs_var, hint, is_tail, is_void, sid);
+      emit_ctx_pop_vars(ctx, saved);
+    }
+    if (stack_promote) {
+      eb_cstr(ctx->b, "  }\n#if defined(__FILC__)\n  else {\n");
+    } else {
+      eb_cstr(ctx->b, "  } else {\n");
+    }
+    if (fail_arm != NULL) {
+      uint32_t saved = ctx->var_count;
+      if (lhs_var != NULL) emit_assign_to(ctx, fail_arm->body, lhs_var, hint);
+      else emit_stmt_or_ret(ctx, fail_arm->body, is_tail, is_void);
+      emit_ctx_pop_vars(ctx, saved);
+    }
+    if (stack_promote) {
+      eb_cstr(ctx->b, "  }\n#endif\n");
+    } else {
+      eb_cstr(ctx->b, "  }\n");
+    }
+  } else if (akind == 2) {
+    /* Array.tryGrow{region}(oldArr, nextCap, fill) */
+    const StigiExpr *old_len_e = find_array_len_expr(ctx, scr->u.call.args[0], NULL);
+    EmitBuf old_b, cap_b, fill_b;
+    emit_expr_with_pre(ctx, scr->u.call.args[0], ETY_UNKNOWN, &old_b);
+    emit_expr_with_pre(ctx, scr->u.call.args[1], ETY_U64, &cap_b);
+    emit_expr_with_pre(ctx, scr->u.call.args[2], ETY_UNKNOWN, &fill_b);
+    eb_cstr(ctx->b, "  ");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " *_old%u = ", sid);
+    eb_mem(ctx->b, old_b.buf, old_b.len);
+    eb_fmt(ctx->b, ";\n  uint64_t _ncap%u = (uint64_t)(", sid);
+    eb_mem(ctx->b, cap_b.buf, cap_b.len);
+    eb_cstr(ctx->b, ");\n  uint64_t _ocap");
+    eb_fmt(ctx->b, "%u = ", sid);
+    if (old_len_e != NULL) {
+      eb_cstr(ctx->b, "(uint64_t)(");
+      EmitBuf olen_b;
+      emit_expr_with_pre(ctx, old_len_e, ETY_U64, &olen_b);
+      eb_mem(ctx->b, olen_b.buf, olen_b.len);
+      free(olen_b.buf);
+      eb_cstr(ctx->b, ")");
+    } else {
+      eb_cstr(ctx->b, "UINT64_C(0)");
+    }
+    eb_cstr(ctx->b, ";\n  ");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " _fv%u = (", sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_cstr(ctx->b, ")(");
+    eb_mem(ctx->b, fill_b.buf, fill_b.len);
+    eb_cstr(ctx->b, ");\n  ");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " *_new%u = (", sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " *)stigi_rt_try_alloc(_ncap%u, sizeof(", sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, "));\n  if (_new%u != NULL) {\n"
+                   "    uint64_t _cp%u = _ocap%u < _ncap%u ? _ocap%u : _ncap%u;\n"
+                   "    for (uint64_t _gi%u = 0; _gi%u < _cp%u; _gi%u++) _new%u[_gi%u] = _old%u[_gi%u];\n"
+                   "    for (uint64_t _gi%u = _cp%u; _gi%u < _ncap%u; _gi%u++) _new%u[_gi%u] = _fv%u;\n"
+                   "    free(_old%u);\n",
+           sid, sid, sid, sid, sid, sid, sid, sid, sid, sid, sid, sid, sid, sid,
+           sid, sid, sid, sid, sid, sid, sid, sid, sid);
+    free(old_b.buf);
+    free(cap_b.buf);
+    free(fill_b.buf);
+
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      if (str_eq_c(pat->name, "Grown")) {
+        uint32_t saved = ctx->var_count;
+        StigiStr binder = {NULL, 0};
+        if (pat->field_count == 1 && !(pat->fields[0].len == 1 && pat->fields[0].ptr[0] == '_')) {
+          binder = pat->fields[0];
+          EmitVar *v = emit_push_var_raw(ctx, binder, true);
+          if (v != NULL) {
+            v->is_array = true;
+            v->len_expr = scr->u.call.args[1];
+            eb_cstr(ctx->b, "    ");
+            eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+            eb_cstr(ctx->b, " *");
+            emit_var_cname(ctx->b, v);
+            eb_fmt(ctx->b, " = _new%u;\n", sid);
+          }
+        }
+        bool escapes = binder.len > 0 && alloc_binder_escapes(e->u.match_expr.arms[a].body, binder);
+        if (!escapes && ctx->stats != NULL) ctx->stats->free_at_exit++;
+        char ptrn[32];
+        (void)snprintf(ptrn, sizeof ptrn, "_new%u", sid);
+        emit_alloc_arm_with_cleanup(ctx, e->u.match_expr.arms[a].body, ptrn,
+                                    !escapes, false, lhs_var, hint, is_tail, is_void, sid);
+        emit_ctx_pop_vars(ctx, saved);
+        break;
+      }
+    }
+    eb_cstr(ctx->b, "  } else {\n");
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      if (str_eq_c(pat->name, "GrowFailed")) {
+        uint32_t saved = ctx->var_count;
+        if (pat->field_count == 1 && !(pat->fields[0].len == 1 && pat->fields[0].ptr[0] == '_')) {
+          EmitVar *v = emit_push_var_raw(ctx, pat->fields[0], true);
+          if (v != NULL) {
+            v->is_array = true;
+            v->len_expr = old_len_e;
+            eb_cstr(ctx->b, "    ");
+            eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+            eb_cstr(ctx->b, " *");
+            emit_var_cname(ctx->b, v);
+            eb_fmt(ctx->b, " = _old%u;\n", sid);
+          }
+        }
+        if (lhs_var != NULL) emit_assign_to(ctx, e->u.match_expr.arms[a].body, lhs_var, hint);
+        else emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
+        emit_ctx_pop_vars(ctx, saved);
+        break;
+      }
+    }
+    eb_cstr(ctx->b, "  }\n");
+  } else {
+    /* Cell.tryMake{region}(init) */
+    EmitBuf init_b;
+    emit_expr_with_pre(ctx, scr->u.call.args[0], ETY_UNKNOWN, &init_b);
+    eb_cstr(ctx->b, "  ");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " *_cell%u = (", sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, " *)stigi_rt_try_alloc(1U, sizeof(");
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_fmt(ctx->b, "));\n  if (_cell%u != NULL) {\n    *_cell%u = (", sid, sid);
+    eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+    eb_cstr(ctx->b, ")(");
+    eb_mem(ctx->b, init_b.buf, init_b.len);
+    eb_cstr(ctx->b, ");\n");
+    free(init_b.buf);
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      if (str_eq_c(pat->name, "Filled")) {
+        uint32_t saved = ctx->var_count;
+        StigiStr binder = {NULL, 0};
+        if (pat->field_count == 1 && !(pat->fields[0].len == 1 && pat->fields[0].ptr[0] == '_')) {
+          binder = pat->fields[0];
+          EmitVar *v = emit_push_var_raw(ctx, binder, true);
+          if (v != NULL) {
+            v->is_cell = true;
+            eb_cstr(ctx->b, "    ");
+            eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
+            eb_cstr(ctx->b, " *");
+            emit_var_cname(ctx->b, v);
+            eb_fmt(ctx->b, " = _cell%u;\n", sid);
+          }
+        }
+        bool escapes = binder.len > 0 && alloc_binder_escapes(e->u.match_expr.arms[a].body, binder);
+        if (!escapes && ctx->stats != NULL) ctx->stats->free_at_exit++;
+        char ptrn[32];
+        (void)snprintf(ptrn, sizeof ptrn, "_cell%u", sid);
+        emit_alloc_arm_with_cleanup(ctx, e->u.match_expr.arms[a].body, ptrn,
+                                    !escapes, false, lhs_var, hint, is_tail, is_void, sid);
+        emit_ctx_pop_vars(ctx, saved);
+        break;
+      }
+    }
+    eb_cstr(ctx->b, "  } else {\n");
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      if (str_eq_c(pat->name, "FillFailed")) {
+        uint32_t saved = ctx->var_count;
+        if (lhs_var != NULL) emit_assign_to(ctx, e->u.match_expr.arms[a].body, lhs_var, hint);
+        else emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
+        emit_ctx_pop_vars(ctx, saved);
+        break;
+      }
+    }
+    eb_cstr(ctx->b, "  }\n");
+  }
+  free(elem_ct.buf);
+}
+
+/* Unified match emitter supporting alloc results, nullable-ptr enums, tail-tag enums,
+ * standard enums, Bool, and integer match — with ZERO __builtin_unreachable() */
+static void emit_match_core(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var,
+                            EmitScalarTy hint, bool is_tail, bool is_void) {
+  int akind = detect_alloc_scrutinee(e->u.match_expr.scrutinee);
+  if (akind > 0) {
+    emit_alloc_match(ctx, e, akind, lhs_var, hint, is_tail, is_void);
+    if (lhs_var == NULL && is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
+    return;
+  }
+
+  const StigiImageUnit *u = &ctx->img->units[ctx->uidx];
+  int32_t enum_uidx = infer_expr_enum_uidx(ctx, e->u.match_expr.scrutinee);
+  if (enum_uidx < 0 && e->u.match_expr.arm_count > 0 &&
+      e->u.match_expr.arms[0].pat.kind == STIGI_PAT_CTOR) {
+    enum_uidx = find_enum_case_owner_det(ctx->img, ctx->uidx,
+                                         e->u.match_expr.arms[0].pat.name, NULL);
+  }
+
+  if (enum_uidx >= 0) {
+    const StigiDecl *ed = ctx->img->units[enum_uidx].ast->decl;
+    StigiEnumLayoutInfo eli = stigi_enum_layout_info(ctx->img, (uint32_t)enum_uidx, NULL, 0);
+    uint32_t sid = ctx->tmp_id++;
+    EmitBuf scr_buf;
+    emit_expr_with_pre(ctx, e->u.match_expr.scrutinee, ETY_UNKNOWN, &scr_buf);
+    eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
+    eb_cstr(ctx->b, "  ");
+    eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
+    eb_fmt(ctx->b, " _sc%u = ", sid);
+    eb_mem(ctx->b, scr_buf.buf, scr_buf.len);
+    free(scr_buf.buf);
+    eb_cstr(ctx->b, ";\n");
+
+    if (eli.is_nullable_ptr) {
+      /* 1-word nullable-pointer enum: NULL = null_case, non-NULL = ptr_case */
+      const StigiMatchArm *null_arm = NULL;
+      const StigiMatchArm *ptr_arm = NULL;
+      for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+        uint32_t cidx = 0;
+        if (find_case_in_enum(ed, e->u.match_expr.arms[a].pat.name, &cidx)) {
+          if (cidx == eli.null_case) null_arm = &e->u.match_expr.arms[a];
+          else if (cidx == eli.ptr_case) ptr_arm = &e->u.match_expr.arms[a];
+        }
+      }
+      eb_fmt(ctx->b, "  if (_sc%u == NULL) {\n", sid);
+      if (null_arm != NULL) {
+        uint32_t saved = ctx->var_count;
+        if (lhs_var != NULL) emit_assign_to(ctx, null_arm->body, lhs_var, hint);
+        else emit_stmt_or_ret(ctx, null_arm->body, is_tail, is_void);
+        emit_ctx_pop_vars(ctx, saved);
+      }
+      eb_cstr(ctx->b, "  } else {\n");
+      if (ptr_arm != NULL) {
+        uint32_t saved = ctx->var_count;
+        const StigiEnumCase *ec = &ed->u.enum_decl.cases[eli.ptr_case];
+        if (ptr_arm->pat.field_count == 1 && ec->field_count == 1 &&
+            !(ptr_arm->pat.fields[0].len == 1 && ptr_arm->pat.fields[0].ptr[0] == '_')) {
+          EmitVar *v = emit_register_var(ctx, ptr_arm->pat.fields[0], ec->fields[0].type,
+                                         (uint32_t)enum_uidx, false);
+          if (v != NULL) {
+            eb_cstr(ctx->b, "    ");
+            emit_c_type(ctx->b, ctx->img, (uint32_t)enum_uidx, ec->fields[0].type, 0);
+            eb_cstr(ctx->b, " ");
+            emit_var_cname(ctx->b, v);
+            eb_fmt(ctx->b, " = _sc%u;\n", sid);
+          }
+        }
+        if (lhs_var != NULL) emit_assign_to(ctx, ptr_arm->body, lhs_var, hint);
+        else emit_stmt_or_ret(ctx, ptr_arm->body, is_tail, is_void);
+        emit_ctx_pop_vars(ctx, saved);
+      }
+      eb_cstr(ctx->b, "  }\n");
+      if (lhs_var == NULL && is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
+      return;
+    }
+
+    /* Tagged enum: switch on tag with every case and NO default (emitter.md 2).
+     * When is_tail && !is_void && lhs_var == NULL, capture result in zero-initialized local
+     * so there is ZERO __builtin_unreachable() (emitter.md 3) AND zero -Wreturn-type! */
+    char mret_name[32];
+    mret_name[0] = '\0';
+    const char *eff_lhs = lhs_var;
+    bool emit_tail_ret = false;
+    if (lhs_var == NULL && is_tail && !is_void && !ctx->is_tail_loop) {
+      uint32_t rid = ctx->tmp_id++;
+      (void)snprintf(mret_name, sizeof mret_name, "_mr%u", rid);
+      eb_cstr(ctx->b, "  ");
+      if (ctx->ret_ast_type != NULL) {
+        emit_c_type(ctx->b, ctx->img, ctx->ret_type_uidx, ctx->ret_ast_type, 0);
+      } else {
+        emit_scalar_c_type(ctx->b, ctx->ret_scalar);
+      }
+      eb_fmt(ctx->b, " %s = {0};\n", mret_name);
+      eff_lhs = mret_name;
+      emit_tail_ret = true;
+    }
+
+    if (eli.tag_in_tail) {
+      eb_fmt(ctx->b, "  switch (_sc%u._hdr.tag) {\n", sid);
+    } else {
+      eb_fmt(ctx->b, "  switch (_sc%u.tag) {\n", sid);
+    }
+    for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+      const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+      uint32_t cidx = 0;
+      if (!find_case_in_enum(ed, pat->name, &cidx)) continue;
+      const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
+      eb_cstr(ctx->b, "    case ");
+      eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
+      eb_cstr(ctx->b, "_");
+      eb_str(ctx->b, ec->name);
+      eb_cstr(ctx->b, ": {\n");
+      uint32_t saved = ctx->var_count;
+      for (uint32_t f = 0; f < pat->field_count && f < ec->field_count; f++) {
+        if (pat->fields[f].len == 1 && pat->fields[f].ptr[0] == '_') continue;
+        if (ast_type_is_void(ctx->img, (uint32_t)enum_uidx, ec->fields[f].type)) continue;
+        EmitVar *v = emit_register_var(ctx, pat->fields[f], ec->fields[f].type,
+                                       (uint32_t)enum_uidx, false);
+        if (v != NULL) {
+          eb_cstr(ctx->b, "      ");
+          emit_c_type(ctx->b, ctx->img, (uint32_t)enum_uidx, ec->fields[f].type, 0);
+          eb_cstr(ctx->b, " ");
+          emit_var_cname(ctx->b, v);
+          if (eli.tag_in_tail) {
+            eb_fmt(ctx->b, " = _sc%u.", sid);
+          } else {
+            eb_fmt(ctx->b, " = _sc%u.u.", sid);
+          }
+          eb_str(ctx->b, ec->name);
+          eb_cstr(ctx->b, ".");
+          eb_c_ident(ctx->b, ec->fields[f].name);
+          eb_cstr(ctx->b, ";\n");
+        }
+      }
+      if (eff_lhs != NULL) {
+        emit_assign_to(ctx, e->u.match_expr.arms[a].body, eff_lhs,
+                       emit_tail_ret ? ctx->ret_scalar : hint);
+        eb_cstr(ctx->b, "      break;\n");
+      } else {
+        emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
+        if (is_void || !is_tail) eb_cstr(ctx->b, "      break;\n");
+      }
+      emit_ctx_pop_vars(ctx, saved);
+      eb_cstr(ctx->b, "    }\n");
+    }
+    eb_cstr(ctx->b, "  }\n");
+    if (emit_tail_ret) {
+      eb_fmt(ctx->b, "  return %s;\n", mret_name);
+    } else if (lhs_var == NULL && is_tail && is_void && ctx->is_tail_loop) {
+      eb_cstr(ctx->b, "  return;\n");
+    }
+    return;
+  }
+
+  /* Integer or Bool match */
+  EmitScalarTy st = infer_expr_scalar(ctx, e->u.match_expr.scrutinee);
+  if (st == ETY_UNKNOWN) st = ETY_U64;
+  uint32_t sid = ctx->tmp_id++;
+  EmitBuf scr_buf;
+  emit_expr_with_pre(ctx, e->u.match_expr.scrutinee, st, &scr_buf);
+  eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
+  eb_cstr(ctx->b, "  ");
+  emit_scalar_c_type(ctx->b, st);
+  eb_fmt(ctx->b, " _sc%u = ", sid);
+  eb_mem(ctx->b, scr_buf.buf, scr_buf.len);
+  free(scr_buf.buf);
+  eb_cstr(ctx->b, ";\n");
+
+  char mret_name[32];
+  mret_name[0] = '\0';
+  const char *eff_lhs = lhs_var;
+  bool emit_tail_ret = false;
+  if (lhs_var == NULL && is_tail && !is_void && !ctx->is_tail_loop) {
+    uint32_t rid = ctx->tmp_id++;
+    (void)snprintf(mret_name, sizeof mret_name, "_mr%u", rid);
+    eb_cstr(ctx->b, "  ");
+    if (ctx->ret_ast_type != NULL) {
+      emit_c_type(ctx->b, ctx->img, ctx->ret_type_uidx, ctx->ret_ast_type, 0);
+    } else {
+      emit_scalar_c_type(ctx->b, ctx->ret_scalar);
+    }
+    eb_fmt(ctx->b, " %s = {0};\n", mret_name);
+    eff_lhs = mret_name;
+    emit_tail_ret = true;
+  }
+
+  if (st == ETY_BOOL) {
+    eb_fmt(ctx->b, "  switch ((int)_sc%u) {\n", sid);
+  } else {
+    eb_fmt(ctx->b, "  switch (_sc%u) {\n", sid);
+  }
+  for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
+    const StigiPat *pat = &e->u.match_expr.arms[a].pat;
+    uint32_t saved = ctx->var_count;
+    if (pat->kind == STIGI_PAT_BOOL) {
+      eb_fmt(ctx->b, "    case %d: {\n", pat->bool_val ? 1 : 0);
+    } else if (pat->kind == STIGI_PAT_INT) {
+      eb_cstr(ctx->b, "    case ");
+      emit_typed_int_lit(ctx->b, pat->int_val, false, st);
+      eb_cstr(ctx->b, ": {\n");
+    } else {
+      eb_cstr(ctx->b, "    default: {\n");
+      if (pat->kind == STIGI_PAT_VAR && !(pat->name.len == 1 && pat->name.ptr[0] == '_')) {
+        EmitVar *v = emit_push_var_raw(ctx, pat->name, true);
+        if (v != NULL) {
+          v->scalar_ty = st;
+          eb_cstr(ctx->b, "      ");
+          emit_scalar_c_type(ctx->b, st);
+          eb_cstr(ctx->b, " ");
+          emit_var_cname(ctx->b, v);
+          eb_fmt(ctx->b, " = _sc%u;\n", sid);
+        }
+      }
+    }
+    if (eff_lhs != NULL) {
+      emit_assign_to(ctx, e->u.match_expr.arms[a].body, eff_lhs,
+                     emit_tail_ret ? ctx->ret_scalar : hint);
+      eb_cstr(ctx->b, "      break;\n");
+    } else {
+      emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
+      if (is_void || !is_tail) eb_cstr(ctx->b, "      break;\n");
+    }
+    emit_ctx_pop_vars(ctx, saved);
+    eb_cstr(ctx->b, "    }\n");
+  }
+  eb_cstr(ctx->b, "  }\n");
+  if (emit_tail_ret) {
+    eb_fmt(ctx->b, "  return %s;\n", mret_name);
+  } else if (lhs_var == NULL && is_tail && is_void && ctx->is_tail_loop) {
+    eb_cstr(ctx->b, "  return;\n");
+  }
+}
+
+/* Lower value-producing complex expressions into an assignment to lhs_var */
 static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var,
                            EmitScalarTy hint) {
   if (e == NULL) {
@@ -967,15 +2029,16 @@ static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var
         emit_stmt_or_ret(ctx, e->u.block.stmts[i], false, true);
       }
     }
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  }\n");
     return;
   }
   if (e->kind == STIGI_EXPR_HANDLE) {
     uint32_t saved = ctx->var_count;
     eb_cstr(ctx->b, "  {\n");
+    emit_handle_setup(ctx, e);
     emit_assign_to(ctx, e->u.handle_stmt.body, lhs_var, hint);
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  }\n");
     return;
   }
@@ -989,64 +2052,16 @@ static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var
     free(cond_buf.buf);
     uint32_t saved = ctx->var_count;
     emit_assign_to(ctx, e->u.if_expr.then_br, lhs_var, hint);
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  } else {\n");
     emit_assign_to(ctx, e->u.if_expr.else_br, lhs_var, hint);
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  }\n");
     return;
   }
   if (e->kind == STIGI_EXPR_MATCH) {
-    int32_t enum_uidx = infer_expr_enum_uidx(ctx, e->u.match_expr.scrutinee);
-    if (enum_uidx < 0 && e->u.match_expr.arm_count > 0 &&
-        e->u.match_expr.arms[0].pat.kind == STIGI_PAT_CTOR) {
-      enum_uidx = find_enum_case_owner_det(ctx->img, ctx->uidx,
-                                           e->u.match_expr.arms[0].pat.name, NULL);
-    }
-    if (enum_uidx >= 0) {
-      const StigiDecl *ed = ctx->img->units[enum_uidx].ast->decl;
-      uint32_t sid = ctx->tmp_id++;
-      EmitBuf scr_buf;
-      emit_expr_with_pre(ctx, e->u.match_expr.scrutinee, ETY_UNKNOWN, &scr_buf);
-      eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
-      eb_cstr(ctx->b, "  ");
-      eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
-      eb_fmt(ctx->b, " _sc%u = ", sid);
-      eb_mem(ctx->b, scr_buf.buf, scr_buf.len);
-      free(scr_buf.buf);
-      eb_fmt(ctx->b, ";\n  switch (_sc%u.tag) {\n", sid);
-      for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
-        const StigiPat *pat = &e->u.match_expr.arms[a].pat;
-        uint32_t cidx = 0;
-        if (!find_case_in_enum(ed, pat->name, &cidx)) continue;
-        eb_cstr(ctx->b, "    case ");
-        eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
-        eb_cstr(ctx->b, "_");
-        eb_str(ctx->b, pat->name);
-        eb_cstr(ctx->b, ": {\n");
-        const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
-        uint32_t saved = ctx->var_count;
-        for (uint32_t f = 0; f < pat->field_count && f < ec->field_count; f++) {
-          if (pat->fields[f].len == 1 && pat->fields[f].ptr[0] == '_') continue;
-          if (ast_type_is_void(ctx->img, (uint32_t)enum_uidx, ec->fields[f].type)) continue;
-          eb_cstr(ctx->b, "      ");
-          emit_c_type(ctx->b, ctx->img, (uint32_t)enum_uidx, ec->fields[f].type, 0);
-          eb_cstr(ctx->b, " ");
-          eb_str(ctx->b, pat->fields[f]);
-          eb_fmt(ctx->b, " = _sc%u.u.", sid);
-          eb_str(ctx->b, ec->name);
-          eb_cstr(ctx->b, ".");
-          eb_str(ctx->b, ec->fields[f].name);
-          eb_cstr(ctx->b, ";\n");
-          emit_register_var(ctx, pat->fields[f], ec->fields[f].type, (uint32_t)enum_uidx, false);
-        }
-        emit_assign_to(ctx, e->u.match_expr.arms[a].body, lhs_var, hint);
-        ctx->var_count = saved;
-        eb_cstr(ctx->b, "      break;\n    }\n");
-      }
-      eb_cstr(ctx->b, "  }\n");
-      return;
-    }
+    emit_match_core(ctx, e, lhs_var, hint, false, false);
+    return;
   }
   EmitBuf rhs_buf;
   emit_expr_with_pre(ctx, e, hint, &rhs_buf);
@@ -1054,70 +2069,6 @@ static void emit_assign_to(EmitCtx *ctx, const StigiExpr *e, const char *lhs_var
   eb_mem(ctx->b, rhs_buf.buf, rhs_buf.len);
   eb_cstr(ctx->b, ";\n");
   free(rhs_buf.buf);
-}
-
-static void emit_match_stmt(EmitCtx *ctx, const StigiExpr *e, bool is_tail, bool is_void) {
-  const StigiImageUnit *u = &ctx->img->units[ctx->uidx];
-  int32_t enum_uidx = infer_expr_enum_uidx(ctx, e->u.match_expr.scrutinee);
-  if (enum_uidx < 0 && e->u.match_expr.arm_count > 0 &&
-      e->u.match_expr.arms[0].pat.kind == STIGI_PAT_CTOR) {
-    enum_uidx = find_enum_case_owner_det(ctx->img, ctx->uidx,
-                                         e->u.match_expr.arms[0].pat.name, NULL);
-  }
-  if (enum_uidx < 0) return;
-
-  const StigiDecl *ed = ctx->img->units[enum_uidx].ast->decl;
-  uint32_t sid = ctx->tmp_id++;
-  EmitBuf scr_buf;
-  emit_expr_with_pre(ctx, e->u.match_expr.scrutinee, ETY_UNKNOWN, &scr_buf);
-  eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
-  eb_cstr(ctx->b, "  ");
-  eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
-  eb_fmt(ctx->b, " _sc%u = ", sid);
-  eb_mem(ctx->b, scr_buf.buf, scr_buf.len);
-  free(scr_buf.buf);
-  eb_fmt(ctx->b, ";\n  switch (_sc%u.tag) {\n", sid);
-
-  /* Every enum case, NO default (emitter.md 2), lookup strictly within resolved ed (Defect 1) */
-  for (uint32_t a = 0; a < e->u.match_expr.arm_count; a++) {
-    const StigiPat *pat = &e->u.match_expr.arms[a].pat;
-    uint32_t cidx = 0;
-    if (!find_case_in_enum(ed, pat->name, &cidx)) continue;
-    eb_cstr(ctx->b, "    case ");
-    eb_mangle_name(ctx->b, ctx->img->units[enum_uidx].name, ctx->img->units[enum_uidx].name_len);
-    eb_cstr(ctx->b, "_");
-    eb_str(ctx->b, pat->name);
-    eb_cstr(ctx->b, ": {\n");
-    const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
-    uint32_t saved = ctx->var_count;
-    for (uint32_t f = 0; f < pat->field_count && f < ec->field_count; f++) {
-      if (pat->fields[f].len == 1 && pat->fields[f].ptr[0] == '_') continue;
-      if (ast_type_is_void(ctx->img, (uint32_t)enum_uidx, ec->fields[f].type)) continue;
-      eb_cstr(ctx->b, "      ");
-      emit_c_type(ctx->b, ctx->img, (uint32_t)enum_uidx, ec->fields[f].type, 0);
-      eb_cstr(ctx->b, " ");
-      eb_str(ctx->b, pat->fields[f]);
-      eb_fmt(ctx->b, " = _sc%u.u.", sid);
-      eb_str(ctx->b, ec->name);
-      eb_cstr(ctx->b, ".");
-      eb_str(ctx->b, ec->fields[f].name);
-      eb_cstr(ctx->b, ";\n");
-      emit_register_var(ctx, pat->fields[f], ec->fields[f].type, (uint32_t)enum_uidx, false);
-    }
-    emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
-    ctx->var_count = saved;
-    /* Defect 4: always break on void / non-tail match arms to prevent fallthrough */
-    if (is_void || !is_tail) {
-      eb_cstr(ctx->b, "      break;\n");
-    }
-    eb_cstr(ctx->b, "    }\n");
-  }
-  eb_cstr(ctx->b, "  }\n");
-  if (is_tail && !is_void) {
-    eb_cstr(ctx->b, "  __builtin_unreachable();\n");
-  } else if (is_tail && is_void && ctx->is_tail_loop) {
-    eb_cstr(ctx->b, "  return;\n");
-  }
 }
 
 static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, bool is_void) {
@@ -1147,7 +2098,6 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     }
   }
 
-  /* Defect 4: save/restore var_count across block scope */
   if (e->kind == STIGI_EXPR_BLOCK) {
     uint32_t saved = ctx->var_count;
     eb_cstr(ctx->b, "  {\n");
@@ -1159,28 +2109,30 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
         emit_stmt_or_ret(ctx, e->u.block.stmts[i], is_tail && last, last ? is_void : true);
       }
     }
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  }\n");
     return;
   }
 
-  /* Defect 4: handle HANDLE blocks with lexical scope save/restore */
   if (e->kind == STIGI_EXPR_HANDLE) {
-    uint32_t saved = ctx->var_count;
-    eb_cstr(ctx->b, "  {\n");
     if (e->u.handle_stmt.body != NULL) {
+      uint32_t saved = ctx->var_count;
+      eb_cstr(ctx->b, "  {\n");
+      emit_handle_setup(ctx, e);
       emit_stmt_or_ret(ctx, e->u.handle_stmt.body, is_tail, is_void);
-    } else if (is_tail && is_void && ctx->is_tail_loop) {
-      eb_cstr(ctx->b, "  return;\n");
+      emit_ctx_pop_vars(ctx, saved);
+      eb_cstr(ctx->b, "  }\n");
+    } else {
+      /* Statement-form handle stays in scope for rest of enclosing block */
+      emit_handle_setup(ctx, e);
+      if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
     }
-    ctx->var_count = saved;
-    eb_cstr(ctx->b, "  }\n");
     return;
   }
 
-  /* Tail self-call -> update params left-to-right & continue (emitter.md 2) */
+  /* Tail self-call -> update original params left-to-right & continue (emitter.md 2) */
   if (is_tail && ctx->is_tail_loop && is_self_tail_call(ctx, e)) {
-    const StigiDefHead *h = &ctx->cur_def->u.def_decl.head;
+    const StigiDefHead *h = ctx->cur_head;
     eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
     eb_cstr(ctx->b, "  {\n");
     uint32_t n = e->u.call.arg_count < h->param_count ? e->u.call.arg_count : h->param_count;
@@ -1197,14 +2149,17 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     }
     for (uint32_t i = 0; i < n; i++) {
       eb_cstr(ctx->b, "    ");
-      eb_str(ctx->b, h->params[i].name);
+      if (i < ctx->param_cname_count && ctx->param_cnames[i] != NULL) {
+        eb_cstr(ctx->b, ctx->param_cnames[i]);
+      } else {
+        eb_c_ident(ctx->b, h->params[i].name);
+      }
       eb_fmt(ctx->b, " = _t%u;\n", i);
     }
     eb_cstr(ctx->b, "    continue;\n  }\n");
     return;
   }
 
-  /* Handle IF in both tail and statement positions (Defect 4) */
   if (e->kind == STIGI_EXPR_IF) {
     EmitBuf cond_buf;
     emit_expr_with_pre(ctx, e->u.if_expr.cond, ETY_BOOL, &cond_buf);
@@ -1215,11 +2170,11 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     free(cond_buf.buf);
     uint32_t saved = ctx->var_count;
     emit_stmt_or_ret(ctx, e->u.if_expr.then_br, is_tail, is_void);
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     if (e->u.if_expr.else_br != NULL) {
       eb_cstr(ctx->b, "  } else {\n");
       emit_stmt_or_ret(ctx, e->u.if_expr.else_br, is_tail, is_void);
-      ctx->var_count = saved;
+      emit_ctx_pop_vars(ctx, saved);
       eb_cstr(ctx->b, "  }\n");
     } else if (is_tail && is_void && ctx->is_tail_loop) {
       eb_cstr(ctx->b, "  } else {\n    return;\n  }\n");
@@ -1229,104 +2184,203 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     return;
   }
 
-  /* Handle MATCH in both tail and non-tail statement positions (Defect 4) */
   if (e->kind == STIGI_EXPR_MATCH) {
-    emit_match_stmt(ctx, e, is_tail, is_void);
+    emit_match_core(ctx, e, NULL, ETY_UNKNOWN, is_tail, is_void);
     return;
   }
 
   eb_line_dir(ctx->b, e->span.line, u->name, u->name_len);
   if (e->kind == STIGI_EXPR_VAL) {
-    if (ast_type_is_void(ctx->img, ctx->uidx, e->u.val_stmt.type)) {
+    if (e->u.val_stmt.type != NULL && ast_type_is_void(ctx->img, ctx->uidx, e->u.val_stmt.type)) {
       emit_stmt_or_ret(ctx, e->u.val_stmt.init, false, true);
-      if (ast_type_is_never(ctx->img, ctx->uidx, e->u.val_stmt.type)) {
-        eb_cstr(ctx->b, "  __builtin_unreachable();\n");
-      }
       if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
       return;
     }
-    EmitScalarTy vhint = ast_type_to_scalar(ctx->img, ctx->uidx, e->u.val_stmt.type, 0);
+    EmitScalarTy vhint = e->u.val_stmt.type != NULL
+                             ? ast_type_to_scalar(ctx->img, ctx->uidx, e->u.val_stmt.type, 0)
+                             : infer_expr_scalar(ctx, e->u.val_stmt.init);
+    EmitBuf ctype_b;
+    memset(&ctype_b, 0, sizeof ctype_b);
+    if (e->u.val_stmt.type != NULL) {
+      emit_c_type(&ctype_b, ctx->img, ctx->uidx, e->u.val_stmt.type, 0);
+    } else {
+      (void)emit_inferred_expr_c_type(&ctype_b, ctx, e->u.val_stmt.init, vhint);
+    }
+
+    if (e->u.val_stmt.pat.kind == STIGI_PAT_CTOR) {
+      /* Single-case enum destructuring: `val Pair(a, b) = expr` */
+      uint32_t cidx = 0;
+      int32_t eidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
+      if (eidx < 0) eidx = find_enum_case_owner_det(ctx->img, ctx->uidx, e->u.val_stmt.pat.name, &cidx);
+      else (void)find_case_in_enum(ctx->img->units[eidx].ast->decl, e->u.val_stmt.pat.name, &cidx);
+      uint32_t tid = ctx->tmp_id++;
+      char tname[32];
+      (void)snprintf(tname, sizeof tname, "_ds%u", tid);
+      eb_cstr(ctx->b, "  ");
+      eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+      eb_fmt(ctx->b, " %s;\n", tname);
+      emit_assign_to(ctx, e->u.val_stmt.init, tname, ETY_UNKNOWN);
+      if (eidx >= 0) {
+        const StigiDecl *ed = ctx->img->units[eidx].ast->decl;
+        const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
+        StigiEnumLayoutInfo eli = stigi_enum_layout_info(ctx->img, (uint32_t)eidx, NULL, 0);
+        for (uint32_t f = 0; f < e->u.val_stmt.pat.field_count && f < ec->field_count; f++) {
+          StigiStr fn = e->u.val_stmt.pat.fields[f];
+          if (fn.len == 1 && fn.ptr[0] == '_') continue;
+          if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
+          EmitVar *v = emit_register_var(ctx, fn, ec->fields[f].type, (uint32_t)eidx, false);
+          if (v != NULL) {
+            eb_cstr(ctx->b, "  const ");
+            emit_c_type(ctx->b, ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
+            eb_cstr(ctx->b, " ");
+            emit_var_cname(ctx->b, v);
+            if (eli.is_nullable_ptr) {
+              eb_fmt(ctx->b, " = %s;\n", tname);
+            } else if (eli.tag_in_tail) {
+              eb_fmt(ctx->b, " = %s.", tname);
+              eb_str(ctx->b, ec->name);
+              eb_cstr(ctx->b, ".");
+              eb_c_ident(ctx->b, ec->fields[f].name);
+              eb_cstr(ctx->b, ";\n");
+            } else {
+              eb_fmt(ctx->b, " = %s.u.", tname);
+              eb_str(ctx->b, ec->name);
+              eb_cstr(ctx->b, ".");
+              eb_c_ident(ctx->b, ec->fields[f].name);
+              eb_cstr(ctx->b, ";\n");
+            }
+          }
+        }
+      }
+      free(ctype_b.buf);
+      if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
+      return;
+    }
+
     if (expr_is_complex_stmt(e->u.val_stmt.init)) {
       uint32_t tid = ctx->tmp_id++;
       char tname[32];
       (void)snprintf(tname, sizeof tname, "_v%u", tid);
       eb_cstr(ctx->b, "  ");
-      emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.val_stmt.type, 0);
+      eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
       eb_fmt(ctx->b, " %s;\n", tname);
       emit_assign_to(ctx, e->u.val_stmt.init, tname, vhint);
-      eb_cstr(ctx->b, "  const ");
-      emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.val_stmt.type, 0);
-      eb_cstr(ctx->b, " ");
-      eb_str(ctx->b, e->u.val_stmt.pat.name);
-      eb_fmt(ctx->b, " = %s;\n", tname);
+      EmitVar *v = emit_register_var(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.type,
+                                     ctx->uidx, false);
+      if (v != NULL) {
+        if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
+        if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
+        eb_cstr(ctx->b, "  const ");
+        eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+        eb_cstr(ctx->b, " ");
+        emit_var_cname(ctx->b, v);
+        eb_fmt(ctx->b, " = %s;\n", tname);
+      }
     } else {
       EmitBuf init_buf;
       emit_expr_with_pre(ctx, e->u.val_stmt.init, vhint, &init_buf);
-      eb_cstr(ctx->b, "  const ");
-      emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.val_stmt.type, 0);
-      eb_cstr(ctx->b, " ");
-      eb_str(ctx->b, e->u.val_stmt.pat.name);
-      eb_cstr(ctx->b, " = ");
-      eb_mem(ctx->b, init_buf.buf, init_buf.len);
-      eb_cstr(ctx->b, ";\n");
+      EmitVar *v = emit_register_var(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.type,
+                                     ctx->uidx, false);
+      if (v != NULL) {
+        if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
+        if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
+        eb_cstr(ctx->b, "  const ");
+        eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+        eb_cstr(ctx->b, " ");
+        emit_var_cname(ctx->b, v);
+        eb_cstr(ctx->b, " = ");
+        eb_mem(ctx->b, init_buf.buf, init_buf.len);
+        eb_cstr(ctx->b, ";\n");
+      }
       free(init_buf.buf);
     }
-    emit_register_var(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.type, ctx->uidx, false);
+    free(ctype_b.buf);
     if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
     return;
   }
+
   if (e->kind == STIGI_EXPR_VAR) {
-    if (ast_type_is_void(ctx->img, ctx->uidx, e->u.var_stmt.type)) {
+    if (e->u.var_stmt.type != NULL && ast_type_is_void(ctx->img, ctx->uidx, e->u.var_stmt.type)) {
       emit_stmt_or_ret(ctx, e->u.var_stmt.init, false, true);
       if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
       return;
     }
-    EmitScalarTy vhint = ast_type_to_scalar(ctx->img, ctx->uidx, e->u.var_stmt.type, 0);
+    EmitScalarTy vhint = e->u.var_stmt.type != NULL
+                             ? ast_type_to_scalar(ctx->img, ctx->uidx, e->u.var_stmt.type, 0)
+                             : infer_expr_scalar(ctx, e->u.var_stmt.init);
+    EmitBuf ctype_b;
+    memset(&ctype_b, 0, sizeof ctype_b);
+    if (e->u.var_stmt.type != NULL) {
+      emit_c_type(&ctype_b, ctx->img, ctx->uidx, e->u.var_stmt.type, 0);
+    } else {
+      (void)emit_inferred_expr_c_type(&ctype_b, ctx, e->u.var_stmt.init, vhint);
+    }
     if (expr_is_complex_stmt(e->u.var_stmt.init)) {
-      char vname[128];
-      (void)snprintf(vname, sizeof vname, "%.*s", (int)e->u.var_stmt.name.len,
-                     e->u.var_stmt.name.ptr);
+      uint32_t tid = ctx->tmp_id++;
+      char tname[32];
+      (void)snprintf(tname, sizeof tname, "_v%u", tid);
       eb_cstr(ctx->b, "  ");
-      emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.var_stmt.type, 0);
-      eb_fmt(ctx->b, " %s;\n", vname);
-      emit_assign_to(ctx, e->u.var_stmt.init, vname, vhint);
+      eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+      eb_fmt(ctx->b, " %s;\n", tname);
+      emit_assign_to(ctx, e->u.var_stmt.init, tname, vhint);
+      EmitVar *v = emit_register_var(ctx, e->u.var_stmt.name, e->u.var_stmt.type,
+                                     ctx->uidx, false);
+      if (v != NULL) {
+        if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
+        if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.var_stmt.init);
+        eb_cstr(ctx->b, "  ");
+        eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+        eb_cstr(ctx->b, " ");
+        emit_var_cname(ctx->b, v);
+        eb_fmt(ctx->b, " = %s;\n", tname);
+      }
     } else {
       EmitBuf init_buf;
       emit_expr_with_pre(ctx, e->u.var_stmt.init, vhint, &init_buf);
-      eb_cstr(ctx->b, "  ");
-      emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.var_stmt.type, 0);
-      eb_cstr(ctx->b, " ");
-      eb_str(ctx->b, e->u.var_stmt.name);
-      eb_cstr(ctx->b, " = ");
-      eb_mem(ctx->b, init_buf.buf, init_buf.len);
-      eb_cstr(ctx->b, ";\n");
+      EmitVar *v = emit_register_var(ctx, e->u.var_stmt.name, e->u.var_stmt.type,
+                                     ctx->uidx, false);
+      if (v != NULL) {
+        if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
+        if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.var_stmt.init);
+        eb_cstr(ctx->b, "  ");
+        eb_mem(ctx->b, ctype_b.buf, ctype_b.len);
+        eb_cstr(ctx->b, " ");
+        emit_var_cname(ctx->b, v);
+        eb_cstr(ctx->b, " = ");
+        eb_mem(ctx->b, init_buf.buf, init_buf.len);
+        eb_cstr(ctx->b, ";\n");
+      }
       free(init_buf.buf);
     }
-    emit_register_var(ctx, e->u.var_stmt.name, e->u.var_stmt.type, ctx->uidx, false);
+    free(ctype_b.buf);
     if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
     return;
   }
+
   if (e->kind == STIGI_EXPR_ASSIGN) {
     const EmitVar *av = emit_find_var(ctx, e->u.assign_stmt.name);
     EmitScalarTy vhint = av != NULL ? av->scalar_ty : ETY_UNKNOWN;
+    EmitBuf lhs_b;
+    memset(&lhs_b, 0, sizeof lhs_b);
+    if (av != NULL) emit_var_cname(&lhs_b, av);
+    else eb_c_ident(&lhs_b, e->u.assign_stmt.name);
     if (expr_is_complex_stmt(e->u.assign_stmt.value)) {
-      char vname[128];
-      (void)snprintf(vname, sizeof vname, "%.*s", (int)e->u.assign_stmt.name.len,
-                     e->u.assign_stmt.name.ptr);
-      emit_assign_to(ctx, e->u.assign_stmt.value, vname, vhint);
+      emit_assign_to(ctx, e->u.assign_stmt.value, lhs_b.buf != NULL ? lhs_b.buf : "", vhint);
     } else {
       EmitBuf val_buf;
       emit_expr_with_pre(ctx, e->u.assign_stmt.value, vhint, &val_buf);
       eb_cstr(ctx->b, "  ");
-      eb_str(ctx->b, e->u.assign_stmt.name);
+      eb_mem(ctx->b, lhs_b.buf, lhs_b.len);
       eb_cstr(ctx->b, " = ");
       eb_mem(ctx->b, val_buf.buf, val_buf.len);
       eb_cstr(ctx->b, ";\n");
       free(val_buf.buf);
     }
+    free(lhs_b.buf);
     if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
     return;
   }
+
   if (e->kind == STIGI_EXPR_WHILE) {
     EmitBuf cpre, cbuf;
     memset(&cpre, 0, sizeof cpre);
@@ -1353,13 +2407,29 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     free(cbuf.buf);
     uint32_t saved = ctx->var_count;
     emit_stmt_or_ret(ctx, e->u.while_expr.body, false, true);
-    ctx->var_count = saved;
+    emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "  }\n");
     if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
     return;
   }
-  /* Defect 6 & 7: mask tainted INDEX_WRITE through Stigi_mask_index using Datalog maskIndex */
+
   if (e->kind == STIGI_EXPR_INDEX_WRITE) {
+    /* Cell write `c(0) := v` */
+    if (e->u.index_expr.target->kind == STIGI_EXPR_LOCAL) {
+      const EmitVar *cv = emit_find_var(ctx, e->u.index_expr.target->u.ident.name);
+      if (cv != NULL && cv->is_cell) {
+        EmitBuf val_buf;
+        emit_expr_with_pre(ctx, e->u.index_expr.value, cv->elem_scalar_ty, &val_buf);
+        eb_cstr(ctx->b, "  *(");
+        emit_var_cname(ctx->b, cv);
+        eb_cstr(ctx->b, ") = ");
+        eb_mem(ctx->b, val_buf.buf, val_buf.len);
+        eb_cstr(ctx->b, ";\n");
+        free(val_buf.buf);
+        if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
+        return;
+      }
+    }
     EmitScalarTy elem_ty = ETY_UNKNOWN;
     const StigiExpr *len_expr = find_array_len_expr(ctx, e->u.index_expr.target, &elem_ty);
     EmitBuf tgt_buf, idx_buf, val_buf;
@@ -1367,25 +2437,36 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     emit_expr_with_pre(ctx, e->u.index_expr.index, ETY_U64, &idx_buf);
     emit_expr_with_pre(ctx, e->u.index_expr.value, elem_ty, &val_buf);
     bool do_mask = ctx_next_access_masked(ctx);
+    EmitBuf len_buf;
+    memset(&len_buf, 0, sizeof len_buf);
+    if (do_mask) {
+      if (len_expr == NULL) {
+        ctx->fail_closed = true;
+        (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg,
+                       "cannot emit required Spectre mask: missing array length expression in '%s'",
+                       u->name);
+      } else {
+        /* Flush any pre-hoist BEFORE opening the write statement */
+        emit_expr_with_pre(ctx, len_expr, ETY_U64, &len_buf);
+      }
+    }
     eb_cstr(ctx->b, "  ");
     eb_mem(ctx->b, tgt_buf.buf, tgt_buf.len);
     eb_cstr(ctx->b, "[");
     if (do_mask && len_expr != NULL) {
-      EmitBuf len_buf;
-      emit_expr_with_pre(ctx, len_expr, ETY_U64, &len_buf);
       ctx->stats->spectre_masks++;
       eb_cstr(ctx->b, "Stigi_mask_index((uint64_t)(");
       eb_mem(ctx->b, idx_buf.buf, idx_buf.len);
       eb_cstr(ctx->b, "), (uint64_t)(");
       eb_mem(ctx->b, len_buf.buf, len_buf.len);
       eb_cstr(ctx->b, "))");
-      free(len_buf.buf);
     } else {
       eb_mem(ctx->b, idx_buf.buf, idx_buf.len);
     }
     eb_cstr(ctx->b, "] = ");
     eb_mem(ctx->b, val_buf.buf, val_buf.len);
     eb_cstr(ctx->b, ";\n");
+    free(len_buf.buf);
     free(tgt_buf.buf);
     free(idx_buf.buf);
     free(val_buf.buf);
@@ -1405,7 +2486,8 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
     if (e->kind != STIGI_EXPR_LIT_UNIT) {
       EmitBuf expr_buf;
       emit_expr_with_pre(ctx, e, ETY_UNKNOWN, &expr_buf);
-      if (infer_expr_scalar(ctx, e) == ETY_UNIT || infer_expr_scalar(ctx, e) == ETY_NEVER) {
+      EmitScalarTy es = infer_expr_scalar(ctx, e);
+      if (es == ETY_UNIT || es == ETY_NEVER) {
         eb_cstr(ctx->b, "  ");
         eb_mem(ctx->b, expr_buf.buf, expr_buf.len);
         eb_cstr(ctx->b, ";\n");
@@ -1416,15 +2498,124 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       }
       free(expr_buf.buf);
     }
-    /* Defect 4: void tail-loop base case MUST return; (never return expr;) */
     if (is_tail && is_void && ctx->is_tail_loop) {
       eb_cstr(ctx->b, "  return;\n");
     }
   }
 }
 
+/* Helper: emit enum constructor expression for all 4 layout representations */
+static void emit_enum_ctor_expr(EmitCtx *ctx, int32_t eidx, uint32_t cidx, const StigiExpr *call_e) {
+  const StigiImageUnit *eu = &ctx->img->units[eidx];
+  const StigiDecl *ed = eu->ast->decl;
+  const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
+  StigiEnumLayoutInfo eli = stigi_enum_layout_info(ctx->img, (uint32_t)eidx, NULL, 0);
+
+  if (eli.is_nullable_ptr) {
+    if (cidx == eli.null_case) {
+      eb_cstr(ctx->b, "((");
+      eb_mangle_name(ctx->b, eu->name, eu->name_len);
+      eb_cstr(ctx->b, ")0)");
+    } else {
+      eb_cstr(ctx->b, "((");
+      eb_mangle_name(ctx->b, eu->name, eu->name_len);
+      eb_cstr(ctx->b, ")(");
+      if (call_e != NULL && call_e->u.call.arg_count >= 1) {
+        emit_expr_typed(ctx, call_e->u.call.args[0], ETY_UNKNOWN);
+      } else {
+        eb_cstr(ctx->b, "0");
+      }
+      eb_cstr(ctx->b, "))");
+    }
+    return;
+  }
+
+  uint32_t argc = call_e != NULL ? call_e->u.call.arg_count : 0U;
+  uint32_t nfields = ec->field_count < argc ? ec->field_count : argc;
+  uint32_t *tids = NULL;
+  bool hoisted = (ctx->pre != NULL && nfields >= 2U);
+  if (hoisted) {
+    tids = malloc((size_t)nfields * sizeof *tids);
+    if (tids == NULL) {
+      ctx->b->oom = true;
+      hoisted = false;
+    } else {
+      for (uint32_t f = 0; f < nfields; f++) {
+        EmitScalarTy fh = ast_type_to_scalar(ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
+        tids[f] = hoist_arg(ctx, call_e->u.call.args[f], ec->fields[f].type, (uint32_t)eidx, fh);
+      }
+    }
+  }
+
+  eb_cstr(ctx->b, "((");
+  eb_mangle_name(ctx->b, eu->name, eu->name_len);
+  eb_cstr(ctx->b, "){ ");
+  if (eli.tag_in_tail) {
+    if (nfields == 0) {
+      eb_cstr(ctx->b, "._hdr = { .tag = ");
+      eb_mangle_name(ctx->b, eu->name, eu->name_len);
+      eb_cstr(ctx->b, "_");
+      eb_str(ctx->b, ec->name);
+      eb_cstr(ctx->b, " }");
+    } else {
+      eb_cstr(ctx->b, ".");
+      eb_str(ctx->b, ec->name);
+      eb_cstr(ctx->b, " = { ");
+      for (uint32_t f = 0; f < nfields; f++) {
+        if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
+        eb_cstr(ctx->b, ".");
+        eb_c_ident(ctx->b, ec->fields[f].name);
+        eb_cstr(ctx->b, " = ");
+        if (hoisted) {
+          eb_fmt(ctx->b, "_a%u", tids[f]);
+        } else {
+          EmitScalarTy fh = ast_type_to_scalar(ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
+          emit_expr_typed(ctx, call_e->u.call.args[f], fh);
+        }
+        eb_cstr(ctx->b, ", ");
+      }
+      eb_cstr(ctx->b, ".tag = ");
+      eb_mangle_name(ctx->b, eu->name, eu->name_len);
+      eb_cstr(ctx->b, "_");
+      eb_str(ctx->b, ec->name);
+      eb_cstr(ctx->b, " }");
+    }
+  } else {
+    if (nfields > 0 && !eli.is_tag_only) {
+      eb_cstr(ctx->b, ".u = { .");
+      eb_str(ctx->b, ec->name);
+      eb_cstr(ctx->b, " = { ");
+      bool first_f = true;
+      for (uint32_t f = 0; f < nfields; f++) {
+        if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
+        if (!first_f) eb_cstr(ctx->b, ", ");
+        first_f = false;
+        eb_cstr(ctx->b, ".");
+        eb_c_ident(ctx->b, ec->fields[f].name);
+        eb_cstr(ctx->b, " = ");
+        if (hoisted) {
+          eb_fmt(ctx->b, "_a%u", tids[f]);
+        } else {
+          EmitScalarTy fh = ast_type_to_scalar(ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
+          emit_expr_typed(ctx, call_e->u.call.args[f], fh);
+        }
+      }
+      eb_cstr(ctx->b, " } }, ");
+    }
+    eb_cstr(ctx->b, ".tag = ");
+    eb_mangle_name(ctx->b, eu->name, eu->name_len);
+    eb_cstr(ctx->b, "_");
+    eb_str(ctx->b, ec->name);
+  }
+  eb_cstr(ctx->b, " })");
+  free(tids);
+}
+
 static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint) {
-  if (e == NULL) { eb_cstr(ctx->b, "UINT64_C(0)"); return; }
+  if (e == NULL) {
+    eb_cstr(ctx->b, "UINT64_C(0)");
+    return;
+  }
   switch (e->kind) {
     case STIGI_EXPR_LIT_INT:
       emit_typed_int_lit(ctx->b, e->u.lit_int.value, false, hint);
@@ -1445,34 +2636,32 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       break;
     case STIGI_EXPR_LOCAL:
     case STIGI_EXPR_GLOBAL: {
-      if (emit_find_var(ctx, e->u.ident.name) != NULL) {
-        eb_str(ctx->b, e->u.ident.name);
+      const EmitVar *lv = emit_find_var(ctx, e->u.ident.name);
+      if (lv != NULL) {
+        emit_var_cname(ctx->b, lv);
         break;
       }
       int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->uidx,
                                              e->u.ident.name.ptr, e->u.ident.name.len);
       if (tgt >= 0) {
+        const StigiDecl *td = ctx->img->units[tgt].ast->decl;
+        if (td->kind == STIGI_DECL_EXTERN && td->u.extern_decl.is_val) {
+          eb_str(ctx->b, extern_c_sym(td->name));
+          break;
+        }
         eb_mangle_name(ctx->b, ctx->img->units[tgt].name, ctx->img->units[tgt].name_len);
         break;
       }
-      /* Nullary enum constructor: deterministic lookup (Defect 1) */
       uint32_t cidx = 0;
       int32_t eidx = find_enum_case_owner_det(ctx->img, ctx->uidx, e->u.ident.name, &cidx);
       if (eidx >= 0) {
-        eb_cstr(ctx->b, "((");
-        eb_mangle_name(ctx->b, ctx->img->units[eidx].name, ctx->img->units[eidx].name_len);
-        eb_cstr(ctx->b, "){ .tag = ");
-        eb_mangle_name(ctx->b, ctx->img->units[eidx].name, ctx->img->units[eidx].name_len);
-        eb_cstr(ctx->b, "_");
-        eb_str(ctx->b, e->u.ident.name);
-        eb_cstr(ctx->b, " })");
+        emit_enum_ctor_expr(ctx, eidx, cidx, NULL);
         break;
       }
-      eb_str(ctx->b, e->u.ident.name);
+      eb_c_ident(ctx->b, e->u.ident.name);
       break;
     }
     case STIGI_EXPR_UNOP:
-      /* Defect 2: typed negative integer literal (-1 for I32/I64, never -1ULL) */
       if (e->u.unop.op == STIGI_OP_NEG && e->u.unop.operand != NULL &&
           e->u.unop.operand->kind == STIGI_EXPR_LIT_INT) {
         EmitScalarTy nh = (hint == ETY_UNKNOWN) ? ETY_I64 : hint;
@@ -1486,6 +2675,22 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       eb_cstr(ctx->b, ")");
       break;
     case STIGI_EXPR_BINOP: {
+      /* Enum equality `==` / `!=` uses generated `Stigi_Enum_eq` helper */
+      if (e->u.binop.op == STIGI_OP_EQ || e->u.binop.op == STIGI_OP_NE) {
+        int32_t euidx = infer_expr_enum_uidx(ctx, e->u.binop.lhs);
+        if (euidx < 0) euidx = infer_expr_enum_uidx(ctx, e->u.binop.rhs);
+        if (euidx >= 0) {
+          if (e->u.binop.op == STIGI_OP_NE) eb_cstr(ctx->b, "(!");
+          eb_mangle_name(ctx->b, ctx->img->units[euidx].name, ctx->img->units[euidx].name_len);
+          eb_cstr(ctx->b, "_eq(");
+          emit_expr_typed(ctx, e->u.binop.lhs, ETY_UNKNOWN);
+          eb_cstr(ctx->b, ", ");
+          emit_expr_typed(ctx, e->u.binop.rhs, ETY_UNKNOWN);
+          eb_cstr(ctx->b, ")");
+          if (e->u.binop.op == STIGI_OP_NE) eb_cstr(ctx->b, ")");
+          break;
+        }
+      }
       EmitScalarTy op_hint = hint;
       if (e->u.binop.op == STIGI_OP_AND || e->u.binop.op == STIGI_OP_OR) {
         op_hint = ETY_BOOL;
@@ -1499,7 +2704,6 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       eb_cstr(ctx->b, "(");
       emit_expr_typed(ctx, e->u.binop.lhs, op_hint);
       eb_fmt(ctx->b, " %s ", c_op_str(e->u.binop.op));
-      /* Do not hoist side-effecting calls out of short-circuit RHS of && / || */
       if (e->u.binop.op == STIGI_OP_AND || e->u.binop.op == STIGI_OP_OR) {
         EmitBuf *saved_pre = ctx->pre;
         ctx->pre = NULL;
@@ -1512,6 +2716,23 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       break;
     }
     case STIGI_EXPR_IF: {
+      if (ctx->pre != NULL && expr_is_complex_stmt(e)) {
+        uint32_t tid = ctx->tmp_id++;
+        char ename[32];
+        (void)snprintf(ename, sizeof ename, "_e%u", tid);
+        EmitBuf *saved_b = ctx->b;
+        EmitBuf *saved_pre = ctx->pre;
+        ctx->b = saved_pre;
+        ctx->pre = NULL;
+        eb_cstr(ctx->b, "  ");
+        (void)emit_inferred_expr_c_type(ctx->b, ctx, e, hint);
+        eb_fmt(ctx->b, " %s;\n", ename);
+        emit_assign_to(ctx, e, ename, hint);
+        ctx->b = saved_b;
+        ctx->pre = saved_pre;
+        eb_cstr(ctx->b, ename);
+        break;
+      }
       EmitBuf *saved_pre = ctx->pre;
       eb_cstr(ctx->b, "(");
       emit_expr_typed(ctx, e->u.if_expr.cond, ETY_BOOL);
@@ -1529,6 +2750,15 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       else eb_cstr(ctx->b, "UINT64_C(0)");
       break;
     case STIGI_EXPR_INDEX_READ: {
+      if (e->u.index_expr.target->kind == STIGI_EXPR_LOCAL) {
+        const EmitVar *cv = emit_find_var(ctx, e->u.index_expr.target->u.ident.name);
+        if (cv != NULL && cv->is_cell) {
+          eb_cstr(ctx->b, "(*(");
+          emit_var_cname(ctx->b, cv);
+          eb_cstr(ctx->b, "))");
+          break;
+        }
+      }
       const StigiExpr *len_expr = find_array_len_expr(ctx, e->u.index_expr.target, NULL);
       EmitBuf idx_buf;
       memset(&idx_buf, 0, sizeof idx_buf);
@@ -1537,6 +2767,12 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       emit_expr_typed(ctx, e->u.index_expr.index, ETY_U64);
       ctx->b = saved_b;
       bool do_mask = ctx_next_access_masked(ctx);
+      if (do_mask && len_expr == NULL) {
+        ctx->fail_closed = true;
+        (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg,
+                       "cannot emit required Spectre mask: missing array length expression in '%s'",
+                       ctx->img->units[ctx->uidx].name);
+      }
       emit_expr_typed(ctx, e->u.index_expr.target, ETY_UNKNOWN);
       eb_cstr(ctx->b, "[");
       if (do_mask && len_expr != NULL) {
@@ -1554,9 +2790,25 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       break;
     }
     case STIGI_EXPR_CALL: {
-      /* Array element read: arr(idx) with Datalog maskIndex (Defects 6 & 7) */
+      /* C-DSL `size[A]` -> `(uint64_t)sizeof(A)` (emitter.md 3) */
+      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL &&
+          str_eq_c(e->u.call.callee->u.ident.name, "size") &&
+          e->u.call.type_arg_count == 1 && !e->u.call.has_parens) {
+        eb_cstr(ctx->b, "((uint64_t)sizeof(");
+        emit_c_type(ctx->b, ctx->img, ctx->uidx, e->u.call.type_args[0], 0);
+        eb_cstr(ctx->b, "))");
+        break;
+      }
+
+      /* Array or Cell element read: arr(idx) / cell(0) */
       if (e->u.call.callee->kind == STIGI_EXPR_LOCAL && e->u.call.arg_count == 1) {
         const EmitVar *av = emit_find_var(ctx, e->u.call.callee->u.ident.name);
+        if (av != NULL && av->is_cell) {
+          eb_cstr(ctx->b, "(*(");
+          emit_var_cname(ctx->b, av);
+          eb_cstr(ctx->b, "))");
+          break;
+        }
         if (av != NULL && av->is_array) {
           EmitBuf idx_buf;
           memset(&idx_buf, 0, sizeof idx_buf);
@@ -1564,8 +2816,14 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
           ctx->b = &idx_buf;
           emit_expr_typed(ctx, e->u.call.args[0], ETY_U64);
           ctx->b = saved_b;
-          bool do_mask = av->is_param_array ? ctx_next_access_masked(ctx) : false;
-          eb_str(ctx->b, av->name);
+          bool do_mask = ctx_next_access_masked(ctx);
+          if (do_mask && av->len_expr == NULL) {
+            ctx->fail_closed = true;
+            (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg,
+                           "cannot emit required Spectre mask: missing length for '%.*s' in '%s'",
+                           (int)av->name.len, av->name.ptr, ctx->img->units[ctx->uidx].name);
+          }
+          emit_var_cname(ctx->b, av);
           eb_cstr(ctx->b, "[");
           if (do_mask && av->len_expr != NULL) {
             ctx->stats->spectre_masks++;
@@ -1582,106 +2840,213 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
           break;
         }
       }
-      /* Stigi.Test.expect(got, want, reason) -> left-to-right eval into temps */
-      if (e->u.call.callee->kind == STIGI_EXPR_GLOBAL &&
-          str_eq_c(e->u.call.callee->u.ident.name, "Stigi.Test.expect") &&
-          e->u.call.arg_count == 3) {
-        EmitScalarTy cmp_hint = infer_expr_scalar(ctx, e->u.call.args[0]);
-        if (cmp_hint == ETY_UNKNOWN) cmp_hint = infer_expr_scalar(ctx, e->u.call.args[1]);
-        if (cmp_hint == ETY_UNKNOWN) cmp_hint = ETY_U64;
-        if (ctx->pre != NULL) {
-          uint32_t t0 = hoist_arg(ctx, e->u.call.args[0], NULL, ctx->uidx, cmp_hint);
-          uint32_t t1 = hoist_arg(ctx, e->u.call.args[1], NULL, ctx->uidx, cmp_hint);
-          eb_fmt(ctx->b, "((_a%u) == (_a%u) ? INT32_C(0) : INT32_C(1))", t0, t1);
-        } else {
-          eb_cstr(ctx->b, "((");
-          emit_expr_typed(ctx, e->u.call.args[0], cmp_hint);
-          eb_cstr(ctx->b, ") == (");
-          emit_expr_typed(ctx, e->u.call.args[1], cmp_hint);
-          eb_cstr(ctx->b, ") ? INT32_C(0) : INT32_C(1))");
-        }
-        break;
-      }
-      /* Enum constructor call: Case(a0, a1) with deterministic lookup & L-to-R eval */
-      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL) {
-        uint32_t cidx = 0;
-        int32_t eidx = find_enum_case_owner_det(ctx->img, ctx->uidx,
-                                                e->u.call.callee->u.ident.name, &cidx);
-        if (eidx >= 0) {
-          const StigiDecl *ed = ctx->img->units[eidx].ast->decl;
-          const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
-          uint32_t nfields = ec->field_count < e->u.call.arg_count ? ec->field_count
-                                                                   : e->u.call.arg_count;
-          uint32_t tids[64];
-          bool hoisted = (ctx->pre != NULL && nfields >= 2 && nfields <= 64);
-          if (hoisted) {
-            for (uint32_t f = 0; f < nfields; f++) {
-              EmitScalarTy fh = ast_type_to_scalar(ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
-              tids[f] = hoist_arg(ctx, e->u.call.args[f], ec->fields[f].type, (uint32_t)eidx, fh);
+
+      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
+          e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
+        StigiStr cn = e->u.call.callee->u.ident.name;
+
+        /* Stigi.Test.expect(got, want, reason) — supports both scalars AND enums! */
+        if (str_eq_c(cn, "Stigi.Test.expect") && e->u.call.arg_count == 3) {
+          int32_t euidx = infer_expr_enum_uidx(ctx, e->u.call.args[0]);
+          if (euidx < 0) euidx = infer_expr_enum_uidx(ctx, e->u.call.args[1]);
+          if (euidx >= 0) {
+            if (ctx->pre != NULL) {
+              uint32_t t0 = hoist_arg(ctx, e->u.call.args[0], NULL, ctx->uidx, ETY_UNKNOWN);
+              uint32_t t1 = hoist_arg(ctx, e->u.call.args[1], NULL, ctx->uidx, ETY_UNKNOWN);
+              eb_cstr(ctx->b, "(");
+              eb_mangle_name(ctx->b, ctx->img->units[euidx].name, ctx->img->units[euidx].name_len);
+              eb_fmt(ctx->b, "_eq(_a%u, _a%u) ? INT32_C(0) : INT32_C(1))", t0, t1);
+            } else {
+              eb_cstr(ctx->b, "(");
+              eb_mangle_name(ctx->b, ctx->img->units[euidx].name, ctx->img->units[euidx].name_len);
+              eb_cstr(ctx->b, "_eq(");
+              emit_expr_typed(ctx, e->u.call.args[0], ETY_UNKNOWN);
+              eb_cstr(ctx->b, ", ");
+              emit_expr_typed(ctx, e->u.call.args[1], ETY_UNKNOWN);
+              eb_cstr(ctx->b, ") ? INT32_C(0) : INT32_C(1))");
             }
+            break;
           }
-          eb_cstr(ctx->b, "((");
-          eb_mangle_name(ctx->b, ctx->img->units[eidx].name, ctx->img->units[eidx].name_len);
-          eb_cstr(ctx->b, "){ ");
-          if (nfields > 0) {
-            eb_cstr(ctx->b, ".u = { .");
-            eb_str(ctx->b, ec->name);
-            eb_cstr(ctx->b, " = { ");
-            bool first_f = true;
-            for (uint32_t f = 0; f < nfields; f++) {
-              if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
-              if (!first_f) eb_cstr(ctx->b, ", ");
-              first_f = false;
-              eb_cstr(ctx->b, ".");
-              eb_str(ctx->b, ec->fields[f].name);
-              eb_cstr(ctx->b, " = ");
-              if (hoisted) {
-                eb_fmt(ctx->b, "_a%u", tids[f]);
-              } else {
-                EmitScalarTy fh = ast_type_to_scalar(ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
-                emit_expr_typed(ctx, e->u.call.args[f], fh);
+          EmitScalarTy cmp_hint = infer_expr_scalar(ctx, e->u.call.args[0]);
+          if (cmp_hint == ETY_UNKNOWN) cmp_hint = infer_expr_scalar(ctx, e->u.call.args[1]);
+          if (cmp_hint == ETY_UNKNOWN) cmp_hint = ETY_U64;
+          if (ctx->pre != NULL) {
+            uint32_t t0 = hoist_arg(ctx, e->u.call.args[0], NULL, ctx->uidx, cmp_hint);
+            uint32_t t1 = hoist_arg(ctx, e->u.call.args[1], NULL, ctx->uidx, cmp_hint);
+            eb_fmt(ctx->b, "((_a%u) == (_a%u) ? INT32_C(0) : INT32_C(1))", t0, t1);
+          } else {
+            eb_cstr(ctx->b, "((");
+            emit_expr_typed(ctx, e->u.call.args[0], cmp_hint);
+            eb_cstr(ctx->b, ") == (");
+            emit_expr_typed(ctx, e->u.call.args[1], cmp_hint);
+            eb_cstr(ctx->b, ") ? INT32_C(0) : INT32_C(1))");
+          }
+          break;
+        }
+
+        /* Builtin integer conversions & bitwise / wrapping ops (emitter.md 4) */
+        if (str_eq_c(cn, "U64.ofU8") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U8); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "U64.ofU32") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U32); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "U64.ofI64") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint64_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_I64); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "U8.ofU64") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint8_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "U32.ofU64") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "((uint32_t)("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, "))"); break;
+        }
+        if (str_eq_c(cn, "U64.mix") && e->u.call.arg_count == 1) {
+          eb_cstr(ctx->b, "stigi_u64_mix("); emit_expr_typed(ctx, e->u.call.args[0], ETY_U64); eb_cstr(ctx->b, ")"); break;
+        }
+        if (e->u.call.arg_count == 2) {
+          const char *bop = NULL;
+          EmitScalarTy bty = ETY_U64;
+          if (str_eq_c(cn, "U64.bitwiseAnd")) { bop = "&"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.bitwiseOr")) { bop = "|"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.bitwiseXor")) { bop = "^"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.shiftLeft")) { bop = "<<"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.shiftRight")) { bop = ">>"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.wrappingAdd")) { bop = "+"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U64.wrappingMultiply")) { bop = "*"; bty = ETY_U64; }
+          else if (str_eq_c(cn, "U32.bitwiseAnd")) { bop = "&"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.bitwiseOr")) { bop = "|"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.bitwiseXor")) { bop = "^"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.shiftLeft")) { bop = "<<"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.shiftRight")) { bop = ">>"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.wrappingAdd")) { bop = "+"; bty = ETY_U32; }
+          else if (str_eq_c(cn, "U32.wrappingMultiply")) { bop = "*"; bty = ETY_U32; }
+          if (bop != NULL) {
+            eb_cstr(ctx->b, "((");
+            emit_expr_typed(ctx, e->u.call.args[0], bty);
+            eb_fmt(ctx->b, ") %s (", bop);
+            emit_expr_typed(ctx, e->u.call.args[1], bty);
+            eb_cstr(ctx->b, "))");
+            break;
+          }
+          if (str_eq_c(cn, "U32.rotateRight")) {
+            eb_cstr(ctx->b, "stigi_u32_rotr(");
+            emit_expr_typed(ctx, e->u.call.args[0], ETY_U32);
+            eb_cstr(ctx->b, ", ");
+            emit_expr_typed(ctx, e->u.call.args[1], ETY_U32);
+            eb_cstr(ctx->b, ")");
+            break;
+          }
+        }
+
+        /* Capability operation call `binder.op(args...)` -> `Stigi_Handler_op(&_hs, args...)` */
+        const char *dot = memchr(cn.ptr, '.', cn.len);
+        if (dot != NULL) {
+          StigiStr bname = {cn.ptr, (size_t)(dot - cn.ptr)};
+          StigiStr opname = {dot + 1, cn.len - bname.len - 1U};
+          const EmitVar *bv = emit_find_var(ctx, bname);
+          if (bv != NULL && bv->handler_uidx >= 0 && bv->handler_state_var != NULL) {
+            const StigiImageUnit *hu = &ctx->img->units[bv->handler_uidx];
+            const StigiDecl *hd = hu->ast->decl;
+            const StigiDefHead *oph = NULL;
+            for (uint32_t m = 0; m < hd->u.handler_decl.def_count; m++) {
+              const StigiDecl *md = hd->u.handler_decl.defs[m];
+              if (md->kind == STIGI_DECL_DEF && str_eq_ss(md->name, opname)) {
+                oph = &md->u.def_decl.head;
+                break;
               }
             }
-            eb_cstr(ctx->b, " } }, ");
+            uint32_t argc = e->u.call.arg_count;
+            uint32_t *tids = NULL;
+            bool hoisted = (ctx->pre != NULL && argc >= 2U);
+            if (hoisted) {
+              tids = malloc((size_t)argc * sizeof *tids);
+              if (tids == NULL) { ctx->b->oom = true; hoisted = false; }
+              else {
+                for (uint32_t i = 0; i < argc; i++) {
+                  const StigiType *pty = (oph != NULL && i < oph->param_count) ? oph->params[i].type : NULL;
+                  EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, (uint32_t)bv->handler_uidx, pty, 0) : ETY_UNKNOWN;
+                  tids[i] = hoist_arg(ctx, e->u.call.args[i], pty, (uint32_t)bv->handler_uidx, ph);
+                }
+              }
+            }
+            eb_mangle_name(ctx->b, hu->name, hu->name_len);
+            eb_cstr(ctx->b, "_op_");
+            eb_str(ctx->b, opname);
+            eb_fmt(ctx->b, "(&%s", bv->handler_state_var);
+            for (uint32_t i = 0; i < argc; i++) {
+              eb_cstr(ctx->b, ", ");
+              if (hoisted) {
+                eb_fmt(ctx->b, "_a%u", tids[i]);
+              } else {
+                const StigiType *pty = (oph != NULL && i < oph->param_count) ? oph->params[i].type : NULL;
+                EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, (uint32_t)bv->handler_uidx, pty, 0) : ETY_UNKNOWN;
+                emit_expr_typed(ctx, e->u.call.args[i], ph);
+              }
+            }
+            eb_cstr(ctx->b, ")");
+            free(tids);
+            break;
           }
-          eb_cstr(ctx->b, ".tag = ");
-          eb_mangle_name(ctx->b, ctx->img->units[eidx].name, ctx->img->units[eidx].name_len);
-          eb_cstr(ctx->b, "_");
-          eb_str(ctx->b, ec->name);
-          eb_cstr(ctx->b, " })");
+        }
+
+        /* Enum constructor call (qualified or unqualified) */
+        uint32_t cidx = 0;
+        int32_t eidx = find_enum_case_owner_det(ctx->img, ctx->uidx, cn, &cidx);
+        int32_t direct_tgt = stigi_image_resolve_name(ctx->img, ctx->uidx, cn.ptr, cn.len);
+        if (direct_tgt < 0 && eidx >= 0) {
+          emit_enum_ctor_expr(ctx, eidx, cidx, e);
           break;
         }
       }
-      /* Regular def call: evaluate arguments left-to-right into temporaries (Defect 5) */
+
+      /* Regular def / extern call: evaluate arguments left-to-right into temporaries */
       int32_t tgt = -1;
       const StigiDefHead *callee_h = NULL;
+      bool callee_is_bodyless_extern = false;
+      const StigiDecl *callee_d = NULL;
       if (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
           e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
         tgt = stigi_image_resolve_name(ctx->img, ctx->uidx,
                                        e->u.call.callee->u.ident.name.ptr,
                                        e->u.call.callee->u.ident.name.len);
-        if (tgt >= 0 && ctx->img->units[tgt].ast->decl->kind == STIGI_DECL_DEF) {
-          callee_h = &ctx->img->units[tgt].ast->decl->u.def_decl.head;
+        if (tgt >= 0) {
+          callee_d = ctx->img->units[tgt].ast->decl;
+          if (callee_d->kind == STIGI_DECL_DEF) {
+            callee_h = &callee_d->u.def_decl.head;
+          } else if (callee_d->kind == STIGI_DECL_EXTERN && !callee_d->u.extern_decl.is_val) {
+            callee_h = &callee_d->u.extern_decl.head;
+            callee_is_bodyless_extern = (callee_d->u.extern_decl.body == NULL);
+          }
         }
       }
       uint32_t argc = e->u.call.arg_count;
-      uint32_t tids[64];
-      bool hoisted = (ctx->pre != NULL && argc >= 2 && argc <= 64);
+      uint32_t *tids = NULL;
+      bool hoisted = (ctx->pre != NULL && argc >= 2U && !callee_is_bodyless_extern);
       if (hoisted) {
-        for (uint32_t i = 0; i < argc; i++) {
-          const StigiType *pty = (callee_h != NULL && i < callee_h->param_count)
-                                     ? callee_h->params[i].type
-                                     : NULL;
-          uint32_t puidx = tgt >= 0 ? (uint32_t)tgt : ctx->uidx;
-          EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, puidx, pty, 0) : ETY_UNKNOWN;
-          tids[i] = hoist_arg(ctx, e->u.call.args[i], pty, puidx, ph);
+        tids = malloc((size_t)argc * sizeof *tids);
+        if (tids == NULL) {
+          ctx->b->oom = true;
+          hoisted = false;
+        } else {
+          for (uint32_t i = 0; i < argc; i++) {
+            const StigiType *pty = (callee_h != NULL && i < callee_h->param_count)
+                                       ? callee_h->params[i].type
+                                       : NULL;
+            uint32_t puidx = tgt >= 0 ? (uint32_t)tgt : ctx->uidx;
+            EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, puidx, pty, 0) : ETY_UNKNOWN;
+            tids[i] = hoist_arg(ctx, e->u.call.args[i], pty, puidx, ph);
+          }
         }
       }
       if (tgt >= 0) {
-        eb_mangle_name(ctx->b, ctx->img->units[tgt].name, ctx->img->units[tgt].name_len);
+        if (callee_is_bodyless_extern) {
+          eb_str(ctx->b, extern_c_sym(callee_d->name));
+        } else {
+          eb_mangle_name(ctx->b, ctx->img->units[tgt].name, ctx->img->units[tgt].name_len);
+        }
       } else if (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
                  e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
-        eb_str(ctx->b, e->u.call.callee->u.ident.name);
+        eb_c_ident(ctx->b, e->u.call.callee->u.ident.name);
       } else {
         emit_expr_typed(ctx, e->u.call.callee, ETY_UNKNOWN);
       }
@@ -1695,41 +3060,98 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
                                      ? callee_h->params[i].type
                                      : NULL;
           uint32_t puidx = tgt >= 0 ? (uint32_t)tgt : ctx->uidx;
+          /* C-DSL rule 1 (emitter.md 3): `xs(i)` passed to `Ptr[A]` param of body-less extern -> `&xs[i]` */
+          bool param_is_ptr = false;
+          if (callee_is_bodyless_extern && pty != NULL) {
+            uint32_t ru = puidx;
+            const StigiType *rt = resolve_typedef_type(ctx->img, &ru, pty, 0);
+            param_is_ptr = (rt != NULL && rt->kind == STIGI_TYPE_PTR);
+          }
+          const StigiExpr *arg = e->u.call.args[i];
+          if (param_is_ptr && arg->kind == STIGI_EXPR_CALL &&
+              arg->u.call.callee->kind == STIGI_EXPR_LOCAL && arg->u.call.arg_count == 1) {
+            const EmitVar *av = emit_find_var(ctx, arg->u.call.callee->u.ident.name);
+            if (av != NULL && av->is_array) {
+              eb_cstr(ctx->b, "(&");
+              emit_var_cname(ctx->b, av);
+              eb_cstr(ctx->b, "[");
+              emit_expr_typed(ctx, arg->u.call.args[0], ETY_U64);
+              eb_cstr(ctx->b, "])");
+              continue;
+            }
+          }
+          if (param_is_ptr && arg->kind == STIGI_EXPR_INDEX_READ) {
+            eb_cstr(ctx->b, "(&(");
+            emit_expr_typed(ctx, arg->u.index_expr.target, ETY_UNKNOWN);
+            eb_cstr(ctx->b, ")[");
+            emit_expr_typed(ctx, arg->u.index_expr.index, ETY_U64);
+            eb_cstr(ctx->b, "])");
+            continue;
+          }
           EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, puidx, pty, 0) : ETY_UNKNOWN;
-          emit_expr_typed(ctx, e->u.call.args[i], ph);
+          emit_expr_typed(ctx, arg, ph);
         }
       }
       eb_cstr(ctx->b, ")");
+      free(tids);
       break;
     }
-    case STIGI_EXPR_HANDLE:
-      if (e->u.handle_stmt.body != NULL) {
-        emit_expr_typed(ctx, e->u.handle_stmt.body, hint);
-      } else {
-        eb_cstr(ctx->b, "UINT64_C(0)");
-      }
-      break;
-    case STIGI_EXPR_BLOCK:
-      if (e->u.block.count == 0) {
-        eb_cstr(ctx->b, "UINT64_C(0)");
-      } else if (e->u.block.count == 1) {
-        emit_expr_typed(ctx, e->u.block.stmts[0], hint);
-      } else {
-        eb_cstr(ctx->b, "(");
-        for (uint32_t i = 0; i < e->u.block.count; i++) {
-          if (i > 0) eb_cstr(ctx->b, ", ");
-          emit_expr_typed(ctx, e->u.block.stmts[i],
-                          (i + 1 == e->u.block.count) ? hint : ETY_UNKNOWN);
-        }
-        eb_cstr(ctx->b, ")");
-      }
-      break;
+    /* Expression-position complex constructs: hoist into temp via ctx->pre (NEVER drop to 0!) */
     case STIGI_EXPR_MATCH:
+    case STIGI_EXPR_BLOCK:
+    case STIGI_EXPR_HANDLE:
+      if (ctx->pre != NULL) {
+        if (e->kind == STIGI_EXPR_BLOCK && e->u.block.count == 0) {
+          eb_cstr(ctx->b, "UINT64_C(0)");
+          break;
+        }
+        if (e->kind == STIGI_EXPR_BLOCK && e->u.block.count == 1 &&
+            !expr_is_complex_stmt(e->u.block.stmts[0])) {
+          emit_expr_typed(ctx, e->u.block.stmts[0], hint);
+          break;
+        }
+        uint32_t tid = ctx->tmp_id++;
+        char ename[32];
+        (void)snprintf(ename, sizeof ename, "_e%u", tid);
+        EmitBuf *saved_b = ctx->b;
+        EmitBuf *saved_pre = ctx->pre;
+        ctx->b = saved_pre;
+        ctx->pre = NULL;
+        eb_cstr(ctx->b, "  ");
+        (void)emit_inferred_expr_c_type(ctx->b, ctx, e, hint);
+        eb_fmt(ctx->b, " %s;\n", ename);
+        emit_assign_to(ctx, e, ename, hint);
+        ctx->b = saved_b;
+        ctx->pre = saved_pre;
+        eb_cstr(ctx->b, ename);
+        break;
+      }
+      if (e->kind == STIGI_EXPR_BLOCK && e->u.block.count == 1) {
+        emit_expr_typed(ctx, e->u.block.stmts[0], hint);
+        break;
+      }
+      if (e->kind == STIGI_EXPR_HANDLE && e->u.handle_stmt.body != NULL) {
+        emit_expr_typed(ctx, e->u.handle_stmt.body, hint);
+        break;
+      }
+      eb_cstr(ctx->b, "UINT64_C(0)");
+      break;
     case STIGI_EXPR_WHILE:
     case STIGI_EXPR_VAL:
     case STIGI_EXPR_VAR:
     case STIGI_EXPR_ASSIGN:
     case STIGI_EXPR_INDEX_WRITE:
+      if (ctx->pre != NULL) {
+        EmitBuf *saved_b = ctx->b;
+        EmitBuf *saved_pre = ctx->pre;
+        ctx->b = saved_pre;
+        ctx->pre = NULL;
+        emit_stmt_or_ret(ctx, e, false, true);
+        ctx->b = saved_b;
+        ctx->pre = saved_pre;
+      }
+      eb_cstr(ctx->b, "UINT64_C(0)");
+      break;
     case STIGI_EXPR_DENY:
     case STIGI_EXPR_LOCAL_DECL:
       eb_cstr(ctx->b, "UINT64_C(0)");
@@ -1741,7 +3163,7 @@ typedef struct {
   const StigiImageUnit *u;
 } UnitRef;
 
-/* Deterministic ordering strictly by 32-byte runtime_id (emitter.md 1, NEVER by pointer!) */
+/* Deterministic ordering strictly by 32-byte runtime_id (emitter.md 1, NEVER by pointer) */
 static int cmp_unit_by_id(const void *pa, const void *pb) {
   const UnitRef *a = pa;
   const UnitRef *b = pb;
@@ -1750,44 +3172,217 @@ static int cmp_unit_by_id(const void *pa, const void *pb) {
   return strcmp(a->u->name, b->u->name);
 }
 
-static void emit_def_sig(EmitBuf *b, const StigiImage *img, uint32_t uidx, const StigiDecl *d) {
-  const StigiDefHead *h = &d->u.def_decl.head;
-  if (strcmp(img->units[uidx].name, "main") != 0) eb_cstr(b, "static ");
+/* Mark enum + transitively any field enums that need Stigi_<Enum>_eq */
+static void mark_enum_needs_eq(const StigiImage *img, uint32_t enum_uidx, bool *enum_needs_eq) {
+  if (enum_uidx >= img->unit_count || enum_needs_eq[enum_uidx]) return;
+  const StigiDecl *d = img->units[enum_uidx].ast->decl;
+  if (d->kind != STIGI_DECL_ENUM) return;
+  enum_needs_eq[enum_uidx] = true;
+  for (uint32_t c = 0; c < d->u.enum_decl.case_count; c++) {
+    const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
+    for (uint32_t f = 0; f < ec->field_count; f++) {
+      uint32_t ru = enum_uidx;
+      const StigiType *rt = resolve_typedef_type(img, &ru, ec->fields[f].type, 0);
+      if (rt != NULL && rt->kind == STIGI_TYPE_NAMED) {
+        int32_t ft = stigi_image_resolve_name(img, ru, rt->name.ptr, rt->name.len);
+        if (ft >= 0 && img->units[ft].ast->decl->kind == STIGI_DECL_ENUM) {
+          mark_enum_needs_eq(img, (uint32_t)ft, enum_needs_eq);
+        }
+      }
+    }
+  }
+}
+
+/* Scan AST to check runtime helpers, enum_eq usage, and pure parallel-safe call sites */
+static void scan_expr_helpers(const StigiImage *img, uint32_t uidx, const StigiExpr *e,
+                              const UnitMaskInfo *mask_infos,
+                              bool *need_mix, bool *need_rotr, bool *need_alloc,
+                              bool *enum_needs_eq, uint32_t *parallel_sites) {
+  if (e == NULL) return;
+  switch (e->kind) {
+    case STIGI_EXPR_CALL:
+      if (e->u.call.callee->kind == STIGI_EXPR_GLOBAL || e->u.call.callee->kind == STIGI_EXPR_LOCAL) {
+        StigiStr cn = e->u.call.callee->u.ident.name;
+        if (str_eq_c(cn, "U64.mix")) *need_mix = true;
+        else if (str_eq_c(cn, "U32.rotateRight")) *need_rotr = true;
+        else if (str_eq_c(cn, "Array.tryFill") || str_eq_c(cn, "Array.tryGrow") ||
+                 str_eq_c(cn, "Cell.tryMake")) {
+          *need_alloc = true;
+        } else if (str_eq_c(cn, "Stigi.Test.expect") && e->u.call.arg_count == 3 &&
+                   enum_needs_eq != NULL) {
+          EmitCtx tmp_c;
+          memset(&tmp_c, 0, sizeof tmp_c);
+          tmp_c.img = img;
+          tmp_c.uidx = uidx;
+          int32_t e0 = infer_expr_enum_uidx(&tmp_c, e->u.call.args[0]);
+          int32_t e1 = infer_expr_enum_uidx(&tmp_c, e->u.call.args[1]);
+          if (e0 >= 0) mark_enum_needs_eq(img, (uint32_t)e0, enum_needs_eq);
+          if (e1 >= 0) mark_enum_needs_eq(img, (uint32_t)e1, enum_needs_eq);
+        } else if (mask_infos != NULL && parallel_sites != NULL) {
+          int32_t tgt = stigi_image_resolve_name(img, uidx, cn.ptr, cn.len);
+          if (tgt >= 0 && mask_infos[tgt].is_pure_def) {
+            (*parallel_sites)++;
+          }
+        }
+      }
+      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+        scan_expr_helpers(img, uidx, e->u.call.args[i], mask_infos, need_mix, need_rotr,
+                          need_alloc, enum_needs_eq, parallel_sites);
+      }
+      break;
+    case STIGI_EXPR_BINOP:
+      if ((e->u.binop.op == STIGI_OP_EQ || e->u.binop.op == STIGI_OP_NE) && enum_needs_eq != NULL) {
+        /* Mark all enums referenced directly in == / != comparisons */
+        EmitCtx tmp_c;
+        memset(&tmp_c, 0, sizeof tmp_c);
+        tmp_c.img = img;
+        tmp_c.uidx = uidx;
+        int32_t e0 = infer_expr_enum_uidx(&tmp_c, e->u.binop.lhs);
+        int32_t e1 = infer_expr_enum_uidx(&tmp_c, e->u.binop.rhs);
+        if (e0 >= 0) mark_enum_needs_eq(img, (uint32_t)e0, enum_needs_eq);
+        if (e1 >= 0) mark_enum_needs_eq(img, (uint32_t)e1, enum_needs_eq);
+      }
+      scan_expr_helpers(img, uidx, e->u.binop.lhs, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.binop.rhs, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_UNOP:
+      scan_expr_helpers(img, uidx, e->u.unop.operand, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_IF:
+      scan_expr_helpers(img, uidx, e->u.if_expr.cond, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.if_expr.then_br, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.if_expr.else_br, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_WHILE:
+      scan_expr_helpers(img, uidx, e->u.while_expr.cond, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.while_expr.body, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_MATCH:
+      scan_expr_helpers(img, uidx, e->u.match_expr.scrutinee, mask_infos, need_mix, need_rotr,
+                        need_alloc, enum_needs_eq, parallel_sites);
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        scan_expr_helpers(img, uidx, e->u.match_expr.arms[i].body, mask_infos, need_mix, need_rotr,
+                          need_alloc, enum_needs_eq, parallel_sites);
+      }
+      break;
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        scan_expr_helpers(img, uidx, e->u.block.stmts[i], mask_infos, need_mix, need_rotr, need_alloc,
+                          enum_needs_eq, parallel_sites);
+      }
+      break;
+    case STIGI_EXPR_VAL:
+      scan_expr_helpers(img, uidx, e->u.val_stmt.init, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_VAR:
+      scan_expr_helpers(img, uidx, e->u.var_stmt.init, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_ASSIGN:
+      scan_expr_helpers(img, uidx, e->u.assign_stmt.value, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_INDEX_READ:
+    case STIGI_EXPR_INDEX_WRITE:
+      scan_expr_helpers(img, uidx, e->u.index_expr.target, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.index_expr.index, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      scan_expr_helpers(img, uidx, e->u.index_expr.value, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_HANDLE:
+      for (uint32_t i = 0; i < e->u.handle_stmt.arg_count; i++) {
+        scan_expr_helpers(img, uidx, e->u.handle_stmt.args[i], mask_infos, need_mix, need_rotr,
+                          need_alloc, enum_needs_eq, parallel_sites);
+      }
+      scan_expr_helpers(img, uidx, e->u.handle_stmt.body, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    case STIGI_EXPR_ASSERT:
+      scan_expr_helpers(img, uidx, e->u.assert_expr.expr, mask_infos, need_mix, need_rotr, need_alloc,
+                        enum_needs_eq, parallel_sites);
+      break;
+    default:
+      break;
+  }
+}
+
+static void emit_def_sig_head(EmitBuf *b, const StigiImage *img, uint32_t uidx,
+                              const StigiDefHead *h, const char *name, size_t name_len,
+                              bool is_static, bool is_inline, const char *extra_first_param) {
+  if (is_static) eb_cstr(b, "static ");
+  if (is_inline) eb_cstr(b, "inline ");
   emit_c_type(b, img, uidx, h->ret_type, 0);
   eb_cstr(b, " ");
-  eb_mangle_name(b, img->units[uidx].name, img->units[uidx].name_len);
+  eb_mangle_name(b, name, name_len);
   eb_cstr(b, "(");
-  if (h->param_count == 0) {
+  bool first = true;
+  if (extra_first_param != NULL) {
+    eb_cstr(b, extra_first_param);
+    first = false;
+  }
+  if (h->param_count == 0 && first) {
     eb_cstr(b, "void");
   } else {
     for (uint32_t i = 0; i < h->param_count; i++) {
-      if (i > 0) eb_cstr(b, ", ");
+      if (!first) eb_cstr(b, ", ");
+      first = false;
       emit_c_type(b, img, uidx, h->params[i].type, 0);
       eb_cstr(b, " ");
-      eb_str(b, h->params[i].name);
+      eb_c_ident(b, h->params[i].name);
     }
   }
   eb_cstr(b, ")");
 }
 
-/* Emit alignment-sorted enum + tail tag + _Static_assert on sizeOf/alignOf/offsetof (Defect 3) */
+/* Emit enum in lockstep with stigi_enum_layout_info (memory.md 8):
+ * 1-word nullable pointer, tail-padding tag union, tag-only, or standard struct+union */
 static void emit_enum_unit(EmitBuf *b, const StigiImage *img, const StigiImageUnit *u,
-                           const StigiDecl *d) {
+                           const StigiDecl *d, bool emit_eq) {
+  StigiEnumLayoutInfo eli = stigi_enum_layout_info(img, u->idx, NULL, 0);
   uint32_t case_count = d->u.enum_decl.case_count;
-  uint64_t tag_size = (case_count <= 256U) ? 1ULL : (case_count <= 65536U ? 2ULL : 4ULL);
-  const char *tag_ctype = (case_count <= 256U) ? "uint8_t"
-                          : (case_count <= 65536U ? "uint16_t" : "uint32_t");
+  const char *tag_ctype = (eli.tag_size == 1ULL) ? "uint8_t"
+                          : (eli.tag_size == 2ULL ? "uint16_t" : "uint32_t");
 
   eb_line_dir(b, d->span.line, u->name, u->name_len);
+
+  if (eli.is_nullable_ptr) {
+    const StigiEnumCase *pc = &d->u.enum_decl.cases[eli.ptr_case];
+    eb_cstr(b, "typedef ");
+    emit_c_type(b, img, u->idx, pc->fields[0].type, 0);
+    eb_cstr(b, " ");
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, ";\n_Static_assert(sizeof(");
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, ") == 8ULL, \"nullable-ptr enum sizeOf mismatch\");\n_Static_assert(_Alignof(");
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, ") == 8ULL, \"nullable-ptr enum alignOf mismatch\");\n");
+    if (emit_eq) {
+      eb_cstr(b, "static inline bool ");
+      eb_mangle_name(b, u->name, u->name_len);
+      eb_cstr(b, "_eq(");
+      eb_mangle_name(b, u->name, u->name_len);
+      eb_cstr(b, " _a, ");
+      eb_mangle_name(b, u->name, u->name_len);
+      eb_cstr(b, " _b) { return _a == _b; }\n");
+    }
+    eb_cstr(b, "\n");
+    return;
+  }
+
   eb_cstr(b, "typedef enum {\n");
-  bool has_any_fields = false;
   for (uint32_t c = 0; c < case_count; c++) {
     const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
-    for (uint32_t f = 0; f < ec->field_count; f++) {
-      if (ast_type_layout(img, u->idx, ec->fields[f].type, 0).size > 0) {
-        has_any_fields = true;
-      }
-    }
     eb_cstr(b, "  ");
     eb_mangle_name(b, u->name, u->name_len);
     eb_cstr(b, "_");
@@ -1798,20 +3393,17 @@ static void emit_enum_unit(EmitBuf *b, const StigiImage *img, const StigiImageUn
   eb_mangle_name(b, u->name, u->name_len);
   eb_cstr(b, "_Tag;\n");
 
-  /* Track field offsets for _Static_assert(offsetof(...)) */
   EmitBuf asserts_buf;
   memset(&asserts_buf, 0, sizeof asserts_buf);
 
-  uint64_t union_align = 1;
-  uint64_t union_size = 0;
-
-  eb_cstr(b, "typedef struct {\n");
-  if (has_any_fields) {
-    eb_cstr(b, "  union {\n");
+  if (eli.tag_in_tail) {
+    /* Tag placed inside tail padding of case union (zero extra stride!) */
+    eb_cstr(b, "typedef union {\n");
+    eb_fmt(b, "  struct { uint8_t _tag_pad[%llu]; %s tag; } _hdr;\n",
+           (unsigned long long)eli.tag_offset, tag_ctype);
     for (uint32_t c = 0; c < case_count; c++) {
       const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
       if (ec->field_count == 0) continue;
-
       StigiLayout *flays = malloc((size_t)ec->field_count * sizeof *flays);
       uint32_t *order = malloc((size_t)ec->field_count * sizeof *order);
       if (flays == NULL || order == NULL) {
@@ -1832,8 +3424,6 @@ static void emit_enum_unit(EmitBuf *b, const StigiImage *img, const StigiImageUn
         free(order);
         continue;
       }
-
-      /* Stable insertion sort by decreasing alignment, then declaration order (memory.md 8) */
       for (uint32_t i = 1; i < ec->field_count; i++) {
         uint32_t key = order[i];
         uint64_t ka = flays[key].align;
@@ -1844,74 +3434,413 @@ static void emit_enum_unit(EmitBuf *b, const StigiImage *img, const StigiImageUn
         }
         order[j] = key;
       }
-
-      eb_cstr(b, "    struct {\n");
-      uint64_t c_align = 1;
+      eb_cstr(b, "  struct {\n");
       uint64_t off = 0;
       for (uint32_t i = 0; i < ec->field_count; i++) {
         uint32_t fi = order[i];
         StigiLayout fl = flays[fi];
         if (fl.size == 0) continue;
-        if (fl.align > c_align) c_align = fl.align;
         off = emit_align_up(off, fl.align);
         uint64_t field_off = off;
         off += fl.size;
-
-        eb_cstr(b, "      ");
+        eb_cstr(b, "    ");
         emit_c_type(b, img, u->idx, ec->fields[fi].type, 0);
         eb_cstr(b, " ");
-        eb_str(b, ec->fields[fi].name);
+        eb_c_ident(b, ec->fields[fi].name);
         eb_cstr(b, ";\n");
 
         eb_cstr(&asserts_buf, "_Static_assert(offsetof(");
         eb_mangle_name(&asserts_buf, u->name, u->name_len);
-        eb_cstr(&asserts_buf, ", u.");
+        eb_cstr(&asserts_buf, ", ");
         eb_str(&asserts_buf, ec->name);
         eb_cstr(&asserts_buf, ".");
-        eb_str(&asserts_buf, ec->fields[fi].name);
+        eb_c_ident(&asserts_buf, ec->fields[fi].name);
         eb_fmt(&asserts_buf, ") == %lluULL, \"enum field offset mismatch\");\n",
                (unsigned long long)field_off);
       }
-      eb_cstr(b, "    } ");
+      if (eli.tag_offset > off) {
+        eb_fmt(b, "    uint8_t _tag_pad[%llu];\n", (unsigned long long)(eli.tag_offset - off));
+      }
+      eb_fmt(b, "    %s tag;\n  } ", tag_ctype);
       eb_str(b, ec->name);
       eb_cstr(b, ";\n");
 
-      uint64_t c_size = emit_align_up(off, c_align);
-      if (c_align > union_align) union_align = c_align;
-      if (c_size > union_size) union_size = c_size;
-
+      eb_cstr(&asserts_buf, "_Static_assert(offsetof(");
+      eb_mangle_name(&asserts_buf, u->name, u->name_len);
+      eb_cstr(&asserts_buf, ", ");
+      eb_str(&asserts_buf, ec->name);
+      eb_fmt(&asserts_buf, ".tag) == %lluULL, \"enum tail tag offset mismatch\");\n",
+             (unsigned long long)eli.tag_offset);
       free(flays);
       free(order);
     }
-    eb_cstr(b, "  } u;\n");
+    eb_cstr(b, "} ");
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, ";\n");
+  } else {
+    eb_cstr(b, "typedef struct {\n");
+    if (!eli.is_tag_only) {
+      eb_cstr(b, "  union {\n");
+      for (uint32_t c = 0; c < case_count; c++) {
+        const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
+        if (ec->field_count == 0) continue;
+        StigiLayout *flays = malloc((size_t)ec->field_count * sizeof *flays);
+        uint32_t *order = malloc((size_t)ec->field_count * sizeof *order);
+        if (flays == NULL || order == NULL) {
+          free(flays);
+          free(order);
+          b->oom = true;
+          free(asserts_buf.buf);
+          return;
+        }
+        uint32_t non_empty = 0;
+        for (uint32_t f = 0; f < ec->field_count; f++) {
+          flays[f] = ast_type_layout(img, u->idx, ec->fields[f].type, 0);
+          order[f] = f;
+          if (flays[f].size > 0) non_empty++;
+        }
+        if (non_empty == 0) {
+          free(flays);
+          free(order);
+          continue;
+        }
+        for (uint32_t i = 1; i < ec->field_count; i++) {
+          uint32_t key = order[i];
+          uint64_t ka = flays[key].align;
+          uint32_t j = i;
+          while (j > 0 && flays[order[j - 1]].align < ka) {
+            order[j] = order[j - 1];
+            j--;
+          }
+          order[j] = key;
+        }
+        eb_cstr(b, "    struct {\n");
+        uint64_t off = 0;
+        for (uint32_t i = 0; i < ec->field_count; i++) {
+          uint32_t fi = order[i];
+          StigiLayout fl = flays[fi];
+          if (fl.size == 0) continue;
+          off = emit_align_up(off, fl.align);
+          uint64_t field_off = off;
+          off += fl.size;
+          eb_cstr(b, "      ");
+          emit_c_type(b, img, u->idx, ec->fields[fi].type, 0);
+          eb_cstr(b, " ");
+          eb_c_ident(b, ec->fields[fi].name);
+          eb_cstr(b, ";\n");
+
+          eb_cstr(&asserts_buf, "_Static_assert(offsetof(");
+          eb_mangle_name(&asserts_buf, u->name, u->name_len);
+          eb_cstr(&asserts_buf, ", u.");
+          eb_str(&asserts_buf, ec->name);
+          eb_cstr(&asserts_buf, ".");
+          eb_c_ident(&asserts_buf, ec->fields[fi].name);
+          eb_fmt(&asserts_buf, ") == %lluULL, \"enum field offset mismatch\");\n",
+                 (unsigned long long)field_off);
+        }
+        eb_cstr(b, "    } ");
+        eb_str(b, ec->name);
+        eb_cstr(b, ";\n");
+        free(flays);
+        free(order);
+      }
+      eb_cstr(b, "  } u;\n");
+    }
+    eb_fmt(b, "  %s tag;\n} ", tag_ctype);
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, ";\n");
   }
-  eb_fmt(b, "  %s tag;\n} ", tag_ctype);
-  eb_mangle_name(b, u->name, u->name_len);
-  eb_cstr(b, ";\n");
-
-  uint64_t tag_off = has_any_fields ? emit_align_up(emit_align_up(union_size, union_align), tag_size)
-                                    : 0ULL;
-
-  StigiTy ety;
-  memset(&ety, 0, sizeof ety);
-  ety.kind = STIGI_TY_ENUM;
-  ety.unit_idx = u->idx;
-  StigiLayout lay = stigi_ty_layout(img, &ety);
 
   eb_cstr(b, "_Static_assert(sizeof(");
   eb_mangle_name(b, u->name, u->name_len);
-  eb_fmt(b, ") == %lluULL, \"enum sizeOf mismatch\");\n", (unsigned long long)lay.size);
+  eb_fmt(b, ") == %lluULL, \"enum sizeOf mismatch\");\n", (unsigned long long)eli.layout.size);
   eb_cstr(b, "_Static_assert(_Alignof(");
   eb_mangle_name(b, u->name, u->name_len);
-  eb_fmt(b, ") == %lluULL, \"enum alignOf mismatch\");\n", (unsigned long long)lay.align);
+  eb_fmt(b, ") == %lluULL, \"enum alignOf mismatch\");\n", (unsigned long long)eli.layout.align);
   eb_cstr(b, "_Static_assert(offsetof(");
   eb_mangle_name(b, u->name, u->name_len);
-  eb_fmt(b, ", tag) == %lluULL, \"enum tag offset mismatch\");\n", (unsigned long long)tag_off);
-  if (asserts_buf.len > 0) {
-    eb_mem(b, asserts_buf.buf, asserts_buf.len);
-  }
+  eb_fmt(b, ", %s) == %lluULL, \"enum tag offset mismatch\");\n",
+         eli.tag_in_tail ? "_hdr.tag" : "tag", (unsigned long long)eli.tag_offset);
+  if (asserts_buf.len > 0) eb_mem(b, asserts_buf.buf, asserts_buf.len);
   if (asserts_buf.oom) b->oom = true;
   free(asserts_buf.buf);
+
+  /* Emit structural equality helper ONLY when actually compared (zero -Wunused-function) */
+  if (!emit_eq) {
+    eb_cstr(b, "\n");
+    return;
+  }
+  eb_cstr(b, "static inline bool ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, "_eq(");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, " _a, ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_fmt(b, " _b) {\n  if (_a.%s != _b.%s) return false;\n",
+         eli.tag_in_tail ? "_hdr.tag" : "tag", eli.tag_in_tail ? "_hdr.tag" : "tag");
+  if (!eli.is_tag_only) {
+    eb_fmt(b, "  switch (_a.%s) {\n", eli.tag_in_tail ? "_hdr.tag" : "tag");
+    for (uint32_t c = 0; c < case_count; c++) {
+      const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
+      eb_cstr(b, "    case ");
+      eb_mangle_name(b, u->name, u->name_len);
+      eb_cstr(b, "_");
+      eb_str(b, ec->name);
+      eb_cstr(b, ": return true");
+      for (uint32_t f = 0; f < ec->field_count; f++) {
+        if (ast_type_layout(img, u->idx, ec->fields[f].type, 0).size == 0) continue;
+        uint32_t ru = u->idx;
+        const StigiType *rft = resolve_typedef_type(img, &ru, ec->fields[f].type, 0);
+        int32_t fe_uidx = -1;
+        if (rft != NULL && rft->kind == STIGI_TYPE_NAMED) {
+          int32_t ft = stigi_image_resolve_name(img, ru, rft->name.ptr, rft->name.len);
+          if (ft >= 0 && img->units[ft].ast->decl->kind == STIGI_DECL_ENUM) fe_uidx = ft;
+        }
+        eb_cstr(b, " && ");
+        if (fe_uidx >= 0) {
+          eb_mangle_name(b, img->units[fe_uidx].name, img->units[fe_uidx].name_len);
+          eb_fmt(b, "_eq(_a.%s", eli.tag_in_tail ? "" : "u.");
+          eb_str(b, ec->name);
+          eb_cstr(b, ".");
+          eb_c_ident(b, ec->fields[f].name);
+          eb_fmt(b, ", _b.%s", eli.tag_in_tail ? "" : "u.");
+          eb_str(b, ec->name);
+          eb_cstr(b, ".");
+          eb_c_ident(b, ec->fields[f].name);
+          eb_cstr(b, ")");
+        } else {
+          eb_fmt(b, "(_a.%s", eli.tag_in_tail ? "" : "u.");
+          eb_str(b, ec->name);
+          eb_cstr(b, ".");
+          eb_c_ident(b, ec->fields[f].name);
+          eb_fmt(b, " == _b.%s", eli.tag_in_tail ? "" : "u.");
+          eb_str(b, ec->name);
+          eb_cstr(b, ".");
+          eb_c_ident(b, ec->fields[f].name);
+          eb_cstr(b, ")");
+        }
+      }
+      eb_cstr(b, ";\n");
+    }
+    eb_cstr(b, "  }\n");
+  }
+  eb_cstr(b, "  return true;\n}\n\n");
+}
+
+/* Topological emission of ENUM / VAL units (deterministic tie-break by runtime_id order) */
+static void topo_order_kind(const StigiImage *img, const UnitRef *sorted, uint32_t scnt,
+                            StigiDeclKind kind, uint32_t *out_indices, uint32_t *out_count) {
+  uint8_t *state = calloc(img->unit_count, 1); /* 0=unvisited, 1=visiting, 2=done */
+  bool *in_set = calloc(img->unit_count, 1);
+  if (state == NULL || in_set == NULL) {
+    free(state);
+    free(in_set);
+    *out_count = 0;
+    return;
+  }
+  for (uint32_t i = 0; i < scnt; i++) {
+    if (sorted[i].u->ast->decl->kind == kind) in_set[sorted[i].u->idx] = true;
+  }
+  uint32_t oc = 0;
+  uint32_t *stack = malloc((size_t)img->unit_count * 2U * sizeof *stack);
+  uint32_t *edge_cur = malloc((size_t)img->unit_count * sizeof *edge_cur);
+  if (stack == NULL || edge_cur == NULL) {
+    for (uint32_t i = 0; i < scnt; i++) {
+      if (sorted[i].u->ast->decl->kind == kind) out_indices[oc++] = sorted[i].u->idx;
+    }
+    *out_count = oc;
+    free(state);
+    free(in_set);
+    free(stack);
+    free(edge_cur);
+    return;
+  }
+  for (uint32_t i = 0; i < img->unit_count; i++) {
+    edge_cur[i] = (img->adj_head != NULL && i < img->adj_cap) ? img->adj_head[i] : UINT32_MAX;
+  }
+  for (uint32_t i = 0; i < scnt; i++) {
+    uint32_t root = sorted[i].u->idx;
+    if (!in_set[root] || state[root] != 0) continue;
+    uint32_t sp = 0;
+    stack[sp++] = root;
+    state[root] = 1;
+    while (sp > 0) {
+      uint32_t cur = stack[sp - 1];
+      bool pushed = false;
+      while (edge_cur[cur] != UINT32_MAX) {
+        uint32_t e = edge_cur[cur];
+        edge_cur[cur] = img->edge_next[e];
+        uint32_t dep = img->edges[e].to;
+        if (dep < img->unit_count && in_set[dep] && state[dep] == 0) {
+          state[dep] = 1;
+          stack[sp++] = dep;
+          pushed = true;
+          break;
+        }
+      }
+      if (!pushed) {
+        state[cur] = 2;
+        out_indices[oc++] = cur;
+        sp--;
+      }
+    }
+  }
+  *out_count = oc;
+  free(state);
+  free(in_set);
+  free(stack);
+  free(edge_cur);
+}
+
+static void emit_handler_unit(EmitBuf *b, const StigiImage *img, const StigiImageUnit *u,
+                              const StigiDecl *d, StigiEmitStats *stats,
+                              const UnitMaskInfo *mask_infos) {
+  eb_line_dir(b, d->span.line, u->name, u->name_len);
+  eb_cstr(b, "typedef struct {\n");
+  uint32_t field_cnt = 0;
+  for (uint32_t i = 0; i < d->u.handler_decl.val_param_count; i++) {
+    if (ast_type_is_void(img, u->idx, d->u.handler_decl.val_params[i].type)) continue;
+    eb_cstr(b, "  ");
+    emit_c_type(b, img, u->idx, d->u.handler_decl.val_params[i].type, 0);
+    eb_cstr(b, " ");
+    eb_c_ident(b, d->u.handler_decl.val_params[i].name);
+    eb_cstr(b, ";\n");
+    field_cnt++;
+  }
+  for (uint32_t m = 0; m < d->u.handler_decl.var_count; m++) {
+    const StigiExpr *ve = d->u.handler_decl.vars[m];
+    if (ve->kind == STIGI_EXPR_VAR &&
+        (ve->u.var_stmt.type == NULL || !ast_type_is_void(img, u->idx, ve->u.var_stmt.type))) {
+      eb_cstr(b, "  ");
+      emit_c_type(b, img, u->idx, ve->u.var_stmt.type, 0);
+      eb_cstr(b, " ");
+      eb_c_ident(b, ve->u.var_stmt.name);
+      eb_cstr(b, ";\n");
+      field_cnt++;
+    }
+  }
+  if (field_cnt == 0) eb_cstr(b, "  uint8_t _empty;\n");
+  eb_cstr(b, "} ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, "_State;\n");
+
+  /* Initializer function */
+  eb_cstr(b, "static inline ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, "_State ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, "_init(");
+  if (d->u.handler_decl.val_param_count == 0) {
+    eb_cstr(b, "void");
+  } else {
+    for (uint32_t i = 0; i < d->u.handler_decl.val_param_count; i++) {
+      if (i > 0) eb_cstr(b, ", ");
+      emit_c_type(b, img, u->idx, d->u.handler_decl.val_params[i].type, 0);
+      eb_cstr(b, " ");
+      eb_c_ident(b, d->u.handler_decl.val_params[i].name);
+    }
+  }
+  eb_cstr(b, ") {\n  ");
+  eb_mangle_name(b, u->name, u->name_len);
+  eb_cstr(b, "_State _st = {0};\n");
+  EmitCtx ictx;
+  memset(&ictx, 0, sizeof ictx);
+  ictx.img = img;
+  ictx.uidx = u->idx;
+  ictx.b = b;
+  ictx.stats = stats;
+  for (uint32_t i = 0; i < d->u.handler_decl.val_param_count; i++) {
+    EmitVar *pv = emit_register_var(&ictx, d->u.handler_decl.val_params[i].name,
+                                    d->u.handler_decl.val_params[i].type, u->idx, true);
+    if (pv != NULL && !ast_type_is_void(img, u->idx, d->u.handler_decl.val_params[i].type)) {
+      eb_cstr(b, "  _st.");
+      eb_c_ident(b, d->u.handler_decl.val_params[i].name);
+      eb_cstr(b, " = ");
+      emit_var_cname(b, pv);
+      eb_cstr(b, ";\n");
+    }
+  }
+  for (uint32_t m = 0; m < d->u.handler_decl.var_count; m++) {
+    const StigiExpr *ve = d->u.handler_decl.vars[m];
+    if (ve->kind == STIGI_EXPR_VAR &&
+        (ve->u.var_stmt.type == NULL || !ast_type_is_void(img, u->idx, ve->u.var_stmt.type))) {
+      EmitScalarTy vh = ast_type_to_scalar(img, u->idx, ve->u.var_stmt.type, 0);
+      EmitBuf ibuf;
+      emit_expr_with_pre(&ictx, ve->u.var_stmt.init, vh, &ibuf);
+      eb_cstr(b, "  _st.");
+      eb_c_ident(b, ve->u.var_stmt.name);
+      eb_cstr(b, " = ");
+      eb_mem(b, ibuf.buf, ibuf.len);
+      eb_cstr(b, ";\n");
+      free(ibuf.buf);
+    }
+  }
+  emit_ctx_free(&ictx);
+  eb_cstr(b, "  return _st;\n}\n");
+
+  /* Handler operation functions */
+  for (uint32_t m = 0; m < d->u.handler_decl.def_count; m++) {
+    const StigiDecl *md = d->u.handler_decl.defs[m];
+    if (md->kind != STIGI_DECL_DEF) continue;
+    const StigiDefHead *oph = &md->u.def_decl.head;
+    EmitBuf extra_p;
+    memset(&extra_p, 0, sizeof extra_p);
+    eb_mangle_name(&extra_p, u->name, u->name_len);
+    eb_cstr(&extra_p, "_State *_hstate");
+
+    eb_cstr(b, "static inline ");
+    emit_c_type(b, img, u->idx, oph->ret_type, 0);
+    eb_cstr(b, " ");
+    eb_mangle_name(b, u->name, u->name_len);
+    eb_cstr(b, "_op_");
+    eb_str(b, md->name);
+    eb_fmt(b, "(%s", extra_p.buf);
+    for (uint32_t p = 0; p < oph->param_count; p++) {
+      eb_cstr(b, ", ");
+      emit_c_type(b, img, u->idx, oph->params[p].type, 0);
+      eb_cstr(b, " ");
+      eb_c_ident(b, oph->params[p].name);
+    }
+    eb_cstr(b, ") {\n  (void)_hstate;\n");
+    for (uint32_t p = 0; p < oph->param_count; p++) {
+      eb_cstr(b, "  (void)");
+      eb_c_ident(b, oph->params[p].name);
+      eb_cstr(b, ";\n");
+    }
+
+    EmitCtx octx;
+    memset(&octx, 0, sizeof octx);
+    octx.img = img;
+    octx.uidx = u->idx;
+    octx.cur_head = oph;
+    octx.b = b;
+    octx.stats = stats;
+    octx.mask_info = mask_infos != NULL ? &mask_infos[u->idx] : NULL;
+    octx.ret_scalar = ast_type_to_scalar(img, u->idx, oph->ret_type, 0);
+    octx.ret_ast_type = oph->ret_type;
+    octx.ret_type_uidx = u->idx;
+
+    for (uint32_t i = 0; i < d->u.handler_decl.val_param_count; i++) {
+      EmitVar *sv = emit_register_var(&octx, d->u.handler_decl.val_params[i].name,
+                                      d->u.handler_decl.val_params[i].type, u->idx, true);
+      if (sv != NULL) sv->is_handler_state_field = true;
+    }
+    for (uint32_t k = 0; k < d->u.handler_decl.var_count; k++) {
+      const StigiExpr *ve = d->u.handler_decl.vars[k];
+      if (ve->kind == STIGI_EXPR_VAR) {
+        EmitVar *sv = emit_register_var(&octx, ve->u.var_stmt.name, ve->u.var_stmt.type, u->idx, true);
+        if (sv != NULL) sv->is_handler_state_field = true;
+      }
+    }
+    for (uint32_t p = 0; p < oph->param_count; p++) {
+      (void)emit_register_var(&octx, oph->params[p].name, oph->params[p].type, u->idx, true);
+    }
+    bool is_void = ast_type_is_void(img, u->idx, oph->ret_type);
+    emit_stmt_or_ret(&octx, md->u.def_decl.body, true, is_void);
+    emit_ctx_free(&octx);
+    eb_cstr(b, "}\n");
+    free(extra_p.buf);
+  }
   eb_cstr(b, "\n");
 }
 
@@ -1939,27 +3868,58 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
     qsort(sorted, scnt, sizeof *sorted, cmp_unit_by_id);
   }
 
-  /* Defect 7: consume Datalog maskIndex relation rather than an ad-hoc local heuristic */
   UnitMaskInfo *mask_infos = NULL;
   uint32_t total_dl_masks = 0;
-  Status mst = compute_datalog_masks(door, &mask_infos, &total_dl_masks, diag);
+  Status mst = compute_datalog_masks(door, &mask_infos, &total_dl_masks, stats, diag);
   if (mst != STIGI_OK) {
     free(sorted);
     return mst;
   }
   bool need_mask = (total_dl_masks > 0);
+  bool need_mix = false, need_rotr = false, need_alloc = false;
+  bool *enum_needs_eq = img->unit_count > 0 ? calloc(img->unit_count, sizeof *enum_needs_eq) : NULL;
+  for (uint32_t i = 0; i < scnt; i++) {
+    const StigiImageUnit *u = sorted[i].u;
+    const StigiDecl *d = u->ast->decl;
+    if (d->kind == STIGI_DECL_DEF) {
+      scan_expr_helpers(img, u->idx, d->u.def_decl.body, mask_infos, &need_mix, &need_rotr,
+                        &need_alloc, enum_needs_eq, &stats->parallel_safe_sites);
+    } else if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST) {
+      scan_expr_helpers(img, u->idx, d->u.val_decl.body, mask_infos, &need_mix, &need_rotr,
+                        &need_alloc, enum_needs_eq, &stats->parallel_safe_sites);
+    } else if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val) {
+      scan_expr_helpers(img, u->idx, d->u.extern_decl.body, mask_infos, &need_mix, &need_rotr,
+                        &need_alloc, enum_needs_eq, &stats->parallel_safe_sites);
+    } else if (d->kind == STIGI_DECL_HANDLER) {
+      for (uint32_t m = 0; m < d->u.handler_decl.var_count; m++) {
+        scan_expr_helpers(img, u->idx, d->u.handler_decl.vars[m], mask_infos, &need_mix,
+                          &need_rotr, &need_alloc, enum_needs_eq, &stats->parallel_safe_sites);
+      }
+      for (uint32_t m = 0; m < d->u.handler_decl.def_count; m++) {
+        const StigiDecl *md = d->u.handler_decl.defs[m];
+        if (md->kind == STIGI_DECL_DEF) {
+          scan_expr_helpers(img, u->idx, md->u.def_decl.body, mask_infos, &need_mix, &need_rotr,
+                            &need_alloc, enum_needs_eq, &stats->parallel_safe_sites);
+        }
+      }
+    }
+  }
 
   EmitBuf b;
   memset(&b, 0, sizeof b);
 
-  /* Portable ISO C11 preamble + S118 runtime + X22-g Spectre barrier mask (ZERO abort/exit!) */
+  /* Portable ISO C11 preamble + S118 runtime + X22-g Spectre barrier mask (ZERO abort/exit/builtins) */
   eb_cstr(&b,
           "#define _GNU_SOURCE\n"
           "#include <stdint.h>\n"
           "#include <stdbool.h>\n"
           "#include <stddef.h>\n"
           "#include <signal.h>\n"
-          "#include <sys/mman.h>\n\n"
+          "#include <sys/mman.h>\n"
+          "#include <unistd.h>\n");
+  if (need_alloc) eb_cstr(&b, "#include <stdlib.h>\n#include <string.h>\n");
+  eb_cstr(&b,
+          "\n"
           "typedef enum {\n"
           "  STIGI_RT_OK = 0,\n"
           "  STIGI_RT_ERR_STACK = 1,\n"
@@ -1975,43 +3935,77 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
           "  void *pool;\n"
           "  StigiRtStatus status;\n"
           "} StigiRtState;\n\n");
+
   if (need_mask) {
     eb_cstr(&b,
-          "static inline uint64_t Stigi_mask_index(uint64_t idx, uint64_t len) {\n"
-          "#if defined(__x86_64__)\n"
-          "  uint64_t mask;\n"
-          "  __asm__ __volatile__(\n"
-          "    \"cmpq %2, %1\\n\\t\"\n"
-          "    \"sbbq %0, %0\\n\\t\"\n"
-          "    : \"=r\"(mask)\n"
-          "    : \"r\"(idx), \"r\"(len)\n"
-          "    : \"cc\"\n"
-          "  );\n"
-          "  return idx & mask;\n"
-          "#elif defined(__aarch64__)\n"
-          "  uint64_t mask;\n"
-          "  __asm__ __volatile__(\n"
-          "    \"cmp %1, %2\\n\\t\"\n"
-          "    \"csetm %0, lo\\n\\t\"\n"
-          "    \"csdb\\n\\t\"\n"
-          "    : \"=r\"(mask)\n"
-          "    : \"r\"(idx), \"r\"(len)\n"
-          "    : \"cc\"\n"
-          "  );\n"
-          "  return idx & mask;\n"
-          "#else\n"
-          "  volatile uint64_t v_idx = idx;\n"
-          "  volatile uint64_t v_len = len;\n"
-          "  uint64_t c_idx = v_idx;\n"
-          "  uint64_t c_len = v_len;\n"
-          "  uint64_t mask = (uint64_t)0 - (uint64_t)(c_idx < c_len);\n"
-          "  volatile uint64_t v_mask = mask;\n"
-          "  return c_idx & v_mask;\n"
-          "#endif\n"
-          "}\n\n");
+            "static inline uint64_t Stigi_mask_index(uint64_t idx, uint64_t len) {\n"
+            "#if defined(__x86_64__)\n"
+            "  uint64_t mask;\n"
+            "  __asm__ __volatile__(\n"
+            "    \"cmpq %2, %1\\n\\t\"\n"
+            "    \"sbbq %0, %0\\n\\t\"\n"
+            "    : \"=r\"(mask)\n"
+            "    : \"r\"(idx), \"r\"(len)\n"
+            "    : \"cc\"\n"
+            "  );\n"
+            "  return idx & mask;\n"
+            "#elif defined(__aarch64__)\n"
+            "  uint64_t mask;\n"
+            "  __asm__ __volatile__(\n"
+            "    \"cmp %1, %2\\n\\t\"\n"
+            "    \"csetm %0, lo\\n\\t\"\n"
+            "    \"csdb\\n\\t\"\n"
+            "    : \"=r\"(mask)\n"
+            "    : \"r\"(idx), \"r\"(len)\n"
+            "    : \"cc\"\n"
+            "  );\n"
+            "  return idx & mask;\n"
+            "#else\n"
+            "  volatile uint64_t v_idx = idx;\n"
+            "  volatile uint64_t v_len = len;\n"
+            "  uint64_t c_idx = v_idx;\n"
+            "  uint64_t c_len = v_len;\n"
+            "  uint64_t mask = (uint64_t)0 - (uint64_t)(c_idx < c_len);\n"
+            "  volatile uint64_t v_mask = mask;\n"
+            "  return c_idx & v_mask;\n"
+            "#endif\n"
+            "}\n\n");
   }
-  /* Defects 9, 10, 11: exact S118 startup order, retain guard-paged stack/pool across Stigi_main,
-   * fail closed, zero unused warnings under -DSTIGI_PROFILE_RT_LOCKED */
+  if (need_mix) {
+    eb_cstr(&b,
+            "static inline uint64_t stigi_u64_mix(uint64_t x) {\n"
+            "  x += UINT64_C(0x9e3779b97f4a7c15);\n"
+            "  x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);\n"
+            "  x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);\n"
+            "  return x ^ (x >> 31);\n"
+            "}\n\n");
+  }
+  if (need_rotr) {
+    eb_cstr(&b,
+            "static inline uint32_t stigi_u32_rotr(uint32_t x, uint32_t n) {\n"
+            "  uint32_t s = n & 31U;\n"
+            "  return s == 0U ? x : ((x >> s) | (x << (32U - s)));\n"
+            "}\n\n");
+  }
+  if (need_alloc) {
+    /* memory.md 8 + S47 Fil-C test builds: per-object allocation, 64-byte cache-line aligned >= 64B */
+    eb_cstr(&b,
+            "static inline void *stigi_rt_try_alloc(uint64_t count, size_t elem_size) {\n"
+            "  if (elem_size == 0U) return NULL;\n"
+            "  if (count == 0U) return calloc(1U, 1U);\n"
+            "  if (count > ((uint64_t)SIZE_MAX) / elem_size) return NULL;\n"
+            "  size_t total = (size_t)count * elem_size;\n"
+            "  if (total >= 64U) {\n"
+            "    void *ptr = NULL;\n"
+            "    if (posix_memalign(&ptr, 64U, total) != 0 || ptr == NULL) return NULL;\n"
+            "    memset(ptr, 0, total);\n"
+            "    return ptr;\n"
+            "  }\n"
+            "  return calloc((size_t)count, elem_size);\n"
+            "}\n\n");
+  }
+
+  /* S118 startup order with sysconf(_SC_PAGESIZE) + real guard-paged stack execution */
   eb_cstr(&b,
           "static void stigi_rt_shutdown(StigiRtState *st) {\n"
           "  if (st->pool_raw != NULL) {\n"
@@ -2031,7 +4025,8 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
           "  st->pool_total = 0U;\n"
           "  st->pool = NULL;\n"
           "  st->status = STIGI_RT_OK;\n"
-          "  size_t page = 4096U;\n"
+          "  long ps = sysconf(_SC_PAGESIZE);\n"
+          "  size_t page = ps > 0 ? (size_t)ps : 4096U;\n"
           "  /* S118 (1): Map main stack (1 MiB) + 1 guard page below it */\n"
           "  size_t stack_sz = 1048576U;\n"
           "  size_t stack_tot = page + stack_sz;\n"
@@ -2074,18 +4069,23 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
           "    return st->status;\n"
           "  }\n"
           "#elif defined(MADV_POPULATE_WRITE)\n"
-          "  if (madvise(st->pool, pool_sz, MADV_POPULATE_WRITE) != 0) {\n"
+          "  if (madvise((char *)sraw + page, stack_sz, MADV_POPULATE_WRITE) != 0 ||\n"
+          "      madvise(st->pool, pool_sz, MADV_POPULATE_WRITE) != 0) {\n"
           "    stigi_rt_shutdown(st);\n"
           "    st->status = STIGI_RT_ERR_MEM_POPULATE;\n"
           "    return st->status;\n"
           "  }\n"
           "#else\n"
+          "  volatile unsigned char *vs = (volatile unsigned char *)((char *)sraw + page);\n"
+          "  for (size_t off = 0U; off < stack_sz; off += page) {\n"
+          "    vs[off] = 0U;\n"
+          "  }\n"
           "  volatile unsigned char *vp = (volatile unsigned char *)st->pool;\n"
           "  for (size_t off = 0U; off < pool_sz; off += page) {\n"
           "    vp[off] = 0U;\n"
           "  }\n"
           "#endif\n"
-          "  /* S118 (3): Ignore SIGPIPE */\n"
+          "  /* S118 (3): Set SIGPIPE disposition to SIG_IGN */\n"
           "  struct sigaction sa;\n"
           "  sa.sa_handler = SIG_IGN;\n"
           "  sa.sa_flags = 0;\n"
@@ -2098,17 +4098,55 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
           "  return STIGI_RT_OK;\n"
           "}\n\n");
 
-  /* 1. Emit Enums + _Static_assert on sizeOf / alignOf / offsetof (Defect 3) */
+  /* 1. Emit Enums in topological order + _Static_assert on sizeOf / alignOf / offsetof */
+  uint32_t *topo_buf = scnt > 0 ? malloc((size_t)scnt * sizeof *topo_buf) : NULL;
+  uint32_t topo_cnt = 0;
+  if (topo_buf != NULL) {
+    topo_order_kind(img, sorted, scnt, STIGI_DECL_ENUM, topo_buf, &topo_cnt);
+    for (uint32_t i = 0; i < topo_cnt; i++) {
+      const StigiImageUnit *u = &img->units[topo_buf[i]];
+      stats->enums_emitted++;
+      stats->units_emitted++;
+      emit_enum_unit(&b, img, u, u->ast->decl, enum_needs_eq != NULL && enum_needs_eq[u->idx]);
+    }
+  }
+  free(enum_needs_eq);
+
+  /* 1b. Emit body-less extern C declarations */
   for (uint32_t i = 0; i < scnt; i++) {
     const StigiImageUnit *u = sorted[i].u;
     const StigiDecl *d = u->ast->decl;
-    if (d->kind != STIGI_DECL_ENUM) continue;
-    stats->enums_emitted++;
-    stats->units_emitted++;
-    emit_enum_unit(&b, img, u, d);
+    if (d->kind != STIGI_DECL_EXTERN) continue;
+    if (d->u.extern_decl.is_val) {
+      eb_line_dir(&b, d->span.line, u->name, u->name_len);
+      eb_cstr(&b, "extern ");
+      emit_c_type(&b, img, u->idx, d->u.extern_decl.val_type, 0);
+      eb_cstr(&b, " ");
+      eb_str(&b, extern_c_sym(d->name));
+      eb_cstr(&b, ";\n");
+    } else if (d->u.extern_decl.body == NULL) {
+      const StigiDefHead *eh = &d->u.extern_decl.head;
+      eb_line_dir(&b, d->span.line, u->name, u->name_len);
+      eb_cstr(&b, "extern ");
+      emit_c_type(&b, img, u->idx, eh->ret_type, 0);
+      eb_cstr(&b, " ");
+      eb_str(&b, extern_c_sym(d->name));
+      eb_cstr(&b, "(");
+      if (eh->param_count == 0) {
+        eb_cstr(&b, "void");
+      } else {
+        for (uint32_t p = 0; p < eh->param_count; p++) {
+          if (p > 0) eb_cstr(&b, ", ");
+          emit_c_type(&b, img, u->idx, eh->params[p].type, 0);
+          eb_cstr(&b, " ");
+          eb_c_ident(&b, eh->params[p].name);
+        }
+      }
+      eb_cstr(&b, ");\n");
+    }
   }
 
-  /* 2. Forward-declare all reached defs and Tests */
+  /* 2. Forward-declare all reached defs, body-ful C-DSL externs, and Tests */
   for (uint32_t i = 0; i < scnt; i++) {
     const StigiImageUnit *u = sorted[i].u;
     const StigiDecl *d = u->ast->decl;
@@ -2117,7 +4155,13 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       continue;
     }
     if (d->kind == STIGI_DECL_DEF) {
-      emit_def_sig(&b, img, u->idx, d);
+      emit_def_sig_head(&b, img, u->idx, &d->u.def_decl.head, u->name, u->name_len,
+                        strcmp(u->name, "main") != 0, false, NULL);
+      eb_cstr(&b, ";\n");
+    } else if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val &&
+               d->u.extern_decl.body != NULL) {
+      emit_def_sig_head(&b, img, u->idx, &d->u.extern_decl.head, u->name, u->name_len,
+                        true, true, NULL);
       eb_cstr(&b, ";\n");
     } else if (d->kind == STIGI_DECL_TEST) {
       eb_cstr(&b, "static int32_t ");
@@ -2127,41 +4171,80 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
   }
   eb_cstr(&b, "\n");
 
-  /* 3. Emit top-level vals */
+  /* 3. Emit top-level vals in topological order (comptime-folded into C11 constant initializers!) */
+  if (topo_buf != NULL) {
+    topo_order_kind(img, sorted, scnt, STIGI_DECL_VAL, topo_buf, &topo_cnt);
+    Arena ev_arena;
+    arena_init(&ev_arena);
+    for (uint32_t i = 0; i < topo_cnt; i++) {
+      const StigiImageUnit *u = &img->units[topo_buf[i]];
+      const StigiDecl *d = u->ast->decl;
+      if (ast_type_is_void(img, u->idx, d->u.val_decl.type)) continue;
+      stats->units_emitted++;
+      eb_line_dir(&b, d->span.line, u->name, u->name_len);
+      eb_cstr(&b, "static const ");
+      emit_c_type(&b, img, u->idx, d->u.val_decl.type, 0);
+      eb_cstr(&b, " ");
+      eb_mangle_name(&b, u->name, u->name_len);
+      eb_cstr(&b, " = ");
+      EmitScalarTy vhint = ast_type_to_scalar(img, u->idx, d->u.val_decl.type, 0);
+      StigiEvalResult er = stigi_eval_unit(img, u->idx, STIGI_DEFAULT_FUEL, &ev_arena);
+      if (er.status == STIGI_OK && er.value.kind == STIGI_VAL_INT) {
+        if (er.value.is_unsigned) {
+          emit_typed_int_lit(&b, er.value.u.u, false, vhint);
+        } else if (er.value.u.i < 0) {
+          uint64_t mag = (er.value.u.i == INT64_MIN) ? (9223372036854775808ULL)
+                                                     : (uint64_t)(-er.value.u.i);
+          emit_typed_int_lit(&b, mag, true, vhint);
+        } else {
+          emit_typed_int_lit(&b, (uint64_t)er.value.u.i, false, vhint);
+        }
+      } else if (er.status == STIGI_OK && er.value.kind == STIGI_VAL_BOOL) {
+        eb_cstr(&b, er.value.u.b ? "true" : "false");
+      } else {
+        EmitCtx ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.img = img;
+        ctx.uidx = u->idx;
+        ctx.b = &b;
+        ctx.stats = stats;
+        ctx.mask_info = mask_infos != NULL ? &mask_infos[u->idx] : NULL;
+        emit_expr_typed(&ctx, d->u.val_decl.body, vhint);
+        emit_ctx_free(&ctx);
+      }
+      eb_cstr(&b, ";\n\n");
+    }
+    arena_free(&ev_arena);
+  }
+  free(topo_buf);
+
+  /* 3b. Emit Handlers (state struct + init + ops) */
   for (uint32_t i = 0; i < scnt; i++) {
     const StigiImageUnit *u = sorted[i].u;
     const StigiDecl *d = u->ast->decl;
-    if (d->kind != STIGI_DECL_VAL) continue;
-    if (ast_type_is_void(img, u->idx, d->u.val_decl.type)) continue;
+    if (d->kind != STIGI_DECL_HANDLER) continue;
     stats->units_emitted++;
-    eb_line_dir(&b, d->span.line, u->name, u->name_len);
-    eb_cstr(&b, "static const ");
-    emit_c_type(&b, img, u->idx, d->u.val_decl.type, 0);
-    eb_cstr(&b, " ");
-    eb_mangle_name(&b, u->name, u->name_len);
-    eb_cstr(&b, " = ");
-    EmitCtx ctx;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.img = img;
-    ctx.uidx = u->idx;
-    ctx.b = &b;
-    ctx.stats = stats;
-    ctx.mask_info = mask_infos != NULL ? &mask_infos[u->idx] : NULL;
-    EmitScalarTy vhint = ast_type_to_scalar(img, u->idx, d->u.val_decl.type, 0);
-    emit_expr_typed(&ctx, d->u.val_decl.body, vhint);
-    eb_cstr(&b, ";\n\n");
+    emit_handler_unit(&b, img, u, d, stats, mask_infos);
   }
 
-  /* 4. Emit defs and Tests */
+  /* 4. Emit body-ful C-DSL externs, defs, and Tests */
   bool has_main = false;
   bool main_is_void = false;
+  bool any_fail_closed = false;
+  char fail_msg[256] = {0};
+
   for (uint32_t i = 0; i < scnt; i++) {
     const StigiImageUnit *u = sorted[i].u;
     const StigiDecl *d = u->ast->decl;
-    if (d->kind == STIGI_DECL_DEF) {
-      if (strcmp(u->name, "main") == 0) {
+    if (d->kind == STIGI_DECL_DEF ||
+        (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val &&
+         d->u.extern_decl.body != NULL)) {
+      bool is_extern_dsl = (d->kind == STIGI_DECL_EXTERN);
+      const StigiDefHead *h = is_extern_dsl ? &d->u.extern_decl.head : &d->u.def_decl.head;
+      const StigiExpr *body = is_extern_dsl ? d->u.extern_decl.body : d->u.def_decl.body;
+      if (!is_extern_dsl && strcmp(u->name, "main") == 0) {
         has_main = true;
-        main_is_void = ast_type_is_void(img, u->idx, d->u.def_decl.head.ret_type);
+        main_is_void = ast_type_is_void(img, u->idx, h->ret_type);
       }
       stats->defs_emitted++;
       stats->units_emitted++;
@@ -2170,41 +4253,55 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       memset(&ctx, 0, sizeof ctx);
       ctx.img = img;
       ctx.uidx = u->idx;
-      ctx.cur_def = d;
+      ctx.cur_def = is_extern_dsl ? NULL : d;
+      ctx.cur_head = h;
       ctx.b = &b;
       ctx.stats = stats;
       ctx.mask_info = mask_infos != NULL ? &mask_infos[u->idx] : NULL;
-      ctx.is_tail_loop = has_self_tail_call(&ctx, d->u.def_decl.body);
-      ctx.is_never_def = ast_type_is_never(img, u->idx, d->u.def_decl.head.ret_type);
-      ctx.ret_scalar = ast_type_to_scalar(img, u->idx, d->u.def_decl.head.ret_type, 0);
+      ctx.is_tail_loop = !is_extern_dsl && has_self_tail_call(&ctx, body);
+      ctx.is_never_def = (ast_type_to_scalar(img, u->idx, h->ret_type, 0) == ETY_NEVER);
+      ctx.in_extern_dsl = is_extern_dsl;
+      ctx.ret_scalar = ast_type_to_scalar(img, u->idx, h->ret_type, 0);
+      ctx.ret_ast_type = h->ret_type;
+      ctx.ret_type_uidx = u->idx;
       if (ctx.is_tail_loop) stats->tail_loops++;
 
-      const StigiDefHead *h = &d->u.def_decl.head;
-      for (uint32_t p = 0; p < h->param_count && ctx.var_count < 128; p++) {
-        emit_register_var(&ctx, h->params[p].name, h->params[p].type, u->idx, true);
+      if (h->param_count > 0) {
+        ctx.param_cnames = calloc(h->param_count, sizeof *ctx.param_cnames);
+        ctx.param_cname_count = h->param_count;
+      }
+      for (uint32_t p = 0; p < h->param_count; p++) {
+        EmitVar *pv = emit_register_var(&ctx, h->params[p].name, h->params[p].type, u->idx, true);
+        if (pv != NULL && pv->c_name != NULL && ctx.param_cnames != NULL) {
+          size_t cl = strlen(pv->c_name);
+          ctx.param_cnames[p] = malloc(cl + 1U);
+          if (ctx.param_cnames[p] != NULL) memcpy(ctx.param_cnames[p], pv->c_name, cl + 1U);
+        }
       }
 
       eb_line_dir(&b, d->span.line, u->name, u->name_len);
-      emit_def_sig(&b, img, u->idx, d);
+      emit_def_sig_head(&b, img, u->idx, h, u->name, u->name_len,
+                        is_extern_dsl || strcmp(u->name, "main") != 0, is_extern_dsl, NULL);
       eb_cstr(&b, " {\n");
-      /* Suppress unused parameter warnings for length-only parameters (e.g. count in Array[U64](count)) */
       for (uint32_t p = 0; p < h->param_count; p++) {
         eb_cstr(&b, "  (void)");
-        eb_str(&b, h->params[p].name);
+        eb_c_ident(&b, h->params[p].name);
         eb_cstr(&b, ";\n");
       }
       bool is_void = ast_type_is_void(img, u->idx, h->ret_type);
       if (ctx.is_tail_loop) {
         eb_cstr(&b, "  while (1) {\n");
-        emit_stmt_or_ret(&ctx, d->u.def_decl.body, true, is_void);
+        emit_stmt_or_ret(&ctx, body, true, is_void);
         eb_cstr(&b, "  }\n");
       } else {
-        emit_stmt_or_ret(&ctx, d->u.def_decl.body, true, is_void);
-      }
-      if (ctx.is_never_def) {
-        eb_cstr(&b, "  __builtin_unreachable();\n");
+        emit_stmt_or_ret(&ctx, body, true, is_void);
       }
       eb_cstr(&b, "}\n\n");
+      if (ctx.fail_closed && !any_fail_closed) {
+        any_fail_closed = true;
+        (void)snprintf(fail_msg, sizeof fail_msg, "%s", ctx.fail_msg);
+      }
+      emit_ctx_free(&ctx);
     } else if (d->kind == STIGI_DECL_TEST) {
       stats->units_emitted++;
       EmitCtx ctx;
@@ -2221,51 +4318,101 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       eb_cstr(&b, "(void) {\n");
       emit_stmt_or_ret(&ctx, d->u.val_decl.body, true, false);
       eb_cstr(&b, "}\n\n");
+      if (ctx.fail_closed && !any_fail_closed) {
+        any_fail_closed = true;
+        (void)snprintf(fail_msg, sizeof fail_msg, "%s", ctx.fail_msg);
+      }
+      emit_ctx_free(&ctx);
     }
   }
 
-  /* 5. C entry point: reset #line (Defect 5), retain guard-paged stack/pool across Stigi_main (Defect 10) */
+  /* 5. C entry point: execute Tests + Stigi_main ON the mapped 1 MiB guard-paged stack (S118) */
   eb_cstr(&b,
           "#line 1 \"<stigi-runtime-main>\"\n"
+          "static int stigi_run_on_stack(StigiRtState *rt_state) {\n"
+          "  (void)rt_state;\n");
+  for (uint32_t i = 0; i < scnt; i++) {
+    const StigiImageUnit *u = sorted[i].u;
+    if (u->ast->decl->kind == STIGI_DECL_TEST) {
+      eb_cstr(&b, "  if (");
+      eb_mangle_name(&b, u->name, u->name_len);
+      eb_cstr(&b, "() != 0) return 100;\n");
+    }
+  }
+  if (has_main) {
+    if (main_is_void) {
+      eb_cstr(&b, "  Stigi_main();\n  return 0;\n");
+    } else {
+      eb_cstr(&b, "  return (int)Stigi_main();\n");
+    }
+  } else {
+    eb_cstr(&b, "  return 0;\n");
+  }
+  eb_cstr(&b,
+          "}\n\n"
+          "#if defined(__x86_64__) && !defined(__FILC__)\n"
+          "static int stigi_call_on_stack(void *stack_top, int (*fn)(StigiRtState *), StigiRtState *arg) {\n"
+          "  uintptr_t top = (((uintptr_t)stack_top) & ~(uintptr_t)15U) - 16U;\n"
+          "  int (*f)(StigiRtState *) = fn;\n"
+          "  StigiRtState *a = arg;\n"
+          "  int rc = 0;\n"
+          "  __asm__ __volatile__(\n"
+          "    \"movq %%rsp, (%1)\\n\\t\"\n"
+          "    \"movq %1, %%rsp\\n\\t\"\n"
+          "    \"call *%2\\n\\t\"\n"
+          "    \"movq (%%rsp), %%rsp\\n\\t\"\n"
+          "    : \"=a\"(rc), \"+r\"(top), \"+S\"(f), \"+D\"(a)\n"
+          "    :\n"
+          "    : \"rcx\", \"rdx\", \"r8\", \"r9\", \"r10\", \"r11\", \"memory\", \"cc\"\n"
+          "  );\n"
+          "  return rc;\n"
+          "}\n"
+          "#elif defined(__aarch64__) && !defined(__FILC__)\n"
+          "static int stigi_call_on_stack(void *stack_top, int (*fn)(StigiRtState *), StigiRtState *arg) {\n"
+          "  uintptr_t top = (((uintptr_t)stack_top) & ~(uintptr_t)15U) - 16U;\n"
+          "  register int rc __asm__(\"w0\");\n"
+          "  register StigiRtState *x0 __asm__(\"x0\") = arg;\n"
+          "  register int (*x9)(StigiRtState *) __asm__(\"x9\") = fn;\n"
+          "  register uintptr_t x10 __asm__(\"x10\") = top;\n"
+          "  __asm__ __volatile__(\n"
+          "    \"mov x11, sp\\n\\t\"\n"
+          "    \"str x11, [x10]\\n\\t\"\n"
+          "    \"mov sp, x10\\n\\t\"\n"
+          "    \"blr x9\\n\\t\"\n"
+          "    \"ldr x11, [sp]\\n\\t\"\n"
+          "    \"mov sp, x11\\n\\t\"\n"
+          "    : \"=r\"(rc), \"+r\"(x0), \"+r\"(x9), \"+r\"(x10)\n"
+          "    :\n"
+          "    : \"x1\", \"x2\", \"x3\", \"x4\", \"x5\", \"x6\", \"x7\", \"x8\",\n"
+          "      \"x11\", \"x12\", \"x13\", \"x14\", \"x15\", \"x16\", \"x17\", \"x30\", \"memory\", \"cc\"\n"
+          "  );\n"
+          "  return rc;\n"
+          "}\n"
+          "#else\n"
+          "static int stigi_call_on_stack(void *stack_top, int (*fn)(StigiRtState *), StigiRtState *arg) {\n"
+          "  (void)stack_top;\n"
+          "  return fn(arg);\n"
+          "}\n"
+          "#endif\n\n"
           "int main(void) {\n"
           "  StigiRtState rt_state;\n"
           "  StigiRtStatus rt = stigi_rt_init(&rt_state);\n"
           "  if (rt != STIGI_RT_OK) {\n"
           "    stigi_rt_shutdown(&rt_state);\n"
           "    return (int)rt;\n"
-          "  }\n");
-  for (uint32_t i = 0; i < scnt; i++) {
-    const StigiImageUnit *u = sorted[i].u;
-    if (u->ast->decl->kind == STIGI_DECL_TEST) {
-      eb_cstr(&b, "  if (");
-      eb_mangle_name(&b, u->name, u->name_len);
-      eb_cstr(&b, "() != 0) {\n"
-                  "    stigi_rt_shutdown(&rt_state);\n"
-                  "    return 100;\n"
-                  "  }\n");
-    }
-  }
-  if (has_main) {
-    if (main_is_void) {
-      eb_cstr(&b,
-              "  Stigi_main();\n"
-              "  stigi_rt_shutdown(&rt_state);\n"
-              "  return 0;\n");
-    } else {
-      eb_cstr(&b,
-              "  int rc = (int)Stigi_main();\n"
-              "  stigi_rt_shutdown(&rt_state);\n"
-              "  return rc;\n");
-    }
-  } else {
-    eb_cstr(&b,
-            "  stigi_rt_shutdown(&rt_state);\n"
-            "  return 0;\n");
-  }
-  eb_cstr(&b, "}\n");
+          "  }\n"
+          "  void *stack_top = (char *)rt_state.stack_raw + rt_state.stack_total;\n"
+          "  int rc = stigi_call_on_stack(stack_top, stigi_run_on_stack, &rt_state);\n"
+          "  stigi_rt_shutdown(&rt_state);\n"
+          "  return rc;\n"
+          "}\n");
 
   free_unit_masks(mask_infos, img->unit_count);
   free(sorted);
+  if (any_fail_closed) {
+    free(b.buf);
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "%s", fail_msg);
+  }
   if (b.oom) {
     free(b.buf);
     return diag_set(diag, STIGI_ERR_OOM, -1, "stigi_emit_c: OOM");
@@ -2275,7 +4422,7 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
   return STIGI_OK;
 }
 
-/* Dynamic line reader for .su files (no fixed line[512] truncation, Defect 13) */
+/* Dynamic line reader for .su files (no fixed line truncation; detects embedded NULs) */
 static int read_dynamic_line(FILE *f, char **buf, size_t *cap, size_t *out_len) {
   size_t len = 0;
   int ch = 0;
@@ -2296,9 +4443,7 @@ static int read_dynamic_line(FILE *f, char **buf, size_t *cap, size_t *out_len) 
   return 1;
 }
 
-/* Parse GCC/Clang -fstack-usage .su file: `file:line:col:func\tbytes\tqualifier`
- * Defects 12 & 13: dynamic lines, strict bytes <= fb, validate strtoull endptr,
- * include DECL_TEST, fail closed if 0 emitted Stigi_* functions matched. */
+/* Parse GCC/Clang -fstack-usage .su file: `file:line:col:func\tbytes\tqualifier` */
 Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
                            char *err_buf, size_t err_cap) {
   if (su_path == NULL || img == NULL) return STIGI_ERR_INVALID;
@@ -2334,6 +4479,14 @@ Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
     }
     if (rr == 0) break;
 
+    if (memchr(line, '\0', line_len) != NULL) {
+      if (err_buf != NULL && err_cap > 0) {
+        (void)snprintf(err_buf, err_cap, "embedded NUL byte in .su file '%s'", su_path);
+      }
+      result = STIGI_ERR_INVALID;
+      break;
+    }
+
     while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
       line[--line_len] = '\0';
     }
@@ -2360,7 +4513,6 @@ Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
     const char *bytes_str = t1 + 1;
     const char *qual = t2 + 1;
 
-    /* Validate strtoull endptr and overflow (Defect 13) */
     if (*bytes_str == '\0' || *bytes_str == '-' || *bytes_str == '+') {
       if (err_buf != NULL && err_cap > 0) {
         (void)snprintf(err_buf, err_cap, "malformed .su byte count '%s'", bytes_str);
@@ -2380,7 +4532,6 @@ Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
     }
     uint64_t bytes = (uint64_t)parsed_bytes;
 
-    /* Extract function name after last ':' in first column */
     const char *colon = strrchr(line, ':');
     const char *fn = colon != NULL ? colon + 1 : line;
 
@@ -2392,7 +4543,6 @@ Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
       break;
     }
 
-    /* Match against Stigi_<mangled> DEF and TEST units; enforce STRICT bytes <= fb */
     if (strncmp(fn, "Stigi_", 6) == 0) {
       for (uint32_t i = 0; i < img->unit_count; i++) {
         StigiDeclKind k = img->units[i].ast->decl->kind;
@@ -2436,7 +4586,6 @@ Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
   free(line);
   (void)fclose(f);
 
-  /* Defect 12: fail closed if 0 emitted Stigi_* functions matched in .su */
   if (result == STIGI_OK && expected_funcs > 0 && matched == 0) {
     if (err_buf != NULL && err_cap > 0) {
       (void)snprintf(err_buf, err_cap,

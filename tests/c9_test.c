@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -271,7 +272,8 @@ static int test_store_load_roundtrip(void) {
         "3 unchanged units and 1 test stayed cached");
   stigi_door_result_free(&res);
 
-  /* Negative control: corrupt cache file MUST be rejected */
+  /* Negative control: corrupt cache file MUST be rejected AND leave existing cache intact (T0) */
+  uint32_t cache_before = fresh_door2.verdict_cache.count;
   FILE *cf = fopen("/tmp/stigi-c9-store/cache", "r+b");
   CHECK(cf != NULL, "open cache for corruption test");
   CHECK(fseek(cf, 20, SEEK_SET) == 0, "seek cache");
@@ -280,7 +282,23 @@ static int test_store_load_roundtrip(void) {
   stigi_door_result_init(&res);
   CHECK(stigi_load_dir(&fresh_door2, store_dir, &res, &diag) == STIGI_ERR_INVALID,
         "corrupt cache file rejected");
+  CHECK(fresh_door2.verdict_cache.count == cache_before,
+        "T0: rejected load_dir leaves existing verdict cache intact");
   stigi_door_result_free(&res);
+
+  /* Subset store: store DIR NAME writes only the requested unit */
+  const char *sub_dir = "/tmp/stigi-c9-store-sub";
+  rm_rf(sub_dir);
+  CHECK(mkdir(sub_dir, 0755) == 0, "mkdir sub_dir");
+  const char *sub_names[1] = {"Demo.doubleVal"};
+  CHECK(stigi_store_dir_subset(&door, sub_dir, sub_names, 1, err, sizeof(err)) == STIGI_OK,
+        "store_dir_subset single unit ok");
+  struct stat sst;
+  CHECK(stat("/tmp/stigi-c9-store-sub/Demo/doubleVal.sc", &sst) == 0,
+        "subset store wrote Demo/doubleVal.sc");
+  CHECK(stat("/tmp/stigi-c9-store-sub/main.sc", &sst) != 0,
+        "subset store omitted non-selected main.sc");
+  rm_rf(sub_dir);
 
   /* Restore clean store, then corrupt index file -> MUST be rejected */
   CHECK(stigi_store_dir(&door, store_dir, err, sizeof(err)) == STIGI_OK, "restore store");
@@ -553,7 +571,7 @@ static int test_3transport_parity_and_negatives(void) {
   CHECK(memcmp(c_vk_before, door_mcp.image.units[ci].verdict_key, 32) != 0,
         "S119: caller verdict_key invalidated after callee proof-fact-only edit");
 
-  /* 9. Defect #25: 1,000-frame flat-RSS oracle with REAL non-empty `check` frames */
+  /* 9. Defect #25: 1,000-frame flat-RSS + zero-page-fault oracle with REAL `check` frames */
   const char *real_check =
       "check\n"
       "new // prompt: real check unit\n"
@@ -563,6 +581,9 @@ static int test_3transport_parity_and_negatives(void) {
   clock_gettime(CLOCK_MONOTONIC, &t0);
   long rss_10 = 0;
   long rss_1000 = 0;
+  struct rusage ru10, ru1000;
+  memset(&ru10, 0, sizeof ru10);
+  memset(&ru1000, 0, sizeof ru1000);
   for (int i = 1; i <= 1000; i++) {
     char *crep = NULL;
     size_t crl = 0;
@@ -570,20 +591,114 @@ static int test_3transport_parity_and_negatives(void) {
           "1000-frame real check ok");
     CHECK(strstr(crep, "admitted component 1") != NULL, "real check admitted");
     free(crep);
-    if (i == 10) rss_10 = read_vm_rss_kb();
-    if (i == 1000) rss_1000 = read_vm_rss_kb();
+    if (i == 10) {
+      rss_10 = read_vm_rss_kb();
+      (void)getrusage(RUSAGE_SELF, &ru10);
+    }
+    if (i == 1000) {
+      rss_1000 = read_vm_rss_kb();
+      (void)getrusage(RUSAGE_SELF, &ru1000);
+    }
   }
   clock_gettime(CLOCK_MONOTONIC, &t1);
   double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
   long rss_delta = rss_1000 - rss_10;
+  long minflt_delta = ru1000.ru_minflt - ru10.ru_minflt;
+  long majflt_delta = ru1000.ru_majflt - ru10.ru_majflt;
   printf("c9 3-transport parity: PASS (6 mutating+read frames byte-identical + identical unit_ids across 3 servers)\n");
   printf("c9 negative controls + S119: PASS (all 8 controls verified)\n");
-  printf("c9 1000-frame real-check RSS: wall=%.2f ms, rss10=%ld KB, rss1000=%ld KB, delta=%ld KB\n",
-         ms, rss_10, rss_1000, rss_delta);
+  printf("c9 1000-frame real-check RSS: wall=%.2f ms, rss10=%ld KB, rss1000=%ld KB, delta=%ld KB, minflt=%ld, majflt=%ld\n",
+         ms, rss_10, rss_1000, rss_delta, minflt_delta, majflt_delta);
 
-#if !defined(__SANITIZE_ADDRESS__)
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
   CHECK(rss_delta <= 64, "RSS delta <= 64 KB over 1000 real check frames");
+  CHECK(majflt_delta == 0, "0 major page faults in steady state");
+  CHECK(minflt_delta == 0, "0 minor page faults in steady state");
 #endif
+
+  /* 10. Wave 4 controls: batch inline test, JSON-RPC scalar id, \u0000 rejection, T18 parallel==seq */
+  {
+    const char *inline_test_batch =
+        "batch\n"
+        "test (2 + 3) == 5\n";
+    CHECK(stigi_handle_frame(&srv_mcp, inline_test_batch, strlen(inline_test_batch),
+                             &rep, &rlen, &diag) == STIGI_OK,
+          "batch inline test ok");
+    CHECK(strstr(rep, "admitted component 1") != NULL,
+          "batch inline test passes tenet gate with readable name");
+    free(rep);
+
+    const char *bad_obj_id = "{\"jsonrpc\":\"2.0\",\"id\":{\"a\":1},\"method\":\"ping\"}";
+    CHECK(stigi_mcp_handle_jsonrpc(&srv_mcp, bad_obj_id, strlen(bad_obj_id),
+                                   &rep, &rlen, &diag) == STIGI_OK,
+          "invalid object id handled");
+    CHECK(rep != NULL && strstr(rep, "-32600") != NULL,
+          "JSON-RPC non-scalar object id rejected with -32600");
+    free(rep);
+
+    const char *nul_esc = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stigi_frame\",\"arguments\":{\"frame\":\"list\\u0000\"}}}";
+    CHECK(stigi_mcp_handle_jsonrpc(&srv_mcp, nul_esc, strlen(nul_esc),
+                                   &rep, &rlen, &diag) == STIGI_OK,
+          "\\u0000 escape handled");
+    CHECK(rep != NULL && strstr(rep, "\"error\"") != NULL,
+          "JSON string with \\u0000 embedded NUL rejected");
+    free(rep);
+  }
+
+  /* T18 lock-free parallel vs sequential parity on 9 units (8 helpers + main) */
+  {
+    const char *par_srcs[9] = {
+        "// prompt: pure math helper one.\npub def Par.helperOne(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 1\n",
+        "// prompt: pure math helper two.\npub def Par.helperTwo(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 2\n",
+        "// prompt: pure math helper three.\npub def Par.helperThree(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 3\n",
+        "// prompt: pure math helper four.\npub def Par.helperFour(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 4\n",
+        "// prompt: pure math helper five.\npub def Par.helperFive(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 5\n",
+        "// prompt: pure math helper six.\npub def Par.helperSix(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 6\n",
+        "// prompt: pure math helper seven.\npub def Par.helperSeven(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 7\n",
+        "// prompt: pure math helper eight.\npub def Par.helperEight(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 8\n",
+        "// prompt: entry calling all eight parallel helpers.\n"
+        "pub def main() <lessOrEqual(0, 1)>: I32 =\n"
+        "  val first: U64 = Par.helperOne(1)\n"
+        "  val second: U64 = Par.helperTwo(1)\n"
+        "  val third: U64 = Par.helperThree(1)\n"
+        "  val fourth: U64 = Par.helperFour(1)\n"
+        "  val fifth: U64 = Par.helperFive(1)\n"
+        "  val sixth: U64 = Par.helperSix(1)\n"
+        "  val seventh: U64 = Par.helperSeven(1)\n"
+        "  val eighth: U64 = Par.helperEight(1)\n"
+        "  if first == 2 && second == 3 && third == 4 && fourth == 5 && fifth == 6 && sixth == 7 && seventh == 8 && eighth == 9 then 0 else 1\n"
+    };
+    size_t par_lens[9];
+    for (int i = 0; i < 9; i++) par_lens[i] = strlen(par_srcs[i]);
+
+    StigiDoor d_seq, d_par;
+    CHECK(stigi_door_init(&d_seq, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &diag) == STIGI_OK, "d_seq init");
+    CHECK(stigi_door_init(&d_par, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &diag) == STIGI_OK, "d_par init");
+
+    StigiDoorResult r_seq, r_par;
+    stigi_door_result_init(&r_seq);
+    stigi_door_result_init(&r_par);
+    setenv("STIGI_THREADS", "1", 1);
+    CHECK(stigi_door_submit(&d_seq, par_srcs, par_lens, 9, &r_seq, &diag) == STIGI_OK && r_seq.accepted,
+          "T18 sequential 9-unit submit accepted");
+    setenv("STIGI_THREADS", "4", 1);
+    CHECK(stigi_door_submit(&d_par, par_srcs, par_lens, 9, &r_par, &diag) == STIGI_OK && r_par.accepted,
+          "T18 parallel 4-thread 9-unit submit accepted");
+    unsetenv("STIGI_THREADS");
+
+    CHECK(d_seq.image.unit_count == 9 && d_par.image.unit_count == 9, "T18 parallel == seq unit count");
+    for (uint32_t i = 0; i < 9; i++) {
+      CHECK(strcmp(d_seq.image.units[i].name, d_par.image.units[i].name) == 0 &&
+            memcmp(d_seq.image.units[i].unit_id, d_par.image.units[i].unit_id, 32) == 0 &&
+            memcmp(d_seq.image.units[i].verdict_key, d_par.image.units[i].verdict_key, 32) == 0,
+            "T18 parallel == seq byte-identical runtime_id and verdict_key");
+    }
+    printf("c9 T18 parallel==seq: PASS (9 units, 4 lock-free workers byte-identical to 1 thread)\n");
+    stigi_door_result_free(&r_seq);
+    stigi_door_result_free(&r_par);
+    stigi_door_free(&d_seq);
+    stigi_door_free(&d_par);
+  }
 
   stigi_server_free(&srv_sock);
   stigi_server_free(&srv_cc);

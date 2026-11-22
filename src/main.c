@@ -70,8 +70,22 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!serve_sock && !cc_sock && !mcp_mode && !(load_dir && emit_path)) {
+  int mode_count = (serve_sock != NULL ? 1 : 0) + (cc_sock != NULL ? 1 : 0) +
+                   (mcp_mode ? 1 : 0) + (emit_path != NULL ? 1 : 0);
+  if (mode_count == 0) {
     fprintf(stderr, "stigi-seed: no mode specified (try --help)\n");
+    return 1;
+  }
+  if (mode_count > 1) {
+    fprintf(stderr, "stigi-seed: --serve, --cc-socks, --mcp, and --emit are mutually exclusive\n");
+    return 1;
+  }
+  if (mcp_sock != NULL && !mcp_mode) {
+    fprintf(stderr, "stigi-seed: --socket requires --mcp\n");
+    return 1;
+  }
+  if (emit_path != NULL && load_dir == NULL) {
+    fprintf(stderr, "stigi-seed: --emit requires --load <dir>\n");
     return 1;
   }
 

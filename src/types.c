@@ -508,6 +508,144 @@ static StigiTy *resolve_ast_type(const StigiImage *img, uint32_t from_idx,
 
 /* ---- Layout computation (memory.md 8) ---- */
 
+static StigiLayout ty_layout_rec(const StigiImage *img, const StigiTy *ty, int depth);
+
+static StigiEnumLayoutInfo enum_layout_info_rec(const StigiImage *img, uint32_t enum_uidx,
+                                                StigiTy *const *type_args,
+                                                uint32_t type_arg_count, int depth) {
+  StigiEnumLayoutInfo info;
+  memset(&info, 0, sizeof info);
+  info.layout = (StigiLayout){1, 1};
+  info.tag_size = 1;
+  info.union_align = 1;
+  if (img == NULL || enum_uidx >= img->unit_count || depth > 32) return info;
+  const StigiDecl *d = img->units[enum_uidx].ast->decl;
+  if (d->kind != STIGI_DECL_ENUM) return info;
+
+  uint32_t case_count = d->u.enum_decl.case_count;
+  uint64_t tag_size = (case_count <= 256U) ? 1ULL : (case_count <= 65536U ? 2ULL : 4ULL);
+  uint64_t tag_align = tag_size;
+  info.tag_size = tag_size;
+
+  Arena tmp;
+  arena_init(&tmp);
+  InternPool lin;
+  intern_init(&lin);
+  TyCtx ectx;
+  memset(&ectx, 0, sizeof ectx);
+  ectx.img = img;
+  ectx.uidx = enum_uidx;
+  ectx.arena = &tmp;
+  ectx.lin_intern = &lin;
+  for (uint32_t tp = 0; tp < d->u.enum_decl.type_param_count; tp++) {
+    StigiTy *subst = (tp < type_arg_count && type_args != NULL) ? type_args[tp] : NULL;
+    (void)push_ty_type_param(&ectx, d->u.enum_decl.type_params[tp].name, subst);
+  }
+
+  /* memory.md 8: 1-word nullable-pointer optimization:
+   * 1 field-less case + 1 case holding a single Array or Cell field */
+  if (case_count == 2U) {
+    uint32_t f0 = d->u.enum_decl.cases[0].field_count;
+    uint32_t f1 = d->u.enum_decl.cases[1].field_count;
+    if ((f0 == 0U && f1 == 1U) || (f1 == 0U && f0 == 1U)) {
+      uint32_t nc = (f0 == 0U) ? 0U : 1U;
+      uint32_t pc = (f0 == 0U) ? 1U : 0U;
+      StigiTy *fty = resolve_ast_type_ctx(img, enum_uidx, d->u.enum_decl.cases[pc].fields[0].type,
+                                          &tmp, &lin, &ectx, NULL, NULL, 0);
+      const StigiTy *ufty = unwrap_ty_underlying(fty);
+      if (ufty != NULL && (ufty->kind == STIGI_TY_ARRAY || ufty->kind == STIGI_TY_CELL)) {
+        ty_ctx_free(&ectx);
+        intern_free(&lin);
+        arena_free(&tmp);
+        info.is_nullable_ptr = true;
+        info.null_case = nc;
+        info.ptr_case = pc;
+        info.tag_size = 0;
+        info.tag_offset = 0;
+        info.layout = (StigiLayout){8, 8};
+        return info;
+      }
+    }
+  }
+
+  uint64_t union_align = 1;
+  uint64_t union_size = 0;
+  uint64_t max_raw_end = 0;
+  bool has_any_fields = false;
+
+  for (uint32_t c = 0; c < case_count; c++) {
+    const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
+    if (ec->field_count == 0) continue;
+    StigiLayout *flays = arena_alloc(&tmp, (size_t)ec->field_count * sizeof *flays);
+    uint32_t *order = arena_alloc(&tmp, (size_t)ec->field_count * sizeof *order);
+    if (flays == NULL || order == NULL) continue;
+    uint32_t non_empty = 0;
+    for (uint32_t f = 0; f < ec->field_count; f++) {
+      StigiTy *fty = resolve_ast_type_ctx(img, enum_uidx, ec->fields[f].type,
+                                          &tmp, &lin, &ectx, NULL, NULL, 0);
+      flays[f] = ty_layout_rec(img, fty, depth + 1);
+      order[f] = f;
+      if (flays[f].size > 0) non_empty++;
+    }
+    if (non_empty == 0) continue;
+    has_any_fields = true;
+    for (uint32_t i = 1; i < ec->field_count; i++) {
+      uint32_t key = order[i];
+      uint64_t ka = flays[key].align;
+      uint32_t j = i;
+      while (j > 0 && flays[order[j - 1]].align < ka) {
+        order[j] = order[j - 1];
+        j--;
+      }
+      order[j] = key;
+    }
+    uint64_t c_align = 1;
+    uint64_t off = 0;
+    for (uint32_t i = 0; i < ec->field_count; i++) {
+      StigiLayout fl = flays[order[i]];
+      if (fl.size == 0) continue;
+      if (fl.align > c_align) c_align = fl.align;
+      off = align_up_u64(off, fl.align) + fl.size;
+    }
+    uint64_t c_size = align_up_u64(off, c_align);
+    if (off > max_raw_end) max_raw_end = off;
+    if (c_align > union_align) union_align = c_align;
+    if (c_size > union_size) union_size = c_size;
+  }
+
+  ty_ctx_free(&ectx);
+  intern_free(&lin);
+  arena_free(&tmp);
+
+  if (!has_any_fields) {
+    info.is_tag_only = true;
+    info.tag_offset = 0;
+    info.layout = (StigiLayout){tag_size, tag_align};
+    return info;
+  }
+
+  info.union_align = union_align;
+  info.union_size = align_up_u64(union_size, union_align);
+  uint64_t total_align = union_align > tag_align ? union_align : tag_align;
+  uint64_t padded_union = align_up_u64(info.union_size, total_align);
+  uint64_t cand_tag_off = align_up_u64(max_raw_end, tag_align);
+  if (max_raw_end > 0 && cand_tag_off + tag_size <= padded_union) {
+    info.tag_in_tail = true;
+    info.tag_offset = cand_tag_off;
+    info.layout = (StigiLayout){padded_union, total_align};
+  } else {
+    info.tag_in_tail = false;
+    info.tag_offset = align_up_u64(info.union_size, tag_align);
+    info.layout = (StigiLayout){align_up_u64(info.tag_offset + tag_size, total_align), total_align};
+  }
+  return info;
+}
+
+StigiEnumLayoutInfo stigi_enum_layout_info(const StigiImage *img, uint32_t enum_uidx,
+                                           StigiTy *const *type_args, uint32_t type_arg_count) {
+  return enum_layout_info_rec(img, enum_uidx, type_args, type_arg_count, 0);
+}
+
 static StigiLayout ty_layout_rec(const StigiImage *img, const StigiTy *ty, int depth) {
   StigiLayout z = {0, 1};
   if (ty == NULL || depth > 32) return z;
@@ -539,79 +677,8 @@ static StigiLayout ty_layout_rec(const StigiImage *img, const StigiTy *ty, int d
       return (StigiLayout){0, 1};
     case STIGI_TY_TYPEDEF:
       return ty_layout_rec(img, ty->elem, depth + 1);
-    case STIGI_TY_ENUM: {
-      if (img == NULL || ty->unit_idx >= img->unit_count) return (StigiLayout){1, 1};
-      const StigiDecl *d = img->units[ty->unit_idx].ast->decl;
-      if (d->kind != STIGI_DECL_ENUM) return (StigiLayout){1, 1};
-      uint32_t case_count = d->u.enum_decl.case_count;
-      uint64_t tag_size = (case_count <= 256U) ? 1ULL : (case_count <= 65536U ? 2ULL : 4ULL);
-      uint64_t tag_align = tag_size;
-      uint64_t union_align = 1;
-      uint64_t union_size = 0;
-      bool has_any_fields = false;
-
-      Arena tmp;
-      arena_init(&tmp);
-      InternPool lin;
-      intern_init(&lin);
-      TyCtx ectx;
-      memset(&ectx, 0, sizeof ectx);
-      ectx.img = img;
-      ectx.uidx = ty->unit_idx;
-      ectx.arena = &tmp;
-      ectx.lin_intern = &lin;
-      for (uint32_t tp = 0; tp < d->u.enum_decl.type_param_count; tp++) {
-        StigiTy *subst = (tp < ty->type_arg_count) ? ty->type_args[tp] : NULL;
-        (void)push_ty_type_param(&ectx, d->u.enum_decl.type_params[tp].name, subst);
-      }
-
-      for (uint32_t c = 0; c < case_count; c++) {
-        const StigiEnumCase *ec = &d->u.enum_decl.cases[c];
-        if (ec->field_count == 0) continue;
-        has_any_fields = true;
-        StigiLayout *flays = arena_alloc(&tmp, (size_t)ec->field_count * sizeof *flays);
-        uint32_t *order = arena_alloc(&tmp, (size_t)ec->field_count * sizeof *order);
-        if (flays == NULL || order == NULL) continue;
-        for (uint32_t f = 0; f < ec->field_count; f++) {
-          StigiTy *fty = resolve_ast_type_ctx(img, ty->unit_idx, ec->fields[f].type,
-                                              &tmp, &lin, &ectx, NULL, NULL, 0);
-          flays[f] = ty_layout_rec(img, fty, depth + 1);
-          order[f] = f;
-        }
-        for (uint32_t i = 1; i < ec->field_count; i++) {
-          uint32_t key = order[i];
-          uint64_t ka = flays[key].align;
-          uint32_t j = i;
-          while (j > 0 && flays[order[j - 1]].align < ka) {
-            order[j] = order[j - 1];
-            j--;
-          }
-          order[j] = key;
-        }
-        uint64_t c_align = 1;
-        uint64_t off = 0;
-        for (uint32_t i = 0; i < ec->field_count; i++) {
-          StigiLayout fl = flays[order[i]];
-          if (fl.size == 0) continue;
-          if (fl.align > c_align) c_align = fl.align;
-          off = align_up_u64(off, fl.align) + fl.size;
-        }
-        uint64_t c_size = align_up_u64(off, c_align);
-        if (c_align > union_align) union_align = c_align;
-        if (c_size > union_size) union_size = c_size;
-      }
-      ty_ctx_free(&ectx);
-      intern_free(&lin);
-      arena_free(&tmp);
-      if (!has_any_fields) {
-        return (StigiLayout){tag_size, tag_align};
-      }
-      union_size = align_up_u64(union_size, union_align);
-      uint64_t tag_off = align_up_u64(union_size, tag_align);
-      uint64_t total_align = union_align > tag_align ? union_align : tag_align;
-      uint64_t total_size = align_up_u64(tag_off + tag_size, total_align);
-      return (StigiLayout){total_size, total_align};
-    }
+    case STIGI_TY_ENUM:
+      return enum_layout_info_rec(img, ty->unit_idx, ty->type_args, ty->type_arg_count, depth + 1).layout;
   }
   return z;
 }
@@ -621,7 +688,7 @@ StigiLayout stigi_ty_layout(const StigiImage *img, const StigiTy *ty) {
 }
 
 static void frame_walk_expr(const StigiImage *img, uint32_t uidx, const StigiExpr *e,
-                            Arena *tmp, InternPool *lin, uint64_t *bytes) {
+                            Arena *tmp, InternPool *lin, uint64_t *bytes, bool *has_call) {
   if (e == NULL) return;
   switch (e->kind) {
     case STIGI_EXPR_VAL:
@@ -632,7 +699,7 @@ static void frame_walk_expr(const StigiImage *img, uint32_t uidx, const StigiExp
       } else {
         *bytes = align_up_u64(*bytes, 8) + 8;
       }
-      frame_walk_expr(img, uidx, e->u.val_stmt.init, tmp, lin, bytes);
+      frame_walk_expr(img, uidx, e->u.val_stmt.init, tmp, lin, bytes, has_call);
       break;
     case STIGI_EXPR_VAR:
       if (e->u.var_stmt.type != NULL) {
@@ -642,21 +709,81 @@ static void frame_walk_expr(const StigiImage *img, uint32_t uidx, const StigiExp
       } else {
         *bytes = align_up_u64(*bytes, 8) + 8;
       }
-      frame_walk_expr(img, uidx, e->u.var_stmt.init, tmp, lin, bytes);
+      frame_walk_expr(img, uidx, e->u.var_stmt.init, tmp, lin, bytes, has_call);
+      break;
+    case STIGI_EXPR_CALL:
+      if (has_call != NULL && e->u.call.callee != NULL &&
+          (e->u.call.callee->kind == STIGI_EXPR_GLOBAL ||
+           e->u.call.callee->kind == STIGI_EXPR_LOCAL)) {
+        StigiStr cn = e->u.call.callee->u.ident.name;
+        int32_t tgt = stigi_image_resolve_name(img, uidx, cn.ptr, cn.len);
+        if (tgt >= 0 && (uint32_t)tgt != uidx) {
+          StigiDeclKind dk = img->units[tgt].ast->decl->kind;
+          if (dk == STIGI_DECL_DEF || dk == STIGI_DECL_EXTERN) *has_call = true;
+        }
+      }
+      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+        frame_walk_expr(img, uidx, e->u.call.args[i], tmp, lin, bytes, has_call);
+      }
+      break;
+    case STIGI_EXPR_BINOP:
+      frame_walk_expr(img, uidx, e->u.binop.lhs, tmp, lin, bytes, has_call);
+      frame_walk_expr(img, uidx, e->u.binop.rhs, tmp, lin, bytes, has_call);
+      break;
+    case STIGI_EXPR_UNOP:
+      frame_walk_expr(img, uidx, e->u.unop.operand, tmp, lin, bytes, has_call);
+      break;
+    case STIGI_EXPR_ASSIGN:
+      frame_walk_expr(img, uidx, e->u.assign_stmt.value, tmp, lin, bytes, has_call);
       break;
     case STIGI_EXPR_BLOCK:
       for (uint32_t i = 0; i < e->u.block.count; i++) {
-        frame_walk_expr(img, uidx, e->u.block.stmts[i], tmp, lin, bytes);
+        frame_walk_expr(img, uidx, e->u.block.stmts[i], tmp, lin, bytes, has_call);
       }
       break;
     case STIGI_EXPR_IF:
-      frame_walk_expr(img, uidx, e->u.if_expr.then_br, tmp, lin, bytes);
-      frame_walk_expr(img, uidx, e->u.if_expr.else_br, tmp, lin, bytes);
+      frame_walk_expr(img, uidx, e->u.if_expr.cond, tmp, lin, bytes, has_call);
+      frame_walk_expr(img, uidx, e->u.if_expr.then_br, tmp, lin, bytes, has_call);
+      frame_walk_expr(img, uidx, e->u.if_expr.else_br, tmp, lin, bytes, has_call);
       break;
     case STIGI_EXPR_WHILE:
-      frame_walk_expr(img, uidx, e->u.while_expr.body, tmp, lin, bytes);
+      frame_walk_expr(img, uidx, e->u.while_expr.cond, tmp, lin, bytes, has_call);
+      frame_walk_expr(img, uidx, e->u.while_expr.body, tmp, lin, bytes, has_call);
       break;
     case STIGI_EXPR_MATCH:
+      frame_walk_expr(img, uidx, e->u.match_expr.scrutinee, tmp, lin, bytes, has_call);
+      if (e->u.match_expr.scrutinee != NULL &&
+          e->u.match_expr.scrutinee->kind == STIGI_EXPR_CALL &&
+          (e->u.match_expr.scrutinee->u.call.callee->kind == STIGI_EXPR_GLOBAL ||
+           e->u.match_expr.scrutinee->u.call.callee->kind == STIGI_EXPR_LOCAL)) {
+        StigiStr cn = e->u.match_expr.scrutinee->u.call.callee->u.ident.name;
+        if ((cn.len == 13 && memcmp(cn.ptr, "Array.tryFill", 13) == 0) ||
+            (cn.len == 13 && memcmp(cn.ptr, "Array.tryGrow", 13) == 0) ||
+            (cn.len == 12 && memcmp(cn.ptr, "Cell.tryMake", 12) == 0)) {
+          /* Account for call-save spill/temps and constant-size stack-promoted arrays */
+          *bytes = align_up_u64(*bytes, 16) + 48;
+          if (cn.len == 13 && memcmp(cn.ptr, "Array.tryFill", 13) == 0 &&
+              e->u.match_expr.scrutinee->u.call.arg_count == 2 &&
+              e->u.match_expr.scrutinee->u.call.args[0]->kind == STIGI_EXPR_LIT_INT) {
+            uint64_t n = e->u.match_expr.scrutinee->u.call.args[0]->u.lit_int.value;
+            if (n > 0 && n <= 256ULL) {
+              uint64_t esz = 8ULL;
+              if (e->u.match_expr.scrutinee->u.call.args[1]->kind == STIGI_EXPR_LIT_CHAR) esz = 1ULL;
+              else if (e->u.match_expr.scrutinee->u.call.type_arg_count > 0) {
+                StigiTy *ety = resolve_ast_type(img, uidx,
+                                                e->u.match_expr.scrutinee->u.call.type_args[0],
+                                                tmp, lin, NULL, NULL, 0);
+                StigiLayout el = stigi_ty_layout(img, ety);
+                if (el.size > 0) esz = el.size;
+              }
+              uint64_t tot = n * esz;
+              if (tot <= 256ULL) {
+                *bytes = align_up_u64(*bytes, 64) + align_up_u64(tot, 64) + 64ULL;
+              }
+            }
+          }
+        }
+      }
       for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
         const StigiPat *pat = &e->u.match_expr.arms[i].pat;
         if (pat->kind == STIGI_PAT_CTOR) {
@@ -668,7 +795,7 @@ static void frame_walk_expr(const StigiImage *img, uint32_t uidx, const StigiExp
         } else if (pat->kind == STIGI_PAT_VAR) {
           *bytes = align_up_u64(*bytes, 8) + 8;
         }
-        frame_walk_expr(img, uidx, e->u.match_expr.arms[i].body, tmp, lin, bytes);
+        frame_walk_expr(img, uidx, e->u.match_expr.arms[i].body, tmp, lin, bytes, has_call);
       }
       break;
     case STIGI_EXPR_HANDLE: {
@@ -685,10 +812,10 @@ static void frame_walk_expr(const StigiImage *img, uint32_t uidx, const StigiExp
           *bytes = align_up_u64(*bytes, l.align) + l.size;
         }
         for (uint32_t v = 0; v < hd->u.handler_decl.var_count; v++) {
-          frame_walk_expr(img, (uint32_t)hidx, hd->u.handler_decl.vars[v], tmp, lin, bytes);
+          frame_walk_expr(img, (uint32_t)hidx, hd->u.handler_decl.vars[v], tmp, lin, bytes, has_call);
         }
       }
-      frame_walk_expr(img, uidx, e->u.handle_stmt.body, tmp, lin, bytes);
+      frame_walk_expr(img, uidx, e->u.handle_stmt.body, tmp, lin, bytes, has_call);
       break;
     }
     default:
@@ -705,7 +832,9 @@ Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t 
     InternPool lin;
     intern_init(&lin);
     uint64_t bytes = 0;
-    frame_walk_expr(img, unit_idx, d->u.val_decl.body, &tmp, &lin, &bytes);
+    bool has_call = false;
+    frame_walk_expr(img, unit_idx, d->u.val_decl.body, &tmp, &lin, &bytes, &has_call);
+    if (has_call) bytes = align_up_u64(bytes, 16) + 48ULL;
     intern_free(&lin);
     arena_free(&tmp);
     *out_bytes = align_up_u64(bytes, 8);
@@ -731,7 +860,9 @@ Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t 
     StigiLayout l = stigi_ty_layout(img, ty);
     bytes = align_up_u64(bytes, l.align) + l.size;
   }
-  frame_walk_expr(img, unit_idx, body, &tmp, &lin, &bytes);
+  bool has_call = false;
+  frame_walk_expr(img, unit_idx, body, &tmp, &lin, &bytes, &has_call);
+  if (has_call) bytes = align_up_u64(bytes, 16) + 48ULL;
   intern_free(&lin);
   arena_free(&tmp);
   *out_bytes = align_up_u64(bytes, 8);

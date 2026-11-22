@@ -99,6 +99,19 @@ typedef struct {
   uint64_t align;
 } StigiLayout;
 
+typedef struct {
+  StigiLayout layout;
+  bool is_nullable_ptr;
+  uint32_t null_case;
+  uint32_t ptr_case;
+  bool is_tag_only;
+  bool tag_in_tail;
+  uint64_t tag_size;
+  uint64_t tag_offset;
+  uint64_t union_align;
+  uint64_t union_size;
+} StigiEnumLayoutInfo;
+
 void stigi_type_diags_init(StigiTypeDiags *d);
 void stigi_type_diags_free(StigiTypeDiags *d);
 const char *stigi_type_code_name(StigiTypeCode code);
@@ -117,6 +130,8 @@ Status stigi_linear_from_expr(const StigiExpr *e, InternPool *intern, StigiLinea
 bool stigi_ty_equal(const StigiTy *a, const StigiTy *b);
 bool stigi_ty_assignable(const StigiTy *expected, const StigiTy *actual);
 StigiLayout stigi_ty_layout(const StigiImage *img, const StigiTy *ty);
+StigiEnumLayoutInfo stigi_enum_layout_info(const StigiImage *img, uint32_t enum_uidx,
+                                           StigiTy *const *type_args, uint32_t type_arg_count);
 Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t *out_bytes);
 
 /* Full image type checker */

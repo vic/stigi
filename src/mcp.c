@@ -149,6 +149,12 @@ static Status handle_mcp_internal(StigiServerCtx *ctx, const char *bridge_sock,
     return diag_set(diag, STIGI_ERR_OOM, -1, "mcp OOM");
   }
   bool is_notification = (id_st == JSON_NOT_FOUND);
+  if (!is_notification && id_span.len > 0 &&
+      (id_span.ptr[0] == '{' || id_span.ptr[0] == '[' ||
+       id_span.ptr[0] == 't' || id_span.ptr[0] == 'f')) {
+    return make_error_reply(NULL, -32600, "invalid JSON-RPC id (must be string, number, or null)",
+                            out_json, out_len, diag);
+  }
 
   char *method = NULL;
   size_t mlen = 0;
@@ -214,7 +220,34 @@ static Status handle_mcp_internal(StigiServerCtx *ctx, const char *bridge_sock,
         size_t rlen = 0;
         Status st = STIGI_OK;
         if (bridge_sock != NULL) {
-          st = stigi_send_socket_frame(bridge_sock, frame, flen, &rep, &rlen, diag);
+          if (has_json_param && json_param) {
+            /* Wrap plain reply into JSON envelope without mutating shared server state */
+            char *raw_rep = NULL;
+            size_t raw_len = 0;
+            st = stigi_send_socket_frame(bridge_sock, frame, flen, &raw_rep, &raw_len, diag);
+            if (st == STIGI_OK && raw_rep != NULL) {
+              if (raw_len > 0 && raw_rep[0] == '{') {
+                rep = raw_rep;
+                rlen = raw_len;
+              } else {
+                const char *stag = "accepted";
+                if (raw_len >= 8 && memcmp(raw_rep, "rejected", 8) == 0) stag = "rejected";
+                else if (raw_len >= 5 && memcmp(raw_rep, "error", 5) == 0) stag = "error";
+                JsonBuf ejb = {NULL, 0, 0, false};
+                jb_cstr(&ejb, "{\"status\":");
+                jb_escaped(&ejb, stag, strlen(stag));
+                jb_cstr(&ejb, ",\"reply\":");
+                jb_escaped(&ejb, raw_rep, raw_len);
+                jb_cstr(&ejb, "}\n");
+                free(raw_rep);
+                st = finalize_jsonbuf(&ejb, &rep, &rlen, diag);
+              }
+            } else {
+              free(raw_rep);
+            }
+          } else {
+            st = stigi_send_socket_frame(bridge_sock, frame, flen, &rep, &rlen, diag);
+          }
         } else {
           bool saved_json = ctx->json_mode;
           if (has_json_param) ctx->json_mode = json_param;
@@ -251,11 +284,18 @@ static Status handle_mcp_internal(StigiServerCtx *ctx, const char *bridge_sock,
           const char *sp = memchr(p, ' ', (size_t)(lend - p));
           if (sp != NULL && sp > p) {
             size_t nlen = (size_t)(sp - p);
-            jb_cstr(&jb, ",{\"uri\":\"stigi://unit/");
-            jb_mem(&jb, p, nlen);
-            jb_cstr(&jb, "\",\"name\":");
-            jb_escaped(&jb, p, nlen);
-            jb_cstr(&jb, ",\"mimeType\":\"text/plain\"}");
+            char *uri_buf = malloc(13U + nlen + 1U);
+            if (uri_buf != NULL) {
+              memcpy(uri_buf, "stigi://unit/", 13U);
+              memcpy(uri_buf + 13U, p, nlen);
+              uri_buf[13U + nlen] = '\0';
+              jb_cstr(&jb, ",{\"uri\":");
+              jb_escaped(&jb, uri_buf, 13U + nlen);
+              jb_cstr(&jb, ",\"name\":");
+              jb_escaped(&jb, p, nlen);
+              jb_cstr(&jb, ",\"mimeType\":\"text/plain\"}");
+              free(uri_buf);
+            }
           }
           if (nl == NULL) break;
           p = nl + 1;
@@ -273,11 +313,18 @@ static Status handle_mcp_internal(StigiServerCtx *ctx, const char *bridge_sock,
       for (uint32_t i = 0; i < img->unit_count; i++) sorted[i] = &img->units[i];
       qsort(sorted, img->unit_count, sizeof *sorted, cmp_unit_name_mcp);
       for (uint32_t i = 0; i < img->unit_count; i++) {
-        jb_cstr(&jb, ",{\"uri\":\"stigi://unit/");
-        jb_mem(&jb, sorted[i]->name, sorted[i]->name_len);
-        jb_cstr(&jb, "\",\"name\":");
-        jb_escaped(&jb, sorted[i]->name, sorted[i]->name_len);
-        jb_cstr(&jb, ",\"mimeType\":\"text/plain\"}");
+        char *uri_buf = malloc(13U + sorted[i]->name_len + 1U);
+        if (uri_buf != NULL) {
+          memcpy(uri_buf, "stigi://unit/", 13U);
+          memcpy(uri_buf + 13U, sorted[i]->name, sorted[i]->name_len);
+          uri_buf[13U + sorted[i]->name_len] = '\0';
+          jb_cstr(&jb, ",{\"uri\":");
+          jb_escaped(&jb, uri_buf, 13U + sorted[i]->name_len);
+          jb_cstr(&jb, ",\"name\":");
+          jb_escaped(&jb, sorted[i]->name, sorted[i]->name_len);
+          jb_cstr(&jb, ",\"mimeType\":\"text/plain\"}");
+          free(uri_buf);
+        }
       }
       free(sorted);
     }

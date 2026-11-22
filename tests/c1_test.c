@@ -128,9 +128,10 @@ static void test_arena_and_intern(void) {
   arena_reset(&a);
   void *p3 = arena_alloc(&a, 64);
   check(p3 != NULL, "arena_alloc after reset");
+  check(((uintptr_t)p3 % 64U) == 0, "arena_alloc(64) is 64-byte cache-line aligned (memory.md 8)");
   ArenaBlock *cur_before_big = a.cur;
   void *big = arena_alloc(&a, 128U * 1024U);
-  check(big != NULL, "arena_alloc oversized block");
+  check(big != NULL && ((uintptr_t)big % 64U) == 0, "arena_alloc oversized block 64-byte aligned");
   check(a.cur == cur_before_big, "oversized block does not abandon free space in a.cur");
   memset(big, 0x33, 128U * 1024U);
   void *s1 = arena_alloc_aligned(&a, 5, 1);
@@ -351,7 +352,7 @@ static void test_dl_1000_frames(void) {
   long delta = (rss_f10 >= 0 && rss_f1000 >= 0) ? (rss_f1000 - rss_f10) : 0L;
   printf("c1_test 1000_frames wall=%.2fms rss_f10=%ldKB rss_f1000=%ldKB rss_delta=%ldKB\n",
          ms, rss_f10, rss_f1000, delta);
-#if !defined(__SANITIZE_ADDRESS__)
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
   check(delta <= 64L, "1000_frames RSS flat (<= 64 KB)");
 #endif
   stigi_dl_close(&dl);

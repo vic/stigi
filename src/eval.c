@@ -367,12 +367,14 @@ static bool eval_has_handler_for_cap(const EvalCtx *ctx, int32_t cap_unit_idx) {
   return false;
 }
 
+#define STIGI_EVAL_MAX_DEPTH 256U
+
 static StigiVal eval_call_handler_op(EvalCtx *ctx, EvalHandlerFrame *hf,
                                      StigiStr op_name, const StigiVal *args, uint32_t argc) {
   StigiVal z;
   memset(&z, 0, sizeof z);
   if (ctx->failed || !burn_fuel(ctx)) return z;
-  if (ctx->call_depth >= 4096) {
+  if (ctx->call_depth >= STIGI_EVAL_MAX_DEPTH) {
     eval_fail(ctx, "evaluation-fuel", "maximum call depth exceeded");
     return z;
   }
@@ -436,7 +438,7 @@ static StigiVal eval_call_unit(EvalCtx *ctx, uint32_t tgt_idx,
   StigiVal z;
   memset(&z, 0, sizeof z);
   if (ctx->failed || !burn_fuel(ctx)) return z;
-  if (ctx->call_depth >= 4096) {
+  if (ctx->call_depth >= STIGI_EVAL_MAX_DEPTH) {
     eval_fail(ctx, "evaluation-fuel", "maximum call depth exceeded");
     return z;
   }
@@ -571,7 +573,7 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
         const StigiDecl *d = ctx->img->units[tgt].ast->decl;
         if (d->kind == STIGI_DECL_VAL) {
           if (!burn_fuel(ctx)) return z;
-          if (ctx->call_depth >= 4096) {
+          if (ctx->call_depth >= STIGI_EVAL_MAX_DEPTH) {
             eval_fail(ctx, "evaluation-fuel", "maximum val evaluation depth exceeded");
             return z;
           }

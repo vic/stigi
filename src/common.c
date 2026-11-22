@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "common.h"
 
 #include <stdarg.h>
@@ -37,14 +39,76 @@ static size_t align_up(size_t n, size_t align) {
   return n + add;
 }
 
+/* Warm per-thread cache of standard 64 KiB cache-aligned ArenaBlocks (eliminates glibc
+ * trim/MADV_DONTNEED churn and guarantees 0 steady-state minor page faults, T5/T15).
+ * Disabled under ASan and Fil-C so every allocation gets individual sanitizer/InvisiCaps checking. */
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
+#include <pthread.h>
+#define STIGI_TLS_BLOCK_CACHE 8U
+typedef struct {
+  ArenaBlock *slots[STIGI_TLS_BLOCK_CACHE];
+  uint32_t count;
+} ArenaTlsPool;
+static _Thread_local ArenaTlsPool g_tls_pool = {{NULL}, 0};
+static pthread_key_t g_tls_pool_key;
+static pthread_once_t g_tls_pool_once = PTHREAD_ONCE_INIT;
+
+static void tls_pool_dtor(void *p) {
+  ArenaTlsPool *pool = (ArenaTlsPool *)p;
+  if (pool == NULL) return;
+  for (uint32_t i = 0; i < pool->count; i++) {
+    free(pool->slots[i]);
+    pool->slots[i] = NULL;
+  }
+  pool->count = 0;
+}
+
+static void tls_pool_atexit(void) {
+  tls_pool_dtor(&g_tls_pool);
+}
+
+static void tls_pool_key_init(void) {
+  (void)pthread_key_create(&g_tls_pool_key, tls_pool_dtor);
+  (void)atexit(tls_pool_atexit);
+}
+#endif
+
 static ArenaBlock *arena_new_block(size_t cap) {
   if (cap > SIZE_MAX - sizeof(ArenaBlock)) return NULL;
-  ArenaBlock *b = malloc(sizeof(ArenaBlock) + cap);
-  if (b == NULL) return NULL;
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
+  if (cap == STIGI_ARENA_BLOCK_SIZE && g_tls_pool.count > 0) {
+    ArenaBlock *b = g_tls_pool.slots[--g_tls_pool.count];
+    g_tls_pool.slots[g_tls_pool.count] = NULL;
+    b->next = NULL;
+    b->cap = cap;
+    b->used = 0;
+    return b;
+  }
+#endif
+  void *mem = NULL;
+  if (posix_memalign(&mem, 64U, sizeof(ArenaBlock) + cap) != 0 || mem == NULL) return NULL;
+  ArenaBlock *b = (ArenaBlock *)mem;
   b->next = NULL;
   b->cap = cap;
   b->used = 0;
   return b;
+}
+
+static void arena_release_block(ArenaBlock *b) {
+  if (b == NULL) return;
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
+  if (b->cap == STIGI_ARENA_BLOCK_SIZE && g_tls_pool.count < STIGI_TLS_BLOCK_CACHE) {
+    (void)pthread_once(&g_tls_pool_once, tls_pool_key_init);
+    if (g_tls_pool.count == 0) {
+      (void)pthread_setspecific(g_tls_pool_key, &g_tls_pool);
+    }
+    b->next = NULL;
+    b->used = 0;
+    g_tls_pool.slots[g_tls_pool.count++] = b;
+    return;
+  }
+#endif
+  free(b);
 }
 
 void arena_init(Arena *a) {
@@ -54,7 +118,7 @@ void arena_init(Arena *a) {
 }
 
 void *arena_alloc_aligned(Arena *a, size_t size, size_t align) {
-  if (a == NULL || align == 0 || (align & (align - 1U)) != 0 || align > _Alignof(max_align_t)) {
+  if (a == NULL || align == 0 || (align & (align - 1U)) != 0 || align > 64U) {
     return NULL;
   }
   size_t req = size == 0 ? 1 : size;
@@ -92,7 +156,9 @@ void *arena_alloc_aligned(Arena *a, size_t size, size_t align) {
 }
 
 void *arena_alloc(Arena *a, size_t size) {
-  return arena_alloc_aligned(a, size, _Alignof(max_align_t));
+  /* memory.md 8: blocks >= 64 bytes are aligned to 64-byte cache lines */
+  size_t align = (size >= 64U) ? 64U : _Alignof(max_align_t);
+  return arena_alloc_aligned(a, size, align);
 }
 
 void arena_reset(Arena *a) {
@@ -104,7 +170,7 @@ void arena_reset(Arena *a) {
   ArenaBlock *b = a->head->next;
   while (b != NULL) {
     ArenaBlock *next = b->next;
-    free(b);
+    arena_release_block(b);
     b = next;
   }
   a->head->next = NULL;
@@ -117,7 +183,7 @@ void arena_free(Arena *a) {
   ArenaBlock *b = a->head;
   while (b != NULL) {
     ArenaBlock *next = b->next;
-    free(b);
+    arena_release_block(b);
     b = next;
   }
   a->head = NULL;

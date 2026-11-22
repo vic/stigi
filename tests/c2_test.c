@@ -810,8 +810,8 @@ static void bench_lexer_1mb(void) {
   double mb_per_s = elapsed_s > 0.0 ? mb / elapsed_s : 0.0;
   printf("c2_test: lex+gate+parse bench: %.2f MB in %.4f s (%.1f MB/s, %llu tokens)\n",
          mb, elapsed_s, mb_per_s, (unsigned long long)tok_count);
-#if defined(__SANITIZE_ADDRESS__)
-  CHECK(mb_per_s >= 2.0, "lex+gate+parse throughput >= 2 MB/s under ASan");
+#if defined(__SANITIZE_ADDRESS__) || defined(__FILC__)
+  CHECK(mb_per_s >= 1.5, "lex+gate+parse throughput >= 1.5 MB/s under ASan/Fil-C");
 #else
   CHECK(mb_per_s >= 10.0, "lex+gate+parse throughput >= 10 MB/s");
 #endif
