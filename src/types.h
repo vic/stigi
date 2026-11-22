@@ -12,6 +12,10 @@
 typedef enum {
   STIGI_TYPE_MISMATCH = 0,
   STIGI_TYPE_ARITY,
+  STIGI_TYPE_TYPE_ARITY,
+  STIGI_TYPE_PATTERN_ARITY,
+  STIGI_TYPE_CANNOT_INFER,
+  STIGI_TYPE_HANDLER_SIGNATURE,
   STIGI_TYPE_ASSIGN_VAL,
   STIGI_TYPE_NOT_EXHAUSTIVE,
   STIGI_TYPE_WILDCARD_ARM,
@@ -34,13 +38,15 @@ typedef struct {
   uint32_t cap;
 } StigiTypeDiags;
 
+#define STIGI_LINEAR_MAX_TERMS 32
+
 /* Linear length-term normal form: c + sum_i (coeff_i * var_i), sorted by var */
 typedef struct {
   int64_t c;
   struct {
     uint32_t var;
     int64_t coeff;
-  } terms[8];
+  } terms[STIGI_LINEAR_MAX_TERMS];
   int nterms;
 } StigiLinear;
 
@@ -61,6 +67,7 @@ typedef enum {
   STIGI_TY_TYPEDEF,
   STIGI_TY_VAR,
   STIGI_TY_TEST_RESULT,
+  STIGI_TY_ERROR,
   STIGI_TY_UNKNOWN
 } StigiTyKind;
 
@@ -98,8 +105,9 @@ bool stigi_linear_equal(const StigiLinear *a, const StigiLinear *b);
 bool stigi_linear_offset(const StigiLinear *a, const StigiLinear *b, int64_t *out_delta);
 Status stigi_linear_from_expr(const StigiExpr *e, InternPool *intern, StigiLinear *out);
 
-/* Type equality & layout */
+/* Type equality, directional assignability (Never is bottom), & layout */
 bool stigi_ty_equal(const StigiTy *a, const StigiTy *b);
+bool stigi_ty_assignable(const StigiTy *expected, const StigiTy *actual);
 StigiLayout stigi_ty_layout(const StigiImage *img, const StigiTy *ty);
 Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t *out_bytes);
 

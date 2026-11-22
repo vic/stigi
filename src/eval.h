@@ -21,17 +21,28 @@ typedef enum {
   STIGI_VAL_TEST_OK
 } StigiValKind;
 
+typedef enum {
+  STIGI_INT_UNTYPED = 0,
+  STIGI_INT_U8,
+  STIGI_INT_U32,
+  STIGI_INT_U64,
+  STIGI_INT_I32,
+  STIGI_INT_I64
+} StigiIntWidth;
+
 typedef struct StigiVal StigiVal;
 
 struct StigiVal {
   StigiValKind kind;
   bool is_unsigned;
+  StigiIntWidth int_width;
   union {
     bool b;
     int64_t i;
     uint64_t u;
     StigiStr s;
     struct {
+      int32_t enum_unit_idx;
       StigiStr case_name;
       StigiVal *fields;
       uint32_t field_count;

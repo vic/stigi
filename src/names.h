@@ -89,9 +89,42 @@ bool stigi_image_visible_from(const StigiImage *img, uint32_t target_idx, uint32
 /* Resolve all references, build dependency graph, check visibility/roots/pub-unused */
 Status stigi_image_resolve(StigiImage *img, StigiNameDiags *diags, Diag *diag);
 
+typedef enum {
+  STIGI_DECODE_OK = 0,
+  STIGI_DECODE_UNKNOWN_TAG,
+  STIGI_DECODE_TRUNCATED,
+  STIGI_DECODE_TRAILING_BYTES,
+  STIGI_DECODE_NON_MINIMAL_NUMBER,
+  STIGI_DECODE_NUMBER_TOO_LARGE,
+  STIGI_DECODE_UNBOUND_LOCAL,
+  STIGI_DECODE_MEMBER_OUT_OF_RANGE,
+  STIGI_DECODE_NON_CANONICAL_GROUP_ORDER,
+  STIGI_DECODE_WRONG_SCHEMA
+} StigiDecodeReason;
+
+typedef struct {
+  StigiDecodeReason reason;
+  size_t offset;
+  char msg[128];
+} StigiDecodeResult;
+
+const char *stigi_decode_reason_name(StigiDecodeReason reason);
+
+/* Strict canonical decoder for stigi/unit/v1, stigi/verdict/v1, stigi/group/v1, stigi/vgrp/v1 */
+StigiDecodeResult stigi_canon_decode(const uint8_t *bytes, size_t len);
+
+/* Validate exact closed Stigi.Code.<PascalCase> case name (obligations.md) */
+bool stigi_is_known_code_case(const char *case_name, size_t len);
+
 /* Resolve a reference string from a given unit using aliases + namepath search.
  * Returns target unit index, or -1 if not found in image. */
 int32_t stigi_image_resolve_name(const StigiImage *img, uint32_t from_idx,
                                  const char *ref, size_t ref_len);
+
+/* Resolve an enum case reference (qualified EnumName.CaseName or unqualified CaseName).
+ * Returns enum unit index and sets *out_case_idx, or -1 if not found or ambiguous. */
+int32_t stigi_image_resolve_enum_case(const StigiImage *img, uint32_t from_idx,
+                                      const char *ref, size_t ref_len,
+                                      uint32_t *out_case_idx, bool *out_ambiguous);
 
 #endif

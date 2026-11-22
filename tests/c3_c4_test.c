@@ -696,6 +696,336 @@ static void test_pro_review_regressions(void) {
   }
 }
 
+static void test_wave2_hardening(void) {
+  Diag d;
+  diag_clear(&d);
+
+  /* 1. Strict canonical decoder: all 9 error reasons (identity.md:42-44) */
+  {
+    /* Truncated */
+    uint8_t empty[1] = {0};
+    CHECK(stigi_canon_decode(empty, 0).reason == STIGI_DECODE_TRUNCATED,
+          "decode: empty -> Truncated");
+
+    /* WrongSchema */
+    uint8_t bad_schema[] = { 4, 'b', 'a', 'd', '!' };
+    CHECK(stigi_canon_decode(bad_schema, sizeof bad_schema).reason == STIGI_DECODE_WRONG_SCHEMA,
+          "decode: bad schema -> WrongSchema");
+
+    /* NonMinimalNumber: overlong ULEB128 0x80 0x00 for string length */
+    uint8_t nonmin[] = { 0x80, 0x00 };
+    CHECK(stigi_canon_decode(nonmin, sizeof nonmin).reason == STIGI_DECODE_NON_MINIMAL_NUMBER,
+          "decode: overlong ULEB -> NonMinimalNumber");
+
+    /* NumberTooLarge: 10-byte ULEB with 10th byte 0x02 (> 2^64 - 1) */
+    uint8_t toolarge[] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 };
+    CHECK(stigi_canon_decode(toolarge, sizeof toolarge).reason == STIGI_DECODE_NUMBER_TOO_LARGE,
+          "decode: >2^64-1 ULEB -> NumberTooLarge");
+
+    /* UnknownTag: valid stigi/unit/v1 header + bogus decl tag 0xFF */
+    uint8_t unk_tag[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      0xFF
+    };
+    CHECK(stigi_canon_decode(unk_tag, sizeof unk_tag).reason == STIGI_DECODE_UNKNOWN_TAG,
+          "decode: unknown decl tag -> UnknownTag");
+
+    /* UnboundLocal: stigi/unit/v1 DEF (0 tparams, 0 params, 0 rtcaps, ret U64, body LOCAL(5)) */
+    uint8_t unbound[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      (uint8_t)(0x80 + STIGI_DECL_DEF),
+      0, 0, 0, /* 0 tparams, 0 params, 0 rtcaps */
+      (uint8_t)(0x10 + STIGI_TYPE_NAMED), 0x07, 3, 'U','6','4', 0, 0, 0, /* ret_type U64 */
+      (uint8_t)(0x30 + STIGI_EXPR_LOCAL),
+      0x01, 5 /* Local(5) with 0 binders in scope! */
+    };
+    CHECK(stigi_canon_decode(unbound, sizeof unbound).reason == STIGI_DECODE_UNBOUND_LOCAL,
+          "decode: Local(5) out of scope -> UnboundLocal");
+
+    /* MemberOutOfRange: stigi/unit/v1 DEF referencing SelfGroup(0) when group_size == 0 */
+    uint8_t mem_oob[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      (uint8_t)(0x80 + STIGI_DECL_DEF),
+      0, 0, 0,
+      (uint8_t)(0x10 + STIGI_TYPE_NAMED), 0x07, 3, 'U','6','4', 0, 0, 0,
+      (uint8_t)(0x30 + STIGI_EXPR_GLOBAL),
+      0x05, 0 /* SelfGroup(0) in non-group unit */
+    };
+    CHECK(stigi_canon_decode(mem_oob, sizeof mem_oob).reason == STIGI_DECODE_MEMBER_OUT_OF_RANGE,
+          "decode: SelfGroup in non-group -> MemberOutOfRange");
+
+    /* TrailingBytes: valid stigi/unit/v1 DEF + 1 extra byte */
+    uint8_t trailing[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      (uint8_t)(0x80 + STIGI_DECL_DEF),
+      0, 0, 0,
+      (uint8_t)(0x10 + STIGI_TYPE_NAMED), 0x07, 3, 'U','6','4', 0, 0, 0,
+      (uint8_t)(0x30 + STIGI_EXPR_LIT_INT), 42,
+      0x99 /* trailing byte */
+    };
+    CHECK(stigi_canon_decode(trailing, sizeof trailing - 1).reason == STIGI_DECODE_OK,
+          "decode: valid stigi/unit/v1 decodes OK");
+    CHECK(stigi_canon_decode(trailing, sizeof trailing).reason == STIGI_DECODE_TRAILING_BYTES,
+          "decode: trailing byte -> TrailingBytes");
+
+    /* NonCanonicalGroupOrder: stigi/group/v1 with 2 members in reverse order (lit 2 before lit 1) */
+    uint8_t m2[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      (uint8_t)(0x80 + STIGI_DECL_DEF), 0, 0, 0,
+      (uint8_t)(0x10 + STIGI_TYPE_NAMED), 0x07, 3, 'U','6','4', 0, 0, 0,
+      (uint8_t)(0x30 + STIGI_EXPR_LIT_INT), 2
+    };
+    uint8_t m1[] = {
+      13, 's','t','i','g','i','/','u','n','i','t','/','v','1',
+      (uint8_t)(0x80 + STIGI_DECL_DEF), 0, 0, 0,
+      (uint8_t)(0x10 + STIGI_TYPE_NAMED), 0x07, 3, 'U','6','4', 0, 0, 0,
+      (uint8_t)(0x30 + STIGI_EXPR_LIT_INT), 1
+    };
+    uint8_t bad_grp[128];
+    size_t gp = 0;
+    bad_grp[gp++] = 14; memcpy(bad_grp + gp, "stigi/group/v1", 14); gp += 14;
+    bad_grp[gp++] = 2; /* count = 2 */
+    bad_grp[gp++] = (uint8_t)sizeof m2; memcpy(bad_grp + gp, m2, sizeof m2); gp += sizeof m2;
+    bad_grp[gp++] = (uint8_t)sizeof m1; memcpy(bad_grp + gp, m1, sizeof m1); gp += sizeof m1;
+    CHECK(stigi_canon_decode(bad_grp, gp).reason == STIGI_DECODE_NON_CANONICAL_GROUP_ORDER,
+          "decode: unsorted SCC members -> NonCanonicalGroupOrder");
+  }
+
+  /* 2. S119: capability-op binder rename + comptime-only local val erasure + n+1 == 1+n */
+  {
+    StigiImage img1, img2;
+    StigiNameDiags nd1, nd2;
+    stigi_image_init(&img1);
+    stigi_image_init(&img2);
+    stigi_name_diags_init(&nd1);
+    stigi_name_diags_init(&nd2);
+
+    const char *cap =
+        "// prompt: runtime clock.\n"
+        "pub capability Demo.Clock:\n"
+        "  def now(): U64\n";
+    add_unit(&img1, cap, &nd1);
+    add_unit(&img1,
+             "// prompt: read clock with binder alpha.\n"
+             "pub def Demo.readOne {clock: Demo.Clock} (count: U64, items: Array[U8](count + 1)): U64 =\n"
+             "  clock.now()\n",
+             &nd1);
+
+    add_unit(&img2, cap, &nd2);
+    add_unit(&img2,
+             "// prompt: read clock with renamed binder + unused comptime val + 1 + count.\n"
+             "pub def Demo.readTwo {timer: Demo.Clock} (size: U64, buf: Array[U8](1 + size)): U64 =\n"
+             "  val witness: U64 = size + 1\n"
+             "  @<lessOrEqual(size, witness)>\n"
+             "  timer.now()\n",
+             &nd2);
+
+    CHECK(stigi_image_resolve(&img1, &nd1, &d) == STIGI_OK &&
+          !has_name_code(&nd1, STIGI_NAME_UNRESOLVED),
+          "resolve cap-op 1 without unresolved-name");
+    CHECK(stigi_image_resolve(&img2, &nd2, &d) == STIGI_OK &&
+          !has_name_code(&nd2, STIGI_NAME_UNRESOLVED),
+          "resolve cap-op 2 without unresolved-name");
+    int32_t u1 = stigi_image_find(&img1, "Demo.readOne", strlen("Demo.readOne"));
+    int32_t u2 = stigi_image_find(&img2, "Demo.readTwo", strlen("Demo.readTwo"));
+    CHECK(u1 >= 0 && u2 >= 0, "find readOne/readTwo");
+    CHECK(memcmp(img1.units[u1].unit_id, img2.units[u2].unit_id, 32) == 0,
+          "S119: cap-op binder rename + comptime-only local val erasure + n+1==1+n keep runtime_id equal");
+    CHECK(memcmp(img1.units[u1].verdict_key, img2.units[u2].verdict_key, 32) != 0,
+          "S119: extra @<..> fact still changes verdict_key");
+
+    stigi_name_diags_free(&nd1);
+    stigi_name_diags_free(&nd2);
+    stigi_image_free(&img1);
+    stigi_image_free(&img2);
+  }
+
+  /* 3. Never is bottom ONLY: `def bad(): Never = 42` MUST fail with mismatch */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+    add_unit(&img, "// prompt: invalid Never return.\npub def Demo.badNever(): Never = 42\n", &nd);
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK, "typecheck badNever");
+    CHECK(has_type_code(&td, STIGI_TYPE_MISMATCH), "Never cannot accept U64");
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+
+  /* 4. Generic [A: Type] inference, cannot-infer, out-of-order dependent params, and qualified Enum.Case */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+    add_unit(&img,
+             "// prompt: generic option.\n"
+             "pub enum Demo.Box[A: Type]:\n"
+             "  case Full(item: A)\n"
+             "  case Empty\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: generic identity.\n"
+             "pub def Demo.ident[A: Type](value: A): A = value\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: out-of-order dependent params.\n"
+             "pub def Demo.useSlice(buf: Array[U8](count), count: U64): U64 = count\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: caller using inferred generics, dependent call len, and qualified enum ctor.\n"
+             "pub def Demo.caller(len: U64, bytes: Array[U8](len)): Demo.Box[U64] =\n"
+             "  val same: U64 = Demo.ident(Demo.useSlice(bytes, len))\n"
+             "  Demo.Box.Full(same)\n",
+             &nd);
+    CHECK(stigi_image_resolve(&img, &nd, &d) == STIGI_OK, "resolve generics+dep");
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK && td.count == 0,
+          "generics + out-of-order dependent params + qualified Enum.Case pass with 0 type errors");
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+
+  /* 5. Dependent call length mismatch caught (Array[U8](len) passed to Array[U8](len + 1)) */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+    add_unit(&img,
+             "// prompt: expects len + 1.\n"
+             "pub def Demo.needPlus(count: U64, buf: Array[U8](count + 1)): U64 = count\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: passes len instead of len + 1.\n"
+             "pub def Demo.badCall(size: U64, buf: Array[U8](size)): U64 =\n"
+             "  Demo.needPlus(size, buf)\n",
+             &nd);
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK, "typecheck dep len mismatch");
+    CHECK(has_type_code(&td, STIGI_TYPE_MISMATCH), "dependent call length mismatch caught");
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+
+  /* 6. Handler signature mismatch caught (capabilities.md 2) */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+    add_unit(&img,
+             "// prompt: clock cap.\n"
+             "pub capability Demo.Clock:\n"
+             "  def now(): U64\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: wrong return type handler.\n"
+             "pub handler Demo.BadClock for Demo.Clock:\n"
+             "  def now(): Bool = true\n",
+             &nd);
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK, "typecheck bad handler");
+    CHECK(has_type_code(&td, STIGI_TYPE_HANDLER_SIGNATURE), "handler-signature mismatch caught");
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+
+  /* 7. Evaluator hardening: (-1) < 2^63, U8 overflow, expect(1,2,3) non-crash, string index, mock handler */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+
+    add_unit(&img,
+             "// prompt: mixed signed/unsigned comparison.\n"
+             "val Demo.Tests.mixedCmp {Stigi.Test}: Stigi.Test.Result =\n"
+             "  Stigi.Test.expect(-1 < 9223372036854775808, true, \"-1 < 2^63 must be true\")\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: U8 overflow.\n"
+             "val Demo.u8Over: U8 =\n"
+             "  val first: U8 = 200\n"
+             "  val second: U8 = 200\n"
+             "  first + second\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: bad expect reason type (non-crash).\n"
+             "val Demo.Tests.badReason {Stigi.Test}: Stigi.Test.Result =\n"
+             "  Stigi.Test.expect(1, 2, 3)\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: string literal byte indexing.\n"
+             "val Demo.Tests.strIdx {Stigi.Test}: Stigi.Test.Result =\n"
+             "  val text: Array[U8](3) = \"abc\"\n"
+             "  Stigi.Test.expect(text(1), 'b', \"second byte of abc is b\")\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: counter capability.\n"
+             "pub capability Demo.Counter:\n"
+             "  def bump(): U64\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: stateful mock handler.\n"
+             "pub handler Demo.MockCounter(startVal: U64) for Demo.Counter:\n"
+             "  var count: U64 = startVal\n"
+             "  def bump(): U64 =\n"
+             "    count = count + 1\n"
+             "    count\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: test using mock handler.\n"
+             "val Demo.Tests.mockRun {Stigi.Test}: Stigi.Test.Result =\n"
+             "  handle ctr = Demo.MockCounter(10):\n"
+             "    val first: U64 = ctr.bump()\n"
+             "    val second: U64 = ctr.bump()\n"
+             "    Stigi.Test.expect(first + second, 23, \"11 + 12 == 23\")\n",
+             &nd);
+
+    Arena eva;
+    arena_init(&eva);
+
+    int32_t i_mix = stigi_image_find(&img, "Demo.Tests.mixedCmp", strlen("Demo.Tests.mixedCmp"));
+    StigiEvalResult rm = stigi_eval_test(&img, (uint32_t)i_mix, STIGI_DEFAULT_FUEL, &eva);
+    CHECK(rm.status == STIGI_OK && rm.value.kind == STIGI_VAL_TEST_OK,
+          "eval: (-1) < 2^63 is true");
+
+    int32_t i_u8 = stigi_image_find(&img, "Demo.u8Over", strlen("Demo.u8Over"));
+    StigiEvalResult ru = stigi_eval_unit(&img, (uint32_t)i_u8, STIGI_DEFAULT_FUEL, &eva);
+    CHECK(ru.status != STIGI_OK, "eval: U8 200 + 200 overflows cleanly");
+
+    int32_t i_br = stigi_image_find(&img, "Demo.Tests.badReason", strlen("Demo.Tests.badReason"));
+    StigiEvalResult rbr = stigi_eval_test(&img, (uint32_t)i_br, STIGI_DEFAULT_FUEL, &eva);
+    CHECK(rbr.status != STIGI_OK && rbr.diag_code != NULL && strcmp(rbr.diag_code, "eval-error") == 0,
+          "eval: Stigi.Test.expect(1, 2, 3) returns eval-error without crashing");
+
+    int32_t i_si = stigi_image_find(&img, "Demo.Tests.strIdx", strlen("Demo.Tests.strIdx"));
+    StigiEvalResult rsi = stigi_eval_test(&img, (uint32_t)i_si, STIGI_DEFAULT_FUEL, &eva);
+    CHECK(rsi.status == STIGI_OK && rsi.value.kind == STIGI_VAL_TEST_OK,
+          "eval: string literal byte indexing returns 'b'");
+
+    int32_t i_mh = stigi_image_find(&img, "Demo.Tests.mockRun", strlen("Demo.Tests.mockRun"));
+    StigiEvalResult rmh = stigi_eval_test(&img, (uint32_t)i_mh, STIGI_DEFAULT_FUEL, &eva);
+    CHECK(rmh.status == STIGI_OK && rmh.value.kind == STIGI_VAL_TEST_OK,
+          "eval: stateful mock handler inside Test runs and mutates handler var");
+
+    arena_free(&eva);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+}
+
 int main(void) {
   test_names_lookup_and_id_invariance();
   test_alpha_equiv_and_dep_propagation();
@@ -704,6 +1034,7 @@ int main(void) {
   test_typecheck_cases();
   test_evaluator();
   test_pro_review_regressions();
+  test_wave2_hardening();
 
   if (g_failures == 0) {
     printf("c3_c4_test: ALL PASS\n");
