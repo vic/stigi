@@ -273,6 +273,16 @@ int main(void) {
       "    case 10..30 if high => 2\n"
       "    case 15..25 => 3\n"
       "    case _ => 0\n";
+  /* emitter: an `is` (a match block) on the right of `&&` / `||` in a loop condition needs statements; it is
+   * hoisted under the short-circuit, never emitted as a constant */
+  const char *u_sugar_run =
+      "// prompt: the count of leading bytes of a text that are lowercase letters or digits.\n"
+      "pub def Demo.Sugar.wordRun(count: U64, text: Array[U8](count)): U64 <lessOrEqual(result, count)> =\n"
+      "  var idx: U64 = 0\n"
+      "  while idx < count && (text(idx) is 'a'..'z' || text(idx) is '0'..'9') do\n"
+      "    @<lessOrEqual(idx, count)>\n"
+      "    idx = idx + 1\n"
+      "  idx\n";
   const char *u_sugar_test =
       "// prompt: check the pattern sugar on fixed inputs in the evaluator.\n"
       "val Demo.Sugar.Tests.sugarSuite {Stigi.Test}: Stigi.Test.Result =\n"
@@ -284,7 +294,8 @@ int main(void) {
       "  val guardGood: Bool = Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.byteClass('q', '/') == 1 && Demo.Sugar.byteClass('5', 'x') == 3\n"
       "  val pairGood: Bool = Demo.Sugar.pairClass('q', 1) == 1 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.pairClass('7', 0) == 2\n"
       "  val bandGood: Bool = Demo.Sugar.bandClass(5, true, true) == 1 && Demo.Sugar.bandClass(5, false, true) == 0 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(12, false, false) == 0 && Demo.Sugar.bandClass(12, false, true) == 2 && Demo.Sugar.bandClass(40, true, true) == 0\n"
-      "  Stigi.Test.expect(digitGood && smallGood && flatGood && lineGood && yesGood && guardGood && pairGood && bandGood, true, "
+      "  val runGood: Bool = Demo.Sugar.wordRun(6, \"ab1D2c\") == 3 && Demo.Sugar.wordRun(2, \"q7\") == 2 && Demo.Sugar.wordRun(1, \"Q\") == 0\n"
+      "  Stigi.Test.expect(digitGood && smallGood && flatGood && lineGood && yesGood && guardGood && pairGood && bandGood && runGood, true, "
       "\"pattern sugar gives the written answers\")\n";
 
   const char *u_lemma =
@@ -348,29 +359,29 @@ int main(void) {
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
       "  val tailVal: U64 = Demo.extractTail(Wide(9, 1))\n"
       "  val foundAt: U64 = Demo.findByte(3, \"abc\", 0, 3, 'c')\n"
-      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2\n"
+      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.wordRun(6, \"ab1D2c\") == 3\n"
       "  val negInput: I32 = -5\n"
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
       "  val signedCompareTrue: Bool = (-5 < 0)\n"
       "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && foundAt == 2 && sugarGood && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[37] = {
+  const char *all_srcs[38] = {
       u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
       u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
       u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
       u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail,   u_lemma,
       u_add_one,         u_eq_trait,    u_eq_word,       u_multi_head,  u_test_ok,
       u_main_ok,         u_find_scan,   u_sugar_shape,   u_sugar_digit, u_sugar_small,
-      u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_guard, u_sugar_pair, u_sugar_band,
+      u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_guard, u_sugar_pair, u_sugar_band, u_sugar_run,
       u_sugar_test
   };
-  size_t all_lens[37];
-  for (int i = 0; i < 37; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[38];
+  for (int i = 0; i < 38; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 37, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 38, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",

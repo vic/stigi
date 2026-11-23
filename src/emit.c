@@ -2721,15 +2721,69 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
         else if (rt != ETY_UNKNOWN) op_hint = rt;
         else if (e->u.binop.op >= STIGI_OP_LT && e->u.binop.op <= STIGI_OP_NE) op_hint = ETY_U64;
       }
+      if (e->u.binop.op == STIGI_OP_AND || e->u.binop.op == STIGI_OP_OR) {
+        /* The right operand runs only when the left one does not decide: when it needs statements (an
+           elaborated `is` or match), they go under `if` on a temp that carries the left value. */
+        bool is_and = e->u.binop.op == STIGI_OP_AND;
+        EmitBuf lbuf, rpre, rbuf;
+        memset(&lbuf, 0, sizeof lbuf);
+        memset(&rpre, 0, sizeof rpre);
+        memset(&rbuf, 0, sizeof rbuf);
+        EmitBuf *saved_b = ctx->b;
+        EmitBuf *saved_pre = ctx->pre;
+        ctx->b = &lbuf;
+        emit_expr_typed(ctx, e->u.binop.lhs, op_hint);
+        /* first as a plain C operand; a match value in it refuses (fail_closed), then it is emitted with a place
+           for its statements */
+        bool saved_fail = ctx->fail_closed;
+        char saved_msg[sizeof ctx->fail_msg];
+        memcpy(saved_msg, ctx->fail_msg, sizeof saved_msg);
+        ctx->fail_closed = false;
+        ctx->b = &rbuf;
+        ctx->pre = NULL;
+        emit_expr_typed(ctx, e->u.binop.rhs, op_hint);
+        bool needs_pre = ctx->fail_closed;
+        ctx->fail_closed = saved_fail;
+        memcpy(ctx->fail_msg, saved_msg, sizeof saved_msg);
+        if (needs_pre) {
+          rbuf.len = 0;
+          ctx->pre = &rpre;
+          emit_expr_typed(ctx, e->u.binop.rhs, op_hint);
+        }
+        ctx->b = saved_b;
+        ctx->pre = saved_pre;
+        if (rpre.len == 0) {
+          eb_cstr(ctx->b, "(");
+          eb_mem(ctx->b, lbuf.buf, lbuf.len);
+          eb_fmt(ctx->b, " %s ", c_op_str(e->u.binop.op));
+          eb_mem(ctx->b, rbuf.buf, rbuf.len);
+          eb_cstr(ctx->b, ")");
+        } else if (ctx->pre == NULL) {
+          ctx->fail_closed = true;
+          (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg,
+                         "a short-circuit operand needs statements where none can be placed");
+          eb_cstr(ctx->b, "false");
+        } else {
+          char ename[32];
+          (void)snprintf(ename, sizeof ename, "_e%u", ctx->tmp_id++);
+          eb_fmt(ctx->pre, "  bool %s = ", ename);
+          eb_mem(ctx->pre, lbuf.buf, lbuf.len);
+          eb_fmt(ctx->pre, ";\n  if (%s%s) {\n", is_and ? "" : "!", ename);
+          eb_mem(ctx->pre, rpre.buf, rpre.len);
+          eb_fmt(ctx->pre, "  %s = ", ename);
+          eb_mem(ctx->pre, rbuf.buf, rbuf.len);
+          eb_cstr(ctx->pre, ";\n  }\n");
+          eb_cstr(ctx->b, ename);
+        }
+        free(lbuf.buf);
+        free(rpre.buf);
+        free(rbuf.buf);
+        break;
+      }
       eb_cstr(ctx->b, "(");
       emit_expr_typed(ctx, e->u.binop.lhs, op_hint);
       eb_fmt(ctx->b, " %s ", c_op_str(e->u.binop.op));
-      if (e->u.binop.op == STIGI_OP_AND || e->u.binop.op == STIGI_OP_OR) {
-        EmitBuf *saved_pre = ctx->pre;
-        ctx->pre = NULL;
-        emit_expr_typed(ctx, e->u.binop.rhs, op_hint);
-        ctx->pre = saved_pre;
-      } else {
+      {
         emit_expr_typed(ctx, e->u.binop.rhs, op_hint);
       }
       eb_cstr(ctx->b, ")");
@@ -3534,6 +3588,11 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
       if (e->kind == STIGI_EXPR_HANDLE && e->u.handle_stmt.body != NULL) {
         emit_expr_typed(ctx, e->u.handle_stmt.body, hint);
         break;
+      }
+      if (e->kind == STIGI_EXPR_MATCH || (e->kind == STIGI_EXPR_BLOCK && e->u.block.count > 1)) {
+        /* a match or block value with no place for its statements is refused, never emitted as a constant */
+        ctx->fail_closed = true;
+        (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg, "a match or block value has no place for its statements");
       }
       eb_cstr(ctx->b, "UINT64_C(0)");
       break;
