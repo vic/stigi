@@ -1,6 +1,6 @@
 // prompt: emit a C forward declaration or function signature header for an L0 def or Test unit.
 pub def Stigi.Emit.emitFunctionHeader {Stigi.Mut} (indexCap: U64, indexBytes: Array[U8](indexCap), nameStart: U64, nameEnd: U64, srcCap: U64, srcBytes: Array[U8](srcCap), tokCap: U64, tokStart: Array[U64](tokCap), tokEnd: Array[U64](tokCap), tokCount: U64, paramListStart: U64, afterParams: U64, returnTok: U64, hasReturnTok: Bool, isForwardDecl: Bool, outCap: U64, output: Array[U8](outCap), writeOffset: U64) <lessOrEqual(nameStart, nameEnd), lessOrEqual(nameEnd, indexCap), below(indexCap, 0x100000000), lessOrEqual(tokCount, tokCap), below(tokCap, 65536), lessOrEqual(paramListStart, afterParams), lessOrEqual(afterParams, tokCount), below(srcCap, 0x100000000), lessOrEqual(writeOffset, outCap), below(outCap, 0x100000000)>: U64 <lessOrEqual(writeOffset, result), lessOrEqual(result, outCap)> =
-  var pos: U64 = Stigi.Emit.writeLiteral(7, "static ", outCap, output, writeOffset)
+  var pos: U64 = Stigi.Emit.writeLiteral(20, "STIGI_UNUSED static ", outCap, output, writeOffset)
   if hasReturnTok && returnTok < tokCount then
     pos = Stigi.Emit.emitTypeName(srcCap, srcBytes, tokCap, tokStart, tokEnd, tokCount, returnTok, outCap, output, pos)
   else

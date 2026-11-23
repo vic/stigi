@@ -3,7 +3,7 @@ def Stigi.Emit.emitEnumEqualHelper {region: Stigi.Region, Stigi.Mut} (unitCount:
   val nameStart: U64 = nameStarts(enumUnit)
   val nameEnd: U64 = nameEnds(enumUnit)
   if nameStart <= nameEnd && nameEnd <= indexCap then
-    var pos: U64 = Stigi.Emit.writeLiteral(19, "static inline bool ", outCap, output, writeOffset)
+    var pos: U64 = Stigi.Emit.writeLiteral(32, "STIGI_UNUSED static inline bool ", outCap, output, writeOffset)
     pos = Stigi.Emit.writeSliceMangled(indexCap, indexBytes, nameStart, nameEnd, true, outCap, output, pos)
     pos = Stigi.Emit.writeLiteral(4, "_eq(", outCap, output, pos)
     pos = Stigi.Emit.writeSliceMangled(indexCap, indexBytes, nameStart, nameEnd, true, outCap, output, pos)
