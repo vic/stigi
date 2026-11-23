@@ -22,9 +22,7 @@ def Stigi.Emit.emitExpr {region: Stigi.Region, writer: Stigi.Emit.Writer, Stigi.
     while scanAt < fin && !cutFound do
       @<lessOrEqual(beg, scanAt), lessOrEqual(scanAt, fin), lessOrEqual(beg, cutAt), lessOrEqual(cutAt, fin), lessOrEqual(atDepth, Stigi.Limit.maxTokens)>
       val Token(atKind, _, _, _, _) = toks(scanAt)
-      if atKind == TokLeftParen && atDepth < Stigi.Limit.maxTokens then atDepth = atDepth + 1
-      else if atKind == TokRightParen && atDepth > 0 then atDepth = atDepth - 1
-      else if atKind == TokAt && atDepth == 0 then
+      if atKind == TokLeftParen && atDepth < Stigi.Limit.maxTokens then atDepth = atDepth + 1 else if atKind == TokRightParen && atDepth > 0 then atDepth = atDepth - 1 else if atKind == TokAt && atDepth == 0 then
         cutAt = scanAt
         cutFound = true
       else ()
@@ -169,8 +167,7 @@ def Stigi.Emit.emitExpr {region: Stigi.Region, writer: Stigi.Emit.Writer, Stigi.
               val litLen: U64 = firstFin - firstBeg
               writer.putByte(outCap, outBuf, 40)
               writer.putSlice(outCap, outBuf, srcCap, src, firstBeg, firstFin)
-              if litLen >= 10 then Stigi.Emit.writeLit{writer}(outCap, outBuf, 4, "ULL)")
-              else writer.putByte(outCap, outBuf, 41)
+              if litLen >= 10 then Stigi.Emit.writeLit{writer}(outCap, outBuf, 4, "ULL)") else writer.putByte(outCap, outBuf, 41)
             else if firstKind == TokTrue then Stigi.Emit.writeLit{writer}(outCap, outBuf, 4, "true") else if firstKind == TokFalse then Stigi.Emit.writeLit{writer}(outCap, outBuf, 5, "false") else if firstKind == TokChar && firstFin <= srcCap then
               writer.putSlice(outCap, outBuf, srcCap, src, firstBeg, firstFin)
             else if firstKind == TokStr && firstFin <= srcCap then

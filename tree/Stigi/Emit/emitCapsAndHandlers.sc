@@ -13,7 +13,7 @@ def Stigi.Emit.emitCapsAndHandlers {region: Stigi.Region, writer: Stigi.Emit.Wri
         val fldPos: U64 = subStart + fldOff
         if fldPos < fieldCount then
           val FieldInfo(fldKind, fldBeg, fldFin, typeBeg, typeFin, elemBeg, elemFin) = fields(fldPos)
-          val isStateOrParam: Bool = (fldKind == FieldParam && fldOff < paramCount) || fldKind == FieldStateVar
+          val isStateOrParam: Bool = fldKind == FieldParam && fldOff < paramCount || fldKind == FieldStateVar
           if isStateOrParam && fldFin <= srcCap && typeFin <= srcCap && elemFin <= srcCap then
             Stigi.Emit.writeLit{writer}(outCap, outBuf, 2, "  ")
             Stigi.Emit.emitType{writer}(outCap, outBuf, srcCap, src, symCap, syms, symCount, typeBeg, typeFin, elemBeg, elemFin, 0, 0)

@@ -20,8 +20,7 @@ def Stigi.Emit.emitSimpleValBind {region: Stigi.Region, writer: Stigi.Emit.Write
         elemBeg = valElemBeg
         elemFin = valElemFin
         scanPos = if afterType > scanPos && afterType <= stmtEnd then afterType else scanPos + 1
-      else if curKind == TokAssign then assignPos = scanPos
-      else scanPos = scanPos + 1
+      else if curKind == TokAssign then assignPos = scanPos else scanPos = scanPos + 1
     val rhsStart: U64 = if assignPos < stmtEnd then assignPos + 1 else stmtEnd
     val isWild: Bool = if nameFin <= srcCap then Stigi.Lex.sliceEquals(srcCap, src, nameBeg, nameFin, 1, "_") else false
     if isWild then
@@ -49,9 +48,7 @@ def Stigi.Emit.emitSimpleValBind {region: Stigi.Region, writer: Stigi.Emit.Write
       while checkPos < stmtEnd && !lineDone do
         @<lessOrEqual(firstRhs, checkPos), lessOrEqual(checkPos, stmtEnd), lessOrEqual(firstRhs, matchPos), lessOrEqual(matchPos, stmtEnd)>
         val Token(chkKind, _, _, _, _) = toks(checkPos)
-        if chkKind == TokNewline then lineDone = true
-        else if chkKind == TokMatch && matchPos == stmtEnd then matchPos = checkPos
-        else ()
+        if chkKind == TokNewline then lineDone = true else if chkKind == TokMatch && matchPos == stmtEnd then matchPos = checkPos else ()
         checkPos = checkPos + 1
       val isStrArr: Bool = if firstRhs < stmtEnd && typeFin <= srcCap then
         val Token(firstRhsKind, _, _, _, _) = toks(firstRhs)
@@ -89,8 +86,7 @@ def Stigi.Emit.emitSimpleValBind {region: Stigi.Region, writer: Stigi.Emit.Write
           Stigi.Emit.emitStmt{region, writer}(outCap, outBuf, srcCap, src, tokCap, toks, firstRhs, stmtEnd, symCap, syms, symCount, fieldCap, fields, fieldCount, localCap, locals, localCount, meta, TargetAssign(tid), nextFuel)
         Stigi.Emit.writeLit{writer}(outCap, outBuf, 2, "  ")
         Stigi.Emit.emitType{writer}(outCap, outBuf, srcCap, src, symCap, syms, symCount, typeBeg, typeFin, elemBeg, elemFin, monoBeg, monoFin)
-        if isMutable then Stigi.Emit.writeLit{writer}(outCap, outBuf, 3, " v_")
-        else Stigi.Emit.writeLit{writer}(outCap, outBuf, 9, " const v_")
+        if isMutable then Stigi.Emit.writeLit{writer}(outCap, outBuf, 3, " v_") else Stigi.Emit.writeLit{writer}(outCap, outBuf, 9, " const v_")
         writer.putSlice(outCap, outBuf, srcCap, src, nameBeg, nameFin)
         Stigi.Emit.writeLit{writer}(outCap, outBuf, 5, " = _e")
         Stigi.Emit.writeUnsigned{region, writer}(outCap, outBuf, tid)
@@ -106,8 +102,7 @@ def Stigi.Emit.emitSimpleValBind {region: Stigi.Region, writer: Stigi.Emit.Write
       else if nameFin <= srcCap && typeFin <= srcCap && elemFin <= srcCap && monoFin <= srcCap then
         Stigi.Emit.writeLit{writer}(outCap, outBuf, 2, "  ")
         Stigi.Emit.emitType{writer}(outCap, outBuf, srcCap, src, symCap, syms, symCount, typeBeg, typeFin, elemBeg, elemFin, monoBeg, monoFin)
-        if isMutable then Stigi.Emit.writeLit{writer}(outCap, outBuf, 3, " v_")
-        else Stigi.Emit.writeLit{writer}(outCap, outBuf, 9, " const v_")
+        if isMutable then Stigi.Emit.writeLit{writer}(outCap, outBuf, 3, " v_") else Stigi.Emit.writeLit{writer}(outCap, outBuf, 9, " const v_")
         writer.putSlice(outCap, outBuf, srcCap, src, nameBeg, nameFin)
         Stigi.Emit.writeLit{writer}(outCap, outBuf, 3, " = ")
         Stigi.Emit.emitExpr{region, writer}(outCap, outBuf, srcCap, src, tokCap, toks, firstRhs, stmtEnd, symCap, syms, symCount, fieldCap, fields, fieldCount, localCap, locals, localCount, meta, nextFuel)

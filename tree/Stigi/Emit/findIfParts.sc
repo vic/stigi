@@ -1,7 +1,6 @@
 // prompt: find matching then and else token positions for an if expression, ignoring val-else clauses.
 def Stigi.Emit.findIfParts(tokCap: Stigi.TokenCap, toks: Array[Stigi.Lex.Token](tokCap), startTok: U64, endTok: U64) <lessOrEqual(startTok, endTok), lessOrEqual(endTok, tokCap)>: Stigi.Emit.IfSplit =
-  if startTok >= endTok then IfIncomplete
-  else
+  if startTok >= endTok then IfIncomplete else
     var pos: U64 = startTok + 1
     var nestedIf: U64 = 0
     var foundThen: Bool = false
@@ -23,18 +22,15 @@ def Stigi.Emit.findIfParts(tokCap: Stigi.TokenCap, toks: Array[Stigi.Lex.Token](
         while peekPos < endTok && !peekDone do
           @<lessOrEqual(pos, peekPos), lessOrEqual(peekPos, endTok)>
           val Token(peekKind, _, _, _, _) = toks(peekPos)
-          if peekKind == TokNewline then peekPos = peekPos + 1
-          else
+          if peekKind == TokNewline then peekPos = peekPos + 1 else
             if peekKind == TokCase then isValElse = true else ()
             peekDone = true
         if !isValElse then
-          if nestedIf > 0 then nestedIf = nestedIf - 1
-          else if foundThen then
+          if nestedIf > 0 then nestedIf = nestedIf - 1 else if foundThen then
             foundElse = true
             elsePos = pos
           else ()
         else ()
       else ()
       pos = pos + 1
-    if foundThen && foundElse && thenPos <= elsePos then IfParts(thenPos, elsePos)
-    else IfIncomplete
+    if foundThen && foundElse && thenPos <= elsePos then IfParts(thenPos, elsePos) else IfIncomplete

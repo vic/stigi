@@ -29,13 +29,7 @@ def Stigi.Emit.splitArgs {Stigi.Mut} (tokCap: Stigi.TokenCap, toks: Array[Stigi.
           pos = pos + 1
           segStart = pos
         else
-          if kind == TokLeftParen && parenDepth < Stigi.Limit.maxTokens then parenDepth = parenDepth + 1
-          else if kind == TokRightParen && parenDepth > 0 then parenDepth = parenDepth - 1
-          else if kind == TokLeftBrack && brackDepth < Stigi.Limit.maxTokens then brackDepth = brackDepth + 1
-          else if kind == TokRightBrack && brackDepth > 0 then brackDepth = brackDepth - 1
-          else if kind == TokLeftBrace && braceDepth < Stigi.Limit.maxTokens then braceDepth = braceDepth + 1
-          else if kind == TokRightBrace && braceDepth > 0 then braceDepth = braceDepth - 1
-          else ()
+          if kind == TokLeftParen && parenDepth < Stigi.Limit.maxTokens then parenDepth = parenDepth + 1 else if kind == TokRightParen && parenDepth > 0 then parenDepth = parenDepth - 1 else if kind == TokLeftBrack && brackDepth < Stigi.Limit.maxTokens then brackDepth = brackDepth + 1 else if kind == TokRightBrack && brackDepth > 0 then brackDepth = brackDepth - 1 else if kind == TokLeftBrace && braceDepth < Stigi.Limit.maxTokens then braceDepth = braceDepth + 1 else if kind == TokRightBrace && braceDepth > 0 then braceDepth = braceDepth - 1 else ()
           pos = pos + 1
     else ()
   else ()

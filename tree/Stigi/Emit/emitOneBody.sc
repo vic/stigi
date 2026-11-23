@@ -31,7 +31,7 @@ def Stigi.Emit.emitOneBody {region: Stigi.Region, writer: Stigi.Emit.Writer, Sti
               val statePos: U64 = hndSubStart + stateOff
               if statePos < fieldCount then
                 val FieldInfo(stateFldKind, fldBeg, fldFin, typeBeg, typeFin, elemBeg, elemFin) = fields(statePos)
-                val isHndField: Bool = (stateFldKind == FieldParam && stateOff < hndParamCount) || stateFldKind == FieldStateVar
+                val isHndField: Bool = stateFldKind == FieldParam && stateOff < hndParamCount || stateFldKind == FieldStateVar
                 if isHndField then
                   locals(locCount) := FieldInfo(FieldStateVar, fldBeg, fldFin, typeBeg, typeFin, elemBeg, elemFin)
                   locCount = locCount + 1
