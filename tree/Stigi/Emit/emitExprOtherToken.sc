@@ -1,5 +1,5 @@
 // prompt: lower one non-identifier token inside an L0 expression using the expression frame stack.
-def Stigi.Emit.emitExprOtherToken {Stigi.Mut} (srcCap: U64, srcBytes: Array[U8](srcCap), tokCap: U64, tokKind: Array[U8](tokCap), tokStart: Array[U64](tokCap), tokEnd: Array[U64](tokCap), tokCount: U64, cursor: U64, exprEnd: U64, frameKinds: Array[U8](32), frameSubs: Array[U8](32), frameArgs: Array[U8](32), frameTargets: Array[U64](32), framePrev: Array[U64](32), topBox: Array[U64](1), cursorBox: Array[U64](1), outCap: U64, output: Array[U8](outCap), writeOffset: U64) <lessOrEqual(tokCount, tokCap), below(tokCap, 65536), lessOrEqual(exprEnd, tokCount), below(cursor, exprEnd), below(srcCap, 0x100000000), lessOrEqual(writeOffset, outCap), below(outCap, 0x100000000)>: U64 <lessOrEqual(writeOffset, result), lessOrEqual(result, outCap)> =
+def Stigi.Emit.emitExprOtherToken {Stigi.Mut} (srcCap: U64, srcBytes: Array[U8](srcCap), tokCap: U64, tokKind: Array[U8](tokCap), tokStart: Array[U64](tokCap), tokEnd: Array[U64](tokCap), tokCount: U64, cursor: U64, exprEnd: U64, frameKinds: Array[U8](32), frameSubs: Array[U8](32), frameArgs: Array[U8](32), frameTargets: Array[U64](32), framePrev: Array[U64](32), topBox: Array[U64](1), cursorBox: Array[U64](1), wrapTopOr: Bool, outCap: U64, output: Array[U8](outCap), writeOffset: U64) <lessOrEqual(tokCount, tokCap), below(tokCap, 65536), lessOrEqual(exprEnd, tokCount), below(cursor, exprEnd), below(srcCap, 0x100000000), lessOrEqual(writeOffset, outCap), below(outCap, 0x100000000)>: U64 <lessOrEqual(writeOffset, result), lessOrEqual(result, outCap)> =
   val kindByte: U8 = tokKind(cursor)
   val tokBeg: U64 = tokStart(cursor)
   val tokFin: U64 = tokEnd(cursor)
@@ -44,6 +44,11 @@ def Stigi.Emit.emitExprOtherToken {Stigi.Mut} (srcCap: U64, srcBytes: Array[U8](
     else
       pos = Stigi.Emit.writeLiteral(1, ")", outCap, output, pos)
     pos
+  else if Stigi.Emit.tokenEquals(srcCap, srcBytes, tokCap, tokStart, tokEnd, cursor, 2, "||") then
+    if wrapTopOr && topBox(0) == 32 then
+      Stigi.Emit.writeLiteral(6, ") || (", outCap, output, writeOffset)
+    else
+      Stigi.Emit.writeLiteral(4, " || ", outCap, output, writeOffset)
   else
     var pos: U64 = writeOffset
     if tokBeg <= tokFin && tokFin <= srcCap then

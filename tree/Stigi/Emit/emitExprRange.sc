@@ -2,6 +2,7 @@
 pub def Stigi.Emit.emitExprRange {region: Stigi.Region, Stigi.Mut} (unitCount: U64, indexCap: U64, indexBytes: Array[U8](indexCap), nameStarts: Array[U64](unitCount), nameEnds: Array[U64](unitCount), kindCodes: Array[U8](unitCount), unitRetEnum: Array[U64](unitCount), callerStart: U64, callerSpaceEnd: U64, srcCap: U64, srcBytes: Array[U8](srcCap), tokCap: U64, tokKind: Array[U8](tokCap), tokStart: Array[U64](tokCap), tokEnd: Array[U64](tokCap), tokCount: U64, exprStart: U64, exprEnd: U64, localCap: U64, localNameStart: Array[U64](localCap), localNameEnd: Array[U64](localCap), localTypeStart: Array[U64](localCap), localTypeEnd: Array[U64](localCap), localIsArray: Array[U8](localCap), localCount: U64, caseCap: U64, caseEnumUnit: Array[U64](caseCap), caseNameStart: Array[U64](caseCap), caseNameEnd: Array[U64](caseCap), caseCount: U64, outCap: U64, output: Array[U8](outCap), writeOffset: U64) <below(unitCount, 4096), lessOrEqual(callerStart, callerSpaceEnd), lessOrEqual(callerSpaceEnd, indexCap), below(indexCap, 0x100000000), lessOrEqual(tokCount, tokCap), below(tokCap, 65536), lessOrEqual(exprStart, exprEnd), lessOrEqual(exprEnd, tokCount), below(srcCap, 0x100000000), lessOrEqual(localCount, localCap), below(localCap, 256), lessOrEqual(caseCount, caseCap), below(caseCap, 4096), lessOrEqual(writeOffset, outCap), below(outCap, 0x100000000)>: U64 <lessOrEqual(writeOffset, result), lessOrEqual(result, outCap)> =
   val zeroByte: U8 = 0
   val zeroWord: U64 = 0
+  val wrapTopOr: Bool = Stigi.Emit.needsTopOrWrap(srcCap, srcBytes, tokCap, tokStart, tokEnd, tokCount, exprStart, exprEnd)
   Array.tryFill{region}(32, zeroByte) match
     case FillFailed => writeOffset
     case Filled(frameKinds) =>
@@ -25,6 +26,10 @@ pub def Stigi.Emit.emitExprRange {region: Stigi.Region, Stigi.Mut} (unitCount: U
                             case Filled(cursorBox) =>
                               topBox(0) := 32
                               var pos: U64 = writeOffset
+                              if wrapTopOr then
+                                pos = Stigi.Emit.writeLiteral(1, "(", outCap, output, writeOffset)
+                              else
+                                ()
                               var cursor: U64 = exprStart
                               val maxSteps: U64 = tokCount + tokCount
                               var stepBudget: U64 = 0
@@ -69,6 +74,7 @@ pub def Stigi.Emit.emitExprRange {region: Stigi.Region, Stigi.Mut} (unitCount: U
                                       ()
                                     cursor = cursor + 1
                                   else if Stigi.Emit.tokenEquals(srcCap, srcBytes, tokCap, tokStart, tokEnd, cursor, 4, "else") then
+                                    pos = Stigi.Emit.popInlineElseFrames(frameKinds, framePrev, topBox, outCap, output, pos)
                                     pos = Stigi.Emit.writeLiteral(5, ") : (", outCap, output, pos)
                                     val curTop: U64 = topBox(0)
                                     if curTop < 32 then
@@ -87,7 +93,7 @@ pub def Stigi.Emit.emitExprRange {region: Stigi.Region, Stigi.Mut} (unitCount: U
                                     else
                                       ()
                                   else
-                                    pos = Stigi.Emit.emitExprOtherToken(srcCap, srcBytes, tokCap, tokKind, tokStart, tokEnd, tokCount, cursor, exprEnd, frameKinds, frameSubs, frameArgs, frameTargets, framePrev, topBox, cursorBox, outCap, output, pos)
+                                    pos = Stigi.Emit.emitExprOtherToken(srcCap, srcBytes, tokCap, tokKind, tokStart, tokEnd, tokCount, cursor, exprEnd, frameKinds, frameSubs, frameArgs, frameTargets, framePrev, topBox, cursorBox, wrapTopOr, outCap, output, pos)
                                     val nextCur: U64 = cursorBox(0)
                                     cursor = if nextCur >= exprStart && nextCur <= exprEnd then nextCur else cursor + 1
                                 else
@@ -111,4 +117,4 @@ pub def Stigi.Emit.emitExprRange {region: Stigi.Region, Stigi.Mut} (unitCount: U
                                 else
                                   draining = false
                                 drainStep = drainStep + 1
-                              pos
+                              if wrapTopOr then Stigi.Emit.writeLiteral(1, ")", outCap, output, pos) else pos

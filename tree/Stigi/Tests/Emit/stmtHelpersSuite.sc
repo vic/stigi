@@ -28,13 +28,13 @@ val Stigi.Tests.Emit.stmtHelpersSuite {Stigi.Test}: Stigi.Test.Result =
                           Array.tryFill{Stigi.Region}(1, zeroByte) match
                             case FillFailed => Stigi.Test.expect(false, true, "k failed")
                             case Filled(kindArr) =>
-                              Array.tryFill{Stigi.Region}(32, zeroByte) match
+                              Array.tryFill{Stigi.Region}(96, zeroByte) match
                                 case FillFailed => Stigi.Test.expect(false, true, "b failed")
                                 case Filled(blkKinds) =>
-                                  Array.tryFill{Stigi.Region}(32, zeroWord) match
+                                  Array.tryFill{Stigi.Region}(96, zeroWord) match
                                     case FillFailed => Stigi.Test.expect(false, true, "b failed")
                                     case Filled(blkTemps) =>
-                                      Array.tryFill{Stigi.Region}(32, zeroWord) match
+                                      Array.tryFill{Stigi.Region}(96, zeroWord) match
                                         case FillFailed => Stigi.Test.expect(false, true, "b failed")
                                         case Filled(blkPrev) =>
                                           Array.tryFill{Stigi.Region}(256, zeroByte) match
@@ -42,7 +42,7 @@ val Stigi.Tests.Emit.stmtHelpersSuite {Stigi.Test}: Stigi.Test.Result =
                                             case Filled(outBuf) =>
                                               blkKinds(0) := 7
                                               blkTemps(0) := 1
-                                              blkPrev(0) := 32
+                                              blkPrev(0) := 96
                                               val posOne: U64 = if 0 < ifLineEnd then Stigi.Emit.emitSingleLineIfStmt{Stigi.Region}(1, 1, " ", unitArr, unitArr, kindArr, unitArr, 0, 0, 32, sampleDef, 32, tokKind, tokStart, tokEnd, tokCount, 0, ifLineEnd, 1, unitArr, unitArr, unitArr, unitArr, kindArr, 0, 1, unitArr, unitArr, unitArr, 0, 256, outBuf, 0) else 0
                                               val posTwo: U64 = if 2 <= tokCount then Stigi.Emit.emitTailReturn{Stigi.Region}(1, 1, " ", unitArr, unitArr, kindArr, unitArr, 0, 0, 32, sampleDef, 32, tokKind, tokStart, tokEnd, tokCount, 1, 2, 0, false, false, false, 0, 0, 1, unitArr, unitArr, unitArr, unitArr, kindArr, 0, 1, unitArr, unitArr, unitArr, 0, blkKinds, blkTemps, blkPrev, 0, 256, outBuf, posOne) else posOne
                                               val posThree: U64 = Stigi.Emit.emitPatternBindings{Stigi.Region}(32, sampleDef, 32, tokStart, tokEnd, tokCount, 0, 0, 1, unitArr, unitArr, 0, 0, 0, 0, true, 1, 1, unitArr, unitArr, unitArr, unitArr, kindArr, unitArr, 256, outBuf, posTwo)
