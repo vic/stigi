@@ -999,32 +999,30 @@ typedef struct {
   uint64_t rows;
 } ExportCtx;
 
-/* Create `parent/<hex id>`. Units with equal canonical bytes have one id but different names and facts
- * (identity.md): the later ones take the suffix `.1`, `.2`, ... until the identity fix (Q0e) makes one
- * directory per id. */
-static Status make_id_dir(const char *parent, const uint8_t id[32], char *dir, size_t cap, Diag *diag) {
+/* Create `parent/<hex id>`. Units with one id are one checked unit (identity.md, S134 b): the first one gets
+ * the directory, a later one with the same id finds it and is not written again (`created` is false). */
+static Status make_id_dir(const char *parent, const uint8_t id[32], char *dir, size_t cap,
+                          bool *created, Diag *diag) {
   int n = snprintf(dir, cap, "%s/", parent);
-  if (n < 0 || (size_t)n + 80U >= cap) {
+  if (n < 0 || (size_t)n + 65U >= cap) {
     return diag_set(diag, STIGI_ERR_IO, -1, "export path too long");
   }
   for (int i = 0; i < 32; i++) {
     (void)snprintf(dir + n + 2 * i, 3, "%02x", (unsigned)id[i]);
   }
-  size_t base_len = strlen(dir);
-  for (uint32_t twin = 1; mkdir(dir, 0755) != 0; twin++) {
-    if (errno != EEXIST || twin > 9999U) {
-      return diag_set(diag, STIGI_ERR_IO, errno, "cannot create %s", dir);
-    }
-    (void)snprintf(dir + base_len, cap - base_len, ".%u", twin);
+  *created = mkdir(dir, 0755) == 0;
+  if (!*created && errno != EEXIST) {
+    return diag_set(diag, STIGI_ERR_IO, errno, "cannot create %s", dir);
   }
   return STIGI_OK;
 }
 
+/* Returns the number of directories written through `wrote` (0 when the id was exported already) */
 static Status write_fact_dir(ExportCtx *ex, const char *parent, const uint8_t id[32],
-                             const StigiFactSet *fs, const char *rules_src, Diag *diag) {
+                             const StigiFactSet *fs, const char *rules_src, bool *wrote, Diag *diag) {
   char dir[1024];
-  Status st = make_id_dir(parent, id, dir, sizeof dir, diag);
-  if (st != STIGI_OK) return st;
+  Status st = make_id_dir(parent, id, dir, sizeof dir, wrote, diag);
+  if (st != STIGI_OK || !*wrote) return st;
   ex->rows += fs->count;
   return stigi_facts_write_dir(fs, dir, rules_src, diag);
 }
@@ -1034,16 +1032,18 @@ static Status export_negtest_facts(StigiDoor *door, ExportCtx *ex, const char *r
                                    const StigiImage *priv, uint32_t local_start,
                                    const uint8_t nt_id[32], Diag *diag) {
   char nt_dir[1024];
-  Status st = make_id_dir(ex->root, nt_id, nt_dir, sizeof nt_dir, diag);
+  bool nt_created = false;
+  Status st = make_id_dir(ex->root, nt_id, nt_dir, sizeof nt_dir, &nt_created, diag);
   for (uint32_t i = local_start; i < priv->unit_count && st == STIGI_OK; i++) {
     StigiFactSet fs;
     stigi_facts_init(&fs);
     st = unit_fact_set(priv, i, door->kernel_mode, &fs, diag);
-    if (st == STIGI_OK) st = write_fact_dir(ex, nt_dir, priv->units[i].unit_id, &fs, rules_src, diag);
-    if (st == STIGI_OK) ex->negtest_local_dirs++;
+    bool wrote = false;
+    if (st == STIGI_OK) st = write_fact_dir(ex, nt_dir, priv->units[i].unit_id, &fs, rules_src, &wrote, diag);
+    if (st == STIGI_OK && wrote) ex->negtest_local_dirs++;
     stigi_facts_free(&fs);
   }
-  if (st == STIGI_OK) ex->negtest_dirs++;
+  if (st == STIGI_OK && nt_created) ex->negtest_dirs++;
   return st;
 }
 
@@ -1635,7 +1635,9 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
     if (cand.unit_count > 0 && tasks == NULL) {
       tx_st = diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
     } else {
-      for (uint32_t i = 0; i < cand.unit_count; i++) {
+      /* Units with one id are one checked unit (identity.md, S134 b): the door evaluates one id once */
+      StigiKeySet queued = {NULL, 0, 0};
+      for (uint32_t i = 0; i < cand.unit_count && tx_st == STIGI_OK; i++) {
         StigiDeclKind k = cand.units[i].ast->decl->kind;
         if (k == STIGI_DECL_NEG_TEST) continue;
         uint8_t vkey[32];
@@ -1645,6 +1647,9 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
           out->verdicts_cached++;
           continue;
         }
+        if (keyset_contains(&queued, vkey)) continue;
+        tx_st = keyset_insert(&queued, vkey, diag);
+        if (tx_st != STIGI_OK) break;
         out->verdicts_computed++;
         tasks[todo_cnt].unit_idx = i;
         memcpy(tasks[todo_cnt].vkey, vkey, 32U);
@@ -1652,6 +1657,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         tasks[todo_cnt].st = STIGI_OK;
         todo_cnt++;
       }
+      keyset_free(&queued);
 
       size_t active_rules_len = cand_rules_dl != NULL ? cand_rules_len : door->rules_dl_len;
       uint32_t nthreads = choose_door_threads(todo_cnt);
@@ -2531,8 +2537,9 @@ Status stigi_door_export(StigiDoor *door, const char *dir, StigiExportStats *sta
     StigiFactSet fs;
     stigi_facts_init(&fs);
     st = unit_fact_set(img, i, door->kernel_mode, &fs, diag);
-    if (st == STIGI_OK) st = write_fact_dir(&ex, dir, img->units[i].unit_id, &fs, door->rules_dl, diag);
-    if (st == STIGI_OK) ex.unit_dirs++;
+    bool wrote = false;
+    if (st == STIGI_OK) st = write_fact_dir(&ex, dir, img->units[i].unit_id, &fs, door->rules_dl, &wrote, diag);
+    if (st == STIGI_OK && wrote) ex.unit_dirs++;
     stigi_facts_free(&fs);
   }
   for (uint32_t i = 0; i < img->unit_count && st == STIGI_OK; i++) {
