@@ -386,6 +386,11 @@ typedef struct {
   ExtLitCache *lits;
   uint32_t lit_count;
   uint32_t lit_cap;
+
+  /* Scope tree of the instance in creation order (index = scope number): the scopeSpan producer (ruling S138) */
+  const char **sc_syms;
+  uint32_t *sc_parent; /* index of the parent scope; a root is its own parent */
+  uint32_t sc_cap;
 } ExtCtx;
 
 static void ext_ctx_free(ExtCtx *ctx) {
@@ -394,6 +399,10 @@ static void ext_ctx_free(ExtCtx *ctx) {
   free(ctx->denials);
   free(ctx->local_assumps);
   free(ctx->lits);
+  free(ctx->sc_syms);
+  free(ctx->sc_parent);
+  ctx->sc_syms = NULL;
+  ctx->sc_parent = NULL;
   ctx->vars = NULL;
   ctx->caps = NULL;
   ctx->denials = NULL;
@@ -640,12 +649,71 @@ static const char *ext_new_pt(ExtCtx *ctx) {
 }
 
 static const char *ext_new_sc(ExtCtx *ctx, const char *parent_sc) {
+  uint32_t idx = ctx->next_sc;
   const char *sc = ctx_fmt(ctx, "%s:s%u", ctx->inst_sym, ctx->next_sc++);
   ctx_emit1(ctx, "scope", col_sym(sc));
   if (parent_sc != NULL) {
     ctx_emit2(ctx, "parent", col_sym(sc), col_sym(parent_sc));
   }
+  if (ctx->err != STIGI_OK) return sc;
+  if (idx >= ctx->sc_cap) {
+    uint32_t cap = ctx->sc_cap == 0 ? 64U : ctx->sc_cap * 2U;
+    const char **ns = realloc(ctx->sc_syms, (size_t)cap * sizeof *ns);
+    if (ns != NULL) ctx->sc_syms = ns;
+    uint32_t *np = realloc(ctx->sc_parent, (size_t)cap * sizeof *np);
+    if (np != NULL) ctx->sc_parent = np;
+    if (ns == NULL || np == NULL) {
+      ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "extract OOM");
+      return sc;
+    }
+    ctx->sc_cap = cap;
+  }
+  /* A parent is always created before its children: search back from the newest scope. */
+  uint32_t parent = idx;
+  for (uint32_t i = idx; parent_sc != NULL && i > 0; i--) {
+    if (ctx->sc_syms[i - 1U] == parent_sc) {
+      parent = i - 1U;
+      break;
+    }
+  }
+  ctx->sc_syms[idx] = sc;
+  ctx->sc_parent[idx] = parent;
   return sc;
+}
+
+/* scopeSpan(sc, first, last): preorder number of each scope in its dominator tree and the last preorder number of
+   its subtree, children in creation order (ruling S138). Parents precede children in creation order, so sizes sum
+   backward and first numbers are handed out forward: O(S), no recursion. Roots take ranges from the fact set
+   counter, so the roots of all instances in one evaluation never overlap (the rootScope rule of spanBad). */
+static void ext_emit_scope_spans(ExtCtx *ctx) {
+  uint32_t n = ctx->next_sc;
+  if (ctx->err != STIGI_OK || n == 0) return;
+  uint32_t *size = malloc((size_t)n * 3U * sizeof *size);
+  if (size == NULL) {
+    ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "extract OOM");
+    return;
+  }
+  uint32_t *first = size + n;
+  uint32_t *next_free = first + n;
+  for (uint32_t i = 0; i < n; i++) size[i] = 1;
+  for (uint32_t i = n; i > 0; i--) {
+    uint32_t p = ctx->sc_parent[i - 1U];
+    if (p != i - 1U) size[p] += size[i - 1U];
+  }
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t p = ctx->sc_parent[i];
+    if (p == i) {
+      first[i] = ctx->fs->next_span;
+      ctx->fs->next_span += size[i];
+    } else {
+      first[i] = next_free[p];
+      next_free[p] += size[i];
+    }
+    next_free[i] = first[i] + 1U;
+    ctx_emit3(ctx, "scopeSpan", col_sym(ctx->sc_syms[i]), col_i64((int64_t)first[i]),
+              col_i64((int64_t)(first[i] + size[i] - 1U)));
+  }
+  free(size);
 }
 
 static ExtVal ext_val_zero(const char *sym, const char *ty) {
@@ -3670,6 +3738,7 @@ static Status extract_def_body(const StigiImage *img, uint32_t unit_idx, const c
   }
   ctx_emit2(&ctx, "returnOf", col_sym(exit_pt), col_sym(ret_v.sym));
   ctx_emit1(&ctx, "exit", col_sym(exit_pt));
+  ext_emit_scope_spans(&ctx);
 
   Status ret = ctx.err;
   ext_ctx_free(&ctx);

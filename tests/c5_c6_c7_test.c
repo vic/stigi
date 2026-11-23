@@ -3,6 +3,7 @@
 #include "common.h"
 #include "door.h"
 #include "extract.h"
+#include "names.h"
 
 #include <dirent.h>
 #include <stdio.h>
@@ -70,6 +71,157 @@ static int tupu_reject_rows(const char *tupu_bin, const char *root, const char *
   out_buf[n] = '\0';
   if (pclose(fp) != 0) return -1;
   return count_tupu_reject_rows(out_buf);
+}
+
+static bool write_file_text(const char *path, const char *text) {
+  FILE *f = fopen(path, "wb");
+  if (f == NULL) return false;
+  size_t n = strlen(text);
+  bool ok = fwrite(text, 1, n, f) == n;
+  return fclose(f) == 0 && ok;
+}
+
+/* One fact directory for `prog`: an empty file for every .input relation, then the given files. */
+static bool write_fact_dir(const char *dir, const char *prog, const char *const *files, uint32_t nfiles) {
+  if (mkdir(dir, 0700) != 0) return false;
+  for (const char *p = strstr(prog, "\n.input "); p != NULL; p = strstr(p + 1, "\n.input ")) {
+    const char *q = p + 8;
+    while (*q != '\0' && *q != '\n') {
+      while (*q == ' ' || *q == ',') q++;
+      const char *s = q;
+      while (*q != '\0' && *q != '\n' && *q != ',' && *q != ' ' && *q != '(') q++;
+      if (q > s) {
+        char path[2048];
+        (void)snprintf(path, sizeof path, "%s/%.*s.facts", dir, (int)(q - s), s);
+        if (!write_file_text(path, "")) return false;
+      }
+      while (*q != '\0' && *q != '\n' && *q != ',') q++;
+    }
+  }
+  for (uint32_t i = 0; i + 1U < nfiles; i += 2U) {
+    char path[2048];
+    (void)snprintf(path, sizeof path, "%s/%s.facts", dir, files[i]);
+    if (!write_file_text(path, files[i + 1U])) return false;
+  }
+  return true;
+}
+
+/* Rows of Stigi.Probe.reachAt from tupu on `dir`, one "value\tlimit\tat" per line in `out` (-1 on failure) */
+static int reach_rows(const char *tupu_bin, const char *prog_path, const char *dir, char *out, size_t cap) {
+  char odir[1200], cmd[4096], csv[1300];
+  (void)snprintf(odir, sizeof odir, "%s.out", dir);
+  if (mkdir(odir, 0700) != 0) return -1;
+  (void)snprintf(cmd, sizeof cmd, "%s -F %s -D %s %s > /dev/null 2>&1", tupu_bin, dir, odir, prog_path);
+  if (system(cmd) != 0) return -1;
+  (void)snprintf(csv, sizeof csv, "%s/Stigi__Probe__reachAt.csv", odir);
+  FILE *f = fopen(csv, "rb");
+  if (f == NULL) return -1;
+  size_t n = fread(out, 1, cap - 1U, f);
+  out[n] = '\0';
+  (void)fclose(f);
+  int rows = 0;
+  for (size_t i = 0; i < n; i++) rows += out[i] == '\n';
+  return rows;
+}
+
+/* S138 (Option A): an order atom in a rule body reads the kernel's stored row through dom; order atoms are refused
+ * negated, in a head, and the P1 closure relations are never named by a rule unit. */
+static void test_s138_rule_mapping(StigiDoor *door, const char *tupu_bin) {
+  int failures_before = g_failures;
+  Diag d;
+  diag_clear(&d);
+  const char *rel =
+      "// prompt: scopes at which a value is below and at most its limit.\n"
+      "pub relation Stigi.Probe.reachAt(value: Stigi.Id.Value, limit: Stigi.Id.Value, at: Stigi.Id.Value)\n";
+  const char *rule =
+      "// prompt: a value that is below and at most its limit at a scope reaches it there.\n"
+      "rule def Stigi.Probe.reachRule: Stigi.Probe.reachAt(value, limit, at) = below(value, limit, at), "
+      "lessOrEqual(value, limit, at)\n";
+  StigiImage img;
+  stigi_image_init(&img);
+  StigiNameDiags nd;
+  stigi_name_diags_init(&nd);
+  CHECK(stigi_image_add_source(&img, rel, strlen(rel), &nd, &d) == STIGI_OK &&
+            stigi_image_add_source(&img, rule, strlen(rule), &nd, &d) == STIGI_OK &&
+            stigi_image_resolve(&img, &nd, &d) == STIGI_OK,
+        "S138 candidate with a relation and a rule unit");
+  char *dl = NULL;
+  size_t dl_len = 0;
+  bool custom = false;
+  CHECK(stigi_door_compile_rules(door, &img, &dl, &dl_len, &custom, &d) == STIGI_OK && custom && dl != NULL,
+        "S138 candidate rules compile");
+  stigi_name_diags_free(&nd);
+  stigi_image_free(&img);
+  if (dl == NULL) return;
+  CHECK(strstr(dl, "belowFrom(value, limit, _dU0), dom(at, _dU0)") != NULL,
+        "S138: below(a, b, s) reads belowFrom(a, b, _dU0), dom(s, _dU0)");
+  CHECK(strstr(dl, "leqFrom(value, limit, _dU1), dom(at, _dU1)") != NULL,
+        "S138: lessOrEqual(a, b, s) reads leqFrom(a, b, _dU1), dom(s, _dU1)");
+
+  /* tupu accepts the program; a credit at the root is seen at the child, a credit at the child is not seen at the
+   * root (scopes R and C, C child of R) */
+  char base[] = "/tmp/stigi-s138-rule-XXXXXX";
+  CHECK(mkdtemp(base) != NULL, "mkdtemp S138 rule dir");
+  char prog_path[1024];
+  (void)snprintf(prog_path, sizeof prog_path, "%s/prog.dl", base);
+  size_t plen = dl_len + 64U;
+  char *prog = malloc(plen);
+  CHECK(prog != NULL, "S138 program buffer");
+  if (prog == NULL) {
+    free(dl);
+    return;
+  }
+  (void)snprintf(prog, plen, "%s\n.output Stigi__Probe__reachAt\n", dl);
+  free(dl);
+  CHECK(write_file_text(prog_path, prog), "write S138 program");
+  const char *tree[] = {"scope", "R\nC\n", "parent", "C\tR\n", "scopeSpan", "R\t0\t1\nC\t1\t1\n", "value", "v\nl\n"};
+  const char *at_root[] = {"baseBelow", "v\tl\tR\n", "baseLeq", "v\tl\tR\n"};
+  const char *at_child[] = {"baseBelow", "v\tl\tC\n", "baseLeq", "v\tl\tC\n"};
+  const char *const *credit[2] = {at_root, at_child};
+  const char *want[2][2] = {{"v\tl\tR\n", "v\tl\tC\n"}, {"v\tl\tC\n", NULL}};
+  const int want_rows[2] = {2, 1};
+  for (int c = 0; c < 2; c++) {
+    char dir[1100];
+    (void)snprintf(dir, sizeof dir, "%s/%s", base, c == 0 ? "root" : "child");
+    const char *files[12];
+    for (int k = 0; k < 8; k++) files[k] = tree[k];
+    for (int k = 0; k < 4; k++) files[8 + k] = credit[c][k];
+    CHECK(write_fact_dir(dir, prog, files, 12), "S138 two-scope fact dir");
+    char rows[512];
+    int n = reach_rows(tupu_bin, prog_path, dir, rows, sizeof rows);
+    CHECK(n == want_rows[c], c == 0 ? "S138: a root credit gives reachAt at R and at C"
+                                    : "S138: a child credit gives reachAt at C only");
+    for (int k = 0; k < 2; k++) {
+      if (want[c][k] != NULL) CHECK(strstr(rows, want[c][k]) != NULL, "S138: expected reachAt row present");
+    }
+  }
+  free(prog);
+
+  /* Refusals (rule-unsafe): a negated order atom, an order alias in a head, a body atom on a P1 closure relation */
+  const char *seen =
+      "// prompt: scopes at which a value was seen with its limit.\n"
+      "pub relation Stigi.Probe.seen(value: Stigi.Id.Value, limit: Stigi.Id.Value, at: Stigi.Id.Value)\n";
+  const char *bad_rules[3] = {
+      "// prompt: a negated order atom must be refused.\n"
+      "rule def Stigi.Probe.negRule: Stigi.Probe.reachAt(value, limit, at) = Stigi.Probe.seen(value, limit, at), "
+      "not below(value, limit, at)\n",
+      "// prompt: an order alias in a head must be refused.\n"
+      "rule def Stigi.Probe.headRule: below(value, limit, at) = Stigi.Probe.seen(value, limit, at)\n",
+      "// prompt: a P1 closure relation in a body must be refused.\n"
+      "rule def Stigi.Probe.innerRule: Stigi.Probe.reachAt(value, limit, at) = belowFrom(value, limit, at)\n"};
+  const char *labels[3] = {"S138: a negated order atom is rule-unsafe", "S138: an order alias in a head is rule-unsafe",
+                           "S138: a P1 closure relation in a body is rule-unsafe"};
+  for (int k = 0; k < 3; k++) {
+    const char *srcs[3] = {rel, seen, bad_rules[k]};
+    size_t lens[3] = {strlen(rel), strlen(seen), strlen(bad_rules[k])};
+    StigiDoorResult r;
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(door, srcs, lens, 3, &r, &d) == STIGI_OK, "check S138 refusal candidate");
+    if (!has_reject_code(&r, "rule-unsafe")) dump_rejects(labels[k], &r);
+    CHECK(!r.accepted && has_reject_code(&r, "rule-unsafe"), labels[k]);
+    stigi_door_result_free(&r);
+  }
+  if (g_failures == failures_before) printf("c7 S138 rule mapping: PASS (dom reads, two-scope rows, 3 refusals)\n");
 }
 
 int main(void) {
@@ -953,6 +1105,12 @@ int main(void) {
     CHECK(unit_dirs > 0, "export holds at least one evaluation");
     CHECK(unit_rej == 0, "Wave 3: tupu on every admitted unit's fact directory gives EXACTLY 0 reject rows");
     CHECK(negtest_rej >= (int)xs.negtest_dirs, "tupu on the NegTest bodies gives their reject rows");
+  }
+
+  {
+    const char *tupu_bin = getenv("TUPU_BIN");
+    if (tupu_bin == NULL || tupu_bin[0] == '\0') tupu_bin = "/home/vic/hk/tupu/result/bin/tupu";
+    test_s138_rule_mapping(&door, tupu_bin);
   }
 
   stigi_door_free(&door);

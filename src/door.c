@@ -546,8 +546,69 @@ static void emit_rule_expr_dl(DlBuf *b, const StigiExpr *e) {
   }
 }
 
+/* Order atoms of a rule unit (ruling S138, Option A of p1-patch.md 7): the kernel stores each order row once at its
+   defining scope (belowFrom, leqFrom, upperFrom, lowerFrom); a reader at scope s sees a row stored at u when u
+   dominates s. */
+typedef enum { ORDER_NONE = 0, ORDER_BELOW, ORDER_LEQ, ORDER_UPPER, ORDER_LOWER } OrderAtom;
+static const char *const ORDER_FROM_REL[] = {[ORDER_NONE] = "", [ORDER_BELOW] = "belowFrom",
+                                             [ORDER_LEQ] = "leqFrom", [ORDER_UPPER] = "upperFrom",
+                                             [ORDER_LOWER] = "lowerFrom"};
+
+static StigiStr strip_facts_prefix(StigiStr n) {
+  static const char pre[] = "Stigi.Facts.";
+  size_t pl = sizeof pre - 1U;
+  if (n.len > pl && memcmp(n.ptr, pre, pl) == 0) {
+    n.ptr += pl;
+    n.len -= pl;
+  }
+  return n;
+}
+
+static OrderAtom order_atom_of(StigiStr raw) {
+  StigiStr n = strip_facts_prefix(raw);
+  if (str_eq_c(n, "below")) return ORDER_BELOW;
+  if (str_eq_c(n, "lessOrEqual") || str_eq_c(n, "leq")) return ORDER_LEQ;
+  if (str_eq_c(n, "upper")) return ORDER_UPPER;
+  if (str_eq_c(n, "lower")) return ORDER_LOWER;
+  return ORDER_NONE;
+}
+
+/* Relations of the P1 order closure: kernel-internal, never named by a rule unit. */
+static bool is_p1_internal_name(StigiStr raw) {
+  static const char *const names[] = {"belowFrom", "leqFrom", "upperFrom", "lowerFrom", "upperBaseFrom",
+                                      "lowerBaseFrom", "belowAt", "leqAt", "upperAt", "lowerAt",
+                                      "orderAsk", "boundAsk", "scopeSpan", "spanBad", "hasSpan",
+                                      "spansValid", "anySpanBad", "rootScope", "hasParent", "dom"};
+  StigiStr n = strip_facts_prefix(raw);
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    if (str_eq_c(n, names[i])) return true;
+  }
+  return false;
+}
+
 static void emit_rule_item_dl(DlBuf *b, const StigiImage *img, uint32_t from_idx,
-                              const char *base_dl, const StigiFactItem *it) {
+                              const char *base_dl, const StigiFactItem *it, uint32_t *fresh,
+                              bool is_head) {
+  OrderAtom oa = it->kind == STIGI_FACT_ATOM ? order_atom_of(it->atom_name) : ORDER_NONE;
+  if (oa != ORDER_NONE && !it->is_negated && !is_head && it->arg_count == 3) {
+    /* below(a, b, s) -> belowFrom(a, b, _dU<n>), dom(s, _dU<n>); `_d` is a prefix the tenet gate refuses in
+       source, so the fresh variable never meets a user name */
+    char var[24];
+    int vn = snprintf(var, sizeof var, "_dU%u", (*fresh)++);
+    db_cstr(b, ORDER_FROM_REL[oa]);
+    db_cstr(b, "(");
+    emit_rule_expr_dl(b, it->args[0]);
+    db_cstr(b, ", ");
+    emit_rule_expr_dl(b, it->args[1]);
+    db_cstr(b, ", ");
+    if (vn > 0) db_mem(b, var, (size_t)vn);
+    db_cstr(b, "), dom(");
+    emit_rule_expr_dl(b, it->args[2]);
+    db_cstr(b, ", ");
+    if (vn > 0) db_mem(b, var, (size_t)vn);
+    db_cstr(b, ")");
+    return;
+  }
   if (it->kind == STIGI_FACT_ATOM) {
     if (it->is_negated) db_cstr(b, "!");
     char rname[160];
@@ -574,8 +635,8 @@ static void emit_rule_item_dl(DlBuf *b, const StigiImage *img, uint32_t from_idx
   }
 }
 
-static Status compile_image_rules(const StigiDoor *door, const StigiImage *cand,
-                                  char **out_dl, size_t *out_len, bool *has_custom, Diag *diag) {
+Status stigi_door_compile_rules(const StigiDoor *door, const StigiImage *cand,
+                               char **out_dl, size_t *out_len, bool *has_custom, Diag *diag) {
   *out_dl = NULL;
   *out_len = 0;
   *has_custom = false;
@@ -625,12 +686,13 @@ static Status compile_image_rules(const StigiDoor *door, const StigiImage *cand,
   for (uint32_t i = 0; i < cand->unit_count && !db.oom; i++) {
     const StigiDecl *d = cand->units[i].ast->decl;
     if (d->kind != STIGI_DECL_RULE) continue;
-    emit_rule_item_dl(&db, cand, i, door->base_rules_dl, &d->u.rule_decl.head);
+    uint32_t fresh = 0; /* per-rule counter of the _dU<n> scope variables */
+    emit_rule_item_dl(&db, cand, i, door->base_rules_dl, &d->u.rule_decl.head, &fresh, true);
     if (d->u.rule_decl.body_count > 0) {
       db_cstr(&db, " :- ");
       for (uint32_t b = 0; b < d->u.rule_decl.body_count; b++) {
         if (b > 0) db_cstr(&db, ", ");
-        emit_rule_item_dl(&db, cand, i, door->base_rules_dl, &d->u.rule_decl.body[b]);
+        emit_rule_item_dl(&db, cand, i, door->base_rules_dl, &d->u.rule_decl.body[b], &fresh, false);
       }
     }
     db_cstr(&db, ".\n");
@@ -638,7 +700,7 @@ static Status compile_image_rules(const StigiDoor *door, const StigiImage *cand,
 
   if (db.oom) {
     free(db.buf);
-    return diag_set(diag, STIGI_ERR_OOM, -1, "compile_image_rules OOM");
+    return diag_set(diag, STIGI_ERR_OOM, -1, "stigi_door_compile_rules OOM");
   }
   *out_dl = db.buf;
   *out_len = db.len;
@@ -847,10 +909,10 @@ static bool is_kernel_head_name(const StigiImage *img, uint32_t from_idx, StigiS
   if (idx >= 0 && img->units[idx].name_len >= 6 && memcmp(img->units[idx].name, "Stigi.", 6) == 0) {
     return true;
   }
-  /* Direct schema.dl safety heads */
+  /* Direct schema.dl safety heads, the order aliases and the P1 order-closure relations (S138) */
   if (str_eq_c(raw_name, "cleared") || str_eq_c(raw_name, "owes") ||
-      str_eq_c(raw_name, "reject") || str_eq_c(raw_name, "below") ||
-      str_eq_c(raw_name, "leq")) {
+      str_eq_c(raw_name, "reject") || order_atom_of(raw_name) != ORDER_NONE ||
+      is_p1_internal_name(raw_name)) {
     return true;
   }
   return false;
@@ -957,9 +1019,27 @@ static Status check_boundary_rules(const StigiImage *cand, bool kernel_mode,
                         "rules targeting Stigi.* relations must live under Stigi.*", diag);
         if (st != STIGI_OK) break;
       }
+      /* S138: order rows are derived by the kernel only, readers go through dom, the closure is internal */
+      const StigiFactItem *hd = &d->u.rule_decl.head;
+      if (hd->kind == STIGI_FACT_ATOM &&
+          (order_atom_of(hd->atom_name) != ORDER_NONE || is_p1_internal_name(hd->atom_name))) {
+        st = add_reject(out, u->name, "rule-unsafe",
+                        "a rule head may not name an order relation or a P1 order-closure relation", diag);
+        if (st != STIGI_OK) break;
+      }
       for (uint32_t b = 0; b < d->u.rule_decl.body_count && st == STIGI_OK; b++) {
         const StigiFactItem *bi = &d->u.rule_decl.body[b];
         if (bi->kind != STIGI_FACT_ATOM) continue;
+        if (bi->is_negated && order_atom_of(bi->atom_name) != ORDER_NONE) {
+          st = add_reject(out, u->name, "rule-unsafe",
+                          "a negated order atom is refused: order rows hold by dominance, not by absence", diag);
+          break;
+        }
+        if (is_p1_internal_name(bi->atom_name)) {
+          st = add_reject(out, u->name, "rule-unsafe",
+                          "a rule body may not name a P1 order-closure relation", diag);
+          break;
+        }
         if (str_eq_c(bi->atom_name, "owes") || str_eq_c(bi->atom_name, "cleared") ||
             str_eq_c(bi->atom_name, "reject") || str_eq_c(bi->atom_name, "Stigi.Gate.owes") ||
             str_eq_c(bi->atom_name, "Stigi.Gate.cleared") ||
@@ -1398,7 +1478,7 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
   size_t priv_dl_len = 0;
   bool priv_has_custom = false;
   if (st == STIGI_OK && priv_res.reject_count == 0) {
-    st = compile_image_rules(door, &priv, &priv_dl_src, &priv_dl_len, &priv_has_custom, diag);
+    st = stigi_door_compile_rules(door, &priv, &priv_dl_src, &priv_dl_len, &priv_has_custom, diag);
     if (st == STIGI_OK && priv_has_custom) {
       Diag od;
       diag_clear(&od);
@@ -1771,7 +1851,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
   bool need_dl_swap = false;
 
   if (tx_st == STIGI_OK && out->reject_count == 0) {
-    tx_st = compile_image_rules(door, &cand, &cand_rules_dl, &cand_rules_len,
+    tx_st = stigi_door_compile_rules(door, &cand, &cand_rules_dl, &cand_rules_len,
                                 &has_custom_rules, diag);
     if (tx_st == STIGI_OK && has_custom_rules) {
       Diag od;

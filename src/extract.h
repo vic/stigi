@@ -29,6 +29,7 @@ typedef struct {
   StigiFactRow *rows;
   uint32_t count;
   uint32_t cap;
+  uint32_t next_span; /* next free preorder number: instance roots take disjoint ranges (scopeSpan, S138) */
 } StigiFactSet;
 
 void stigi_facts_init(StigiFactSet *fs);

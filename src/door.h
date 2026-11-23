@@ -149,4 +149,9 @@ typedef struct {
  * door loads for that unit; a NegTest body is one directory, named by the NegTest's id). */
 Status stigi_door_export(StigiDoor *door, const char *dir, StigiExportStats *stats, Diag *diag);
 
+/* The rule program of a candidate: the base rules plus its relation and rule units compiled to Datalog
+ * (S138: order atoms read through dom). *has_custom is false when the candidate holds neither. */
+Status stigi_door_compile_rules(const StigiDoor *door, const StigiImage *cand,
+                               char **out_dl, size_t *out_len, bool *has_custom, Diag *diag);
+
 #endif
