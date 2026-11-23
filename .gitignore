@@ -6,3 +6,6 @@ result-*
 *.o
 *.su
 *.s
+GEMINI*
+CLAUDE*
+AGENTS*
