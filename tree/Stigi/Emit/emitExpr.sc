@@ -17,14 +17,19 @@ def Stigi.Emit.emitExpr {region: Stigi.Region, writer: Stigi.Emit.Writer, Stigi.
       if kind == TokNewline && beg <= lastPos then fin = lastPos else trimTail = false
     var scanAt: U64 = beg
     var atDepth: U64 = 0
-    while scanAt < fin do
-      @<lessOrEqual(beg, scanAt), lessOrEqual(scanAt, fin), lessOrEqual(atDepth, Stigi.Limit.maxTokens)>
+    var cutAt: U64 = fin
+    var cutFound: Bool = false
+    while scanAt < fin && !cutFound do
+      @<lessOrEqual(beg, scanAt), lessOrEqual(scanAt, fin), lessOrEqual(beg, cutAt), lessOrEqual(cutAt, fin), lessOrEqual(atDepth, Stigi.Limit.maxTokens)>
       val Token(atKind, _, _, _, _) = toks(scanAt)
       if atKind == TokLeftParen && atDepth < Stigi.Limit.maxTokens then atDepth = atDepth + 1
       else if atKind == TokRightParen && atDepth > 0 then atDepth = atDepth - 1
-      else if atKind == TokAt && atDepth == 0 then fin = scanAt
+      else if atKind == TokAt && atDepth == 0 then
+        cutAt = scanAt
+        cutFound = true
       else ()
       scanAt = scanAt + 1
+    fin = cutAt
     if beg >= fin then Stigi.Emit.writeLit{writer}(outCap, outBuf, 9, "((void)0)") else
       val BodyMeta(_, _, monoBeg, monoFin, _, _, _) = meta
       val Token(firstKind, firstBeg, firstFin, _, _) = toks(beg)

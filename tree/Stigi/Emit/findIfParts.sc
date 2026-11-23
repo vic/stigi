@@ -1,4 +1,4 @@
-// prompt: find matching then and else token positions for an if expression, skipping val-else clauses.
+// prompt: find matching then and else token positions for an if expression, ignoring val-else clauses.
 def Stigi.Emit.findIfParts(tokCap: Stigi.TokenCap, toks: Array[Stigi.Lex.Token](tokCap), startTok: U64, endTok: U64) <lessOrEqual(startTok, endTok), lessOrEqual(endTok, tokCap)>: Stigi.Emit.IfSplit =
   if startTok >= endTok then IfIncomplete
   else
