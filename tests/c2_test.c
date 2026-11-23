@@ -58,6 +58,19 @@ static void check_roundtrip(const char *label, const char *src, StigiDeclKind ex
 }
 
 static void test_roundtrips(void) {
+  /* S129 pattern sugar: alternatives (also nested), byte and int ranges, text patterns, `is` */
+  check_roundtrip(
+      "pattern_sugar",
+      "// prompt: classify a shape and a byte with pattern sugar.\n"
+      "pub def Demo.kind(shape: Demo.Shape, code: U8, count: U64, word: Array[U8](count)): U64 =\n"
+      "  val flat: Bool = shape is Dot | Line(_)\n"
+      "  val digit: Bool = code is '0'..'9' | 'a'..'f'\n"
+      "  val pair: Bool = shape is Box(1 | 2, _) && code is 0..9\n"
+      "  word match\n"
+      "    case \"yes\" | \"y\" => 1\n"
+      "    case _ => if flat && digit || pair then 2 else 3\n",
+      STIGI_DECL_DEF);
+
   check_roundtrip(
       "def_generic_evidence",
       "// prompt: the element at a proved index.\n"

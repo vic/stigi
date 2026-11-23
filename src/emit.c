@@ -3557,6 +3557,12 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
     case STIGI_EXPR_LOCAL_DECL:
       eb_cstr(ctx->b, "UINT64_C(0)");
       break;
+    case STIGI_EXPR_IS:
+      /* the elaborator rewrites every `is` into a match (S129); one that reaches the emitter is refused */
+      ctx->fail_closed = true;
+      (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg, "an `is` expression reached the emitter unelaborated");
+      eb_cstr(ctx->b, "false");
+      break;
   }
 }
 

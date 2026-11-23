@@ -124,6 +124,56 @@ static int reach_rows(const char *tupu_bin, const char *prog_path, const char *d
   return rows;
 }
 
+/* S129 sugar refusals: each candidate is rejected with exactly one code, the one under test (T2: a NegTest needs
+ * exactly its codes) */
+static void test_s129_negatives(StigiDoor *door) {
+  int failures_before = g_failures;
+  const char *shape =
+      "// prompt: a drawn shape.\n"
+      "pub enum Demo.Neg.Shape:\n"
+      "  case Dot\n"
+      "  case Line(len: U64)\n"
+      "  case Box(wide: U64, high: U64)\n";
+  struct {
+    const char *label;
+    const char *code;
+    const char *src;
+  } cases[3] = {
+      {"S129: a range whose low end is above its high end is mismatch", "mismatch",
+       "// prompt: a reversed range must be refused.\n"
+       "pub def main(code: U8): I32 <lessOrEqual(0, result)> =\n"
+       "  code match\n"
+       "    case 9..0 => 1\n"
+       "    case _ => 0\n"},
+      {"S129: alternatives with other binders are pattern-arity", "pattern-arity",
+       "// prompt: alternatives with different binders must be refused.\n"
+       "pub def main(shape: Demo.Neg.Shape): U64 <lessOrEqual(0, result)> =\n"
+       "  shape match\n"
+       "    case Line(len) | Dot => len\n"
+       "    case Box(_, _) => 0\n"},
+      {"S129: a text match without a last default arm is not-exhaustive", "not-exhaustive",
+       "// prompt: a text match without a default arm must be refused.\n"
+       "pub def main(count: U64, word: Array[U8](count)): I32 <lessOrEqual(0, result)> =\n"
+       "  word match\n"
+       "    case \"yes\" => 1\n"}};
+  for (int k = 0; k < 3; k++) {
+    /* only the binder case reads the shape enum; an unread enum would add no-reader */
+    uint32_t n = k == 1 ? 2U : 1U;
+    const char *srcs[2] = {k == 1 ? shape : cases[k].src, cases[k].src};
+    size_t lens[2] = {strlen(srcs[0]), strlen(srcs[1])};
+    Diag d;
+    diag_clear(&d);
+    StigiDoorResult r;
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(door, srcs, lens, n, &r, &d) == STIGI_OK, "check S129 refusal candidate");
+    bool exact = !r.accepted && r.reject_count == 1 && strcmp(r.rejects[0].code, cases[k].code) == 0;
+    if (!exact) dump_rejects(cases[k].label, &r);
+    CHECK(exact, cases[k].label);
+    stigi_door_result_free(&r);
+  }
+  if (g_failures == failures_before) printf("c6 S129 refusals: PASS (mismatch, pattern-arity, not-exhaustive)\n");
+}
+
 /* S138 (Option A): an order atom in a rule body reads the kernel's stored row through dom; order atoms are refused
  * negated, in a head, and the P1 closure relations are never named by a rule unit. */
 static void test_s138_rule_mapping(StigiDoor *door, const char *tupu_bin) {
@@ -1112,6 +1162,7 @@ int main(void) {
     if (tupu_bin == NULL || tupu_bin[0] == '\0') tupu_bin = "/home/vic/hk/tupu/result/bin/tupu";
     test_s138_rule_mapping(&door, tupu_bin);
   }
+  test_s129_negatives(&door);
 
   stigi_door_free(&door);
 

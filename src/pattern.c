@@ -12,6 +12,9 @@ typedef struct {
   Diag *diag;
   uint32_t fresh_seq;
   Status err;
+  const StigiDecl *cur_decl; /* the def or val whose body is elaborated: declared local types (S129) */
+  StigiExpr *missing_body;   /* stands in for a missing case after not-exhaustive: typed like the match */
+  bool arity_dropped;        /* this match dropped an alternative after pattern-arity: no not-exhaustive */
 } ElabCtx;
 
 typedef struct {
@@ -228,6 +231,9 @@ static bool pat_is_1level_simple(const StigiPat *p) {
       return !p->int_neg;
     case STIGI_PAT_CHAR:
     case STIGI_PAT_TUPLE:
+    case STIGI_PAT_OR:
+    case STIGI_PAT_RANGE:
+    case STIGI_PAT_STR:
       return false;
     case STIGI_PAT_CTOR:
       if (p->subpat_count == 0) return true;
@@ -288,6 +294,370 @@ static void report_wildcard_rows(ElabCtx *ctx, const PatRow *rows, uint32_t nrow
   }
 }
 
+/* ---- S129 pattern sugar: alternatives, ranges, text, `is` ---- */
+
+static StigiExpr *make_lit_expr(ElabCtx *ctx, const StigiPat *lit_pat) {
+  /* the literal of an int/char pattern as an expression: `x == L` with x the scrutinee, then take the rhs */
+  StigiExpr *eq = make_eq_lit(ctx, NULL, lit_pat, lit_pat->span);
+  return eq == NULL ? NULL : eq->u.binop.rhs;
+}
+
+static StigiExpr *make_binop_expr(ElabCtx *ctx, StigiOp op, StigiExpr *lhs, StigiExpr *rhs, StigiSpan sp) {
+  StigiExpr *e = ea_alloc(ctx, sizeof *e);
+  if (e == NULL) return NULL;
+  memset(e, 0, sizeof *e);
+  e->kind = STIGI_EXPR_BINOP;
+  e->span = sp;
+  e->u.binop.op = op;
+  e->u.binop.lhs = lhs;
+  e->u.binop.rhs = rhs;
+  return e;
+}
+
+static StigiExpr *make_uint_expr(ElabCtx *ctx, uint64_t v, StigiSpan sp) {
+  StigiExpr *e = ea_alloc(ctx, sizeof *e);
+  if (e == NULL) return NULL;
+  memset(e, 0, sizeof *e);
+  e->kind = STIGI_EXPR_LIT_INT;
+  e->span = sp;
+  e->u.lit_int.value = v;
+  char tmp[24];
+  int n = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)v);
+  char *raw = n > 0 ? ea_alloc(ctx, (size_t)n + 1U) : NULL;
+  if (raw == NULL) return NULL;
+  memcpy(raw, tmp, (size_t)n + 1U);
+  e->u.lit_int.raw = (StigiStr){raw, (uint32_t)n};
+  return e;
+}
+
+static StigiExpr *make_bool_expr(ElabCtx *ctx, bool v, StigiSpan sp) {
+  StigiExpr *e = ea_alloc(ctx, sizeof *e);
+  if (e == NULL) return NULL;
+  memset(e, 0, sizeof *e);
+  e->kind = STIGI_EXPR_LIT_BOOL;
+  e->span = sp;
+  e->u.lit_bool.value = v;
+  return e;
+}
+
+/* Signed value of an int literal pattern, or the byte of a char pattern */
+static int cmp_lit(const StigiPat *a, const StigiPat *b) {
+  if (a->kind == STIGI_PAT_CHAR) return a->char_val < b->char_val ? -1 : a->char_val > b->char_val;
+  if (a->int_neg != b->int_neg) return a->int_neg ? -1 : 1;
+  int mag = a->int_val < b->int_val ? -1 : a->int_val > b->int_val;
+  return a->int_neg ? -mag : mag;
+}
+
+static bool lit_is_zero(const StigiPat *p) {
+  return p->kind == STIGI_PAT_CHAR ? p->char_val == 0 : (!p->int_neg && p->int_val == 0);
+}
+
+/* A local's type as written in the def or val being elaborated: a parameter, or a typed `val`/`var`. Names are
+   unique in a body (names.md), so the first declaration found is the one. NULL when it states no type. */
+static const StigiType *find_typed_local(const StigiExpr *e, StigiStr name, int depth);
+
+static const StigiType *find_typed_local_arms(const StigiMatchArm *arms, uint32_t n, StigiStr name, int depth) {
+  for (uint32_t i = 0; i < n; i++) {
+    const StigiType *t = find_typed_local(arms[i].body, name, depth + 1);
+    if (t != NULL) return t;
+  }
+  return NULL;
+}
+
+static const StigiType *find_typed_local(const StigiExpr *e, StigiStr name, int depth) {
+  if (e == NULL || depth > 256) return NULL;
+  switch (e->kind) {
+    case STIGI_EXPR_VAL:
+      if (e->u.val_stmt.type != NULL && e->u.val_stmt.pat.kind == STIGI_PAT_VAR &&
+          str_eq_ss(e->u.val_stmt.pat.name, name)) {
+        return e->u.val_stmt.type;
+      }
+      return find_typed_local(e->u.val_stmt.init, name, depth + 1);
+    case STIGI_EXPR_VAR:
+      if (e->u.var_stmt.type != NULL && str_eq_ss(e->u.var_stmt.name, name)) return e->u.var_stmt.type;
+      return find_typed_local(e->u.var_stmt.init, name, depth + 1);
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        const StigiType *t = find_typed_local(e->u.block.stmts[i], name, depth + 1);
+        if (t != NULL) return t;
+      }
+      return NULL;
+    case STIGI_EXPR_IF: {
+      const StigiType *t = find_typed_local(e->u.if_expr.then_br, name, depth + 1);
+      return t != NULL ? t : find_typed_local(e->u.if_expr.else_br, name, depth + 1);
+    }
+    case STIGI_EXPR_WHILE:
+      return find_typed_local(e->u.while_expr.body, name, depth + 1);
+    case STIGI_EXPR_MATCH:
+      return find_typed_local_arms(e->u.match_expr.arms, e->u.match_expr.arm_count, name, depth);
+    case STIGI_EXPR_HANDLE:
+      return find_typed_local(e->u.handle_stmt.body, name, depth + 1);
+    case STIGI_EXPR_LOCAL:
+    case STIGI_EXPR_GLOBAL:
+    case STIGI_EXPR_LIT_INT:
+    case STIGI_EXPR_LIT_CHAR:
+    case STIGI_EXPR_LIT_STR:
+    case STIGI_EXPR_LIT_BOOL:
+    case STIGI_EXPR_LIT_UNIT:
+    case STIGI_EXPR_CALL:
+    case STIGI_EXPR_BINOP:
+    case STIGI_EXPR_UNOP:
+    case STIGI_EXPR_ASSIGN:
+    case STIGI_EXPR_INDEX_READ:
+    case STIGI_EXPR_INDEX_WRITE:
+    case STIGI_EXPR_ASSERT:
+    case STIGI_EXPR_DENY:
+    case STIGI_EXPR_LOCAL_DECL:
+    case STIGI_EXPR_IS:
+      return NULL;
+  }
+  return NULL;
+}
+
+static const StigiType *declared_type_of(const ElabCtx *ctx, const StigiExpr *scrut) {
+  if (scrut == NULL || scrut->kind != STIGI_EXPR_LOCAL || ctx->cur_decl == NULL) return NULL;
+  StigiStr name = scrut->u.ident.name;
+  const StigiDecl *d = ctx->cur_decl;
+  if (d->kind == STIGI_DECL_DEF || d->kind == STIGI_DECL_LEMMA_DEF) {
+    const StigiDefHead *h = &d->u.def_decl.head;
+    for (uint32_t i = 0; i < h->param_count; i++) {
+      if (str_eq_ss(h->params[i].name, name)) return h->params[i].type;
+    }
+    return find_typed_local(d->u.def_decl.body, name, 0);
+  }
+  if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST) return find_typed_local(d->u.val_decl.body, name, 0);
+  return NULL;
+}
+
+/* The largest value of a declared unsigned integer type; 0 when the type is not one */
+static uint64_t unsigned_type_max(const StigiType *t) {
+  if (t == NULL || t->type_arg_count != 0 || t->len_arg_count != 0) return 0;
+  static const struct { const char *name; uint64_t max; } ut[] = {
+      {"U8", 255U}, {"U32", 4294967295U}, {"U64", UINT64_MAX}};
+  for (size_t i = 0; i < sizeof ut / sizeof ut[0]; i++) {
+    if (t->name.len == strlen(ut[i].name) && memcmp(t->name.ptr, ut[i].name, t->name.len) == 0) return ut[i].max;
+  }
+  return 0;
+}
+
+/* `lo..hi` on x: `x >= lo && x <= hi` (literal on the right, as the type check reads it), without a half the type
+   of x already decides (ruling on S129 ranges): a byte or a declared unsigned x never needs `x >= 0`, nor
+   `x <= max` at its type's maximum; lo == hi is `x == lo`. NULL when the range covers the whole type. */
+static StigiExpr *make_range_test(ElabCtx *ctx, const StigiPat *r, StigiExpr *x) {
+  const StigiPat *lo = &r->subpats[0];
+  const StigiPat *hi = &r->subpats[1];
+  if (cmp_lit(lo, hi) == 0) return make_eq_lit(ctx, x, lo, r->span);
+  uint64_t umax = lo->kind == STIGI_PAT_CHAR ? 255U : unsigned_type_max(declared_type_of(ctx, x));
+  bool is_unsigned = umax != 0;
+  uint64_t hi_val = hi->kind == STIGI_PAT_CHAR ? hi->char_val : hi->int_val;
+  bool need_lo = !(is_unsigned && lit_is_zero(lo));
+  bool need_hi = !(is_unsigned && !hi->int_neg && hi_val == umax);
+  StigiExpr *lo_t = need_lo ? make_binop_expr(ctx, STIGI_OP_GE, x, make_lit_expr(ctx, lo), r->span) : NULL;
+  StigiExpr *hi_t = need_hi ? make_binop_expr(ctx, STIGI_OP_LE, x, make_lit_expr(ctx, hi), r->span) : NULL;
+  if (lo_t != NULL && hi_t != NULL) return make_binop_expr(ctx, STIGI_OP_AND, lo_t, hi_t, r->span);
+  return lo_t != NULL ? lo_t : hi_t;
+}
+
+/* How a text pattern meets its scrutinee (ruling on S129 text): the scrutinee must be a local declared
+   Array[U8](n); a literal n equal to the text length needs no length test, a different one never matches. */
+typedef enum { TEXT_BAD_SCRUTINEE, TEXT_NEVER, TEXT_SAME_LENGTH, TEXT_TEST_LENGTH } TextPlan;
+
+static StigiExpr *text_length_expr(const ElabCtx *ctx, StigiExpr *s) {
+  const StigiType *t = declared_type_of(ctx, s);
+  if (t == NULL || t->len_arg_count != 1 || t->type_arg_count != 1 ||
+      !(t->name.len == 5 && memcmp(t->name.ptr, "Array", 5) == 0)) {
+    return NULL;
+  }
+  return t->len_args[0];
+}
+
+static TextPlan text_plan(ElabCtx *ctx, const StigiPat *tp, StigiExpr *s) {
+  StigiExpr *n = text_length_expr(ctx, s);
+  if (n == NULL) {
+    elab_add_diag(ctx, STIGI_TYPE_MISMATCH, tp->span, "text pattern needs a named Array[U8](n) scrutinee");
+    return TEXT_BAD_SCRUTINEE;
+  }
+  if (n->kind != STIGI_EXPR_LIT_INT) return TEXT_TEST_LENGTH;
+  return n->u.lit_int.value == tp->int_val ? TEXT_SAME_LENGTH : TEXT_NEVER;
+}
+
+/* "text" on s: Array[U8](n): the length test when asked, then every byte; every failed test goes to `no` */
+static StigiExpr *make_text_test(ElabCtx *ctx, const StigiPat *tp, StigiExpr *s, bool test_length, StigiExpr *yes,
+                                 StigiExpr *no) {
+  StigiExpr *n = text_length_expr(ctx, s);
+  uint64_t len = tp->int_val;
+  StigiExpr *body = yes;
+  for (uint64_t i = len; i > 0; i--) {
+    /* `s(i)`: an array read is a call on the array, as the parser builds it */
+    StigiExpr *rd = ea_alloc(ctx, sizeof *rd);
+    StigiExpr **args = ea_alloc(ctx, sizeof *args);
+    if (rd == NULL || args == NULL) return no;
+    memset(rd, 0, sizeof *rd);
+    rd->kind = STIGI_EXPR_CALL;
+    rd->span = tp->span;
+    rd->u.call.callee = s;
+    args[0] = make_uint_expr(ctx, i - 1U, tp->span);
+    rd->u.call.args = args;
+    rd->u.call.arg_count = 1;
+    rd->u.call.has_parens = true;
+    StigiExpr *lit = make_uint_expr(ctx, tp->str_bytes[i - 1U], tp->span);
+    StigiExpr *cmp = make_binop_expr(ctx, STIGI_OP_EQ, rd, lit, tp->span);
+    body = make_if_expr(ctx, cmp, body, no, tp->span);
+  }
+  if (!test_length || n == NULL) return body;
+  StigiExpr *len_cmp = make_binop_expr(ctx, STIGI_OP_EQ, n, make_uint_expr(ctx, len, tp->span), tp->span);
+  return make_if_expr(ctx, len_cmp, body, no, tp->span);
+}
+
+/* Binder names a pattern introduces, appended to *out (heap, grows) */
+static void pat_binders(const StigiPat *p, StigiStr **out, uint32_t *n, uint32_t *cap) {
+  if (p->kind == STIGI_PAT_VAR || (p->kind == STIGI_PAT_CTOR && p->subpat_count == 0)) {
+    uint32_t add = p->kind == STIGI_PAT_VAR ? 1U : p->field_count;
+    for (uint32_t i = 0; i < add; i++) {
+      StigiStr nm = p->kind == STIGI_PAT_VAR ? p->name : p->fields[i];
+      if (nm.len == 1 && nm.ptr[0] == '_') continue;
+      if (*n == *cap) {
+        uint32_t nc = *cap == 0 ? 8U : *cap * 2U;
+        StigiStr *g = realloc(*out, (size_t)nc * sizeof *g);
+        if (g == NULL) return;
+        *out = g;
+        *cap = nc;
+      }
+      (*out)[(*n)++] = nm;
+    }
+    return;
+  }
+  if (p->kind == STIGI_PAT_OR) {
+    if (p->subpat_count > 0) pat_binders(&p->subpats[0], out, n, cap);
+    return;
+  }
+  for (uint32_t i = 0; i < p->subpat_count; i++) pat_binders(&p->subpats[i], out, n, cap);
+}
+
+static int cmp_str_q(const void *a, const void *b) {
+  const StigiStr *x = a, *y = b;
+  uint32_t m = x->len < y->len ? x->len : y->len;
+  int c = memcmp(x->ptr, y->ptr, m);
+  return c != 0 ? c : (x->len > y->len) - (x->len < y->len);
+}
+
+/* Whether two patterns bind the same names (any order) */
+static bool same_binders(const StigiPat *a, const StigiPat *b) {
+  StigiStr *ba = NULL, *bb = NULL;
+  uint32_t na = 0, ca = 0, nb = 0, cb = 0;
+  pat_binders(a, &ba, &na, &ca);
+  pat_binders(b, &bb, &nb, &cb);
+  if (na > 1) qsort(ba, na, sizeof *ba, cmp_str_q);
+  if (nb > 1) qsort(bb, nb, sizeof *bb, cmp_str_q);
+  bool same = na == nb;
+  for (uint32_t k = 0; same && k < na; k++) same = str_eq_ss(ba[k], bb[k]);
+  free(ba);
+  free(bb);
+  return same;
+}
+
+/* Checks inside one pattern: alternatives bind the same names (pattern-arity), ranges are ordered (mismatch) */
+static void check_pat_sugar(ElabCtx *ctx, const StigiPat *p) {
+  if (p->kind == STIGI_PAT_RANGE && cmp_lit(&p->subpats[0], &p->subpats[1]) > 0) {
+    elab_add_diag(ctx, STIGI_TYPE_MISMATCH, p->span, "range low end is above its high end");
+  }
+  if (p->kind == STIGI_PAT_OR) {
+    for (uint32_t i = 1; i < p->subpat_count; i++) {
+      if (!same_binders(&p->subpats[0], &p->subpats[i])) {
+        elab_add_diag(ctx, STIGI_TYPE_PATTERN_ARITY, p->subpats[i].span,
+                      "every alternative of a pattern must bind the same names");
+      }
+    }
+  }
+  if (p->kind != STIGI_PAT_RANGE) {
+    for (uint32_t i = 0; i < p->subpat_count; i++) check_pat_sugar(ctx, &p->subpats[i]);
+  }
+}
+
+static bool pat_has_or(const StigiPat *p) {
+  if (p->kind == STIGI_PAT_OR) return true;
+  for (uint32_t i = 0; i < p->subpat_count; i++) {
+    if (pat_has_or(&p->subpats[i])) return true;
+  }
+  return false;
+}
+
+/* Every OR-free form of p, in source order: alternatives multiply out through constructors and tuples
+   (Maranget 2008: an or-pattern is a set of rows). Arena-allocated. */
+static StigiPat *pat_expand(ElabCtx *ctx, const StigiPat *p, uint32_t *out_n) {
+  *out_n = 0;
+  if (p->kind == STIGI_PAT_OR) {
+    StigiPat *acc = NULL;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < p->subpat_count; i++) {
+      /* an alternative with other binders was reported (pattern-arity) and adds no row */
+      if (i > 0 && !same_binders(&p->subpats[0], &p->subpats[i])) {
+        ctx->arity_dropped = true;
+        continue;
+      }
+      uint32_t k = 0;
+      StigiPat *ex = pat_expand(ctx, &p->subpats[i], &k);
+      if (ex == NULL) return NULL;
+      StigiPat *grown = ea_alloc(ctx, (size_t)(total + k) * sizeof *grown);
+      if (grown == NULL) return NULL;
+      if (total > 0) memcpy(grown, acc, (size_t)total * sizeof *grown);
+      memcpy(grown + total, ex, (size_t)k * sizeof *grown);
+      acc = grown;
+      total += k;
+    }
+    *out_n = total;
+    return acc;
+  }
+  if ((p->kind == STIGI_PAT_CTOR || p->kind == STIGI_PAT_TUPLE) && p->subpat_count > 0 && pat_has_or(p)) {
+    uint32_t ns = p->subpat_count;
+    StigiPat **opts = malloc((size_t)ns * sizeof *opts);
+    uint32_t *cnt = malloc((size_t)ns * sizeof *cnt);
+    if (opts == NULL || cnt == NULL) {
+      free(opts);
+      free(cnt);
+      ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "pattern OOM");
+      return NULL;
+    }
+    uint32_t total = 1;
+    for (uint32_t i = 0; i < ns; i++) {
+      opts[i] = pat_expand(ctx, &p->subpats[i], &cnt[i]);
+      total *= cnt[i];
+    }
+    StigiPat *res = ea_alloc(ctx, (size_t)total * sizeof *res);
+    for (uint32_t r = 0; res != NULL && r < total; r++) {
+      res[r] = *p;
+      res[r].subpats = ea_alloc(ctx, (size_t)ns * sizeof *res[r].subpats);
+      if (res[r].subpats == NULL) break;
+      uint32_t rem = r;
+      bool flat = true;
+      for (uint32_t i = ns; i > 0; i--) {
+        res[r].subpats[i - 1U] = opts[i - 1U][rem % cnt[i - 1U]];
+        rem /= cnt[i - 1U];
+        flat = flat && pat_is_wild_or_var(&res[r].subpats[i - 1U]);
+      }
+      res[r].fields = NULL;
+      res[r].field_count = 0;
+      if (flat && p->kind == STIGI_PAT_CTOR) {
+        /* keep the flat field list a written `C(a, b)` has (parse.c), so the 1-level IR is the same */
+        res[r].fields = ea_alloc(ctx, (size_t)ns * sizeof *res[r].fields);
+        if (res[r].fields != NULL) {
+          for (uint32_t i = 0; i < ns; i++) res[r].fields[i] = res[r].subpats[i].name;
+          res[r].field_count = ns;
+        }
+      }
+    }
+    free(opts);
+    free(cnt);
+    *out_n = res != NULL ? total : 0;
+    return res;
+  }
+  StigiPat *one = ea_alloc(ctx, sizeof *one);
+  if (one == NULL) return NULL;
+  *one = *p;
+  *out_n = 1;
+  return one;
+}
+
 /* ---- Maranget (2007/2008) Pattern Matrix Decision-Tree Compiler ---- */
 
 static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_t ncols,
@@ -303,10 +673,13 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
   /* 1. Empty matrix -> fallback or non-exhaustive with concrete witness */
   if (nrows == 0) {
     if (fallback != NULL) return fallback;
-    elab_add_diag(ctx, STIGI_TYPE_NOT_EXHAUSTIVE, match_span,
-                  "non-exhaustive match: missing case '%s'",
-                  witness_ctx != NULL && witness_ctx[0] != '\0' ? witness_ctx : "_");
-    return make_unit_expr(ctx, match_span);
+    if (!ctx->arity_dropped) {
+      elab_add_diag(ctx, STIGI_TYPE_NOT_EXHAUSTIVE, match_span,
+                    "non-exhaustive match: missing case '%s'",
+                    witness_ctx != NULL && witness_ctx[0] != '\0' ? witness_ctx : "_");
+    }
+    /* the match is rejected; the stand-in has the match's type so no second code follows */
+    return ctx->missing_body != NULL ? ctx->missing_body : make_unit_expr(ctx, match_span);
   }
 
   /* 2. Check if row 0 is all wildcards/variables */
@@ -731,6 +1104,53 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
     return make_if_expr(ctx, scruts[col], branches[1], branches[0], match_span);
   }
 
+  /* Case R (S129): a column with a range or a text pattern is compiled by backtracking on row 0 (Maranget 2008,
+     sec. 4): test row 0's pattern; the true side keeps row 0 with that column matched and every later row with
+     its own test, the false side drops row 0. */
+  bool backtrack = false;
+  for (uint32_t r = 0; r < nrows && !backtrack; r++) {
+    backtrack = rows[r].pats[col].kind == STIGI_PAT_RANGE || rows[r].pats[col].kind == STIGI_PAT_STR;
+  }
+  if (backtrack && (head_kind == STIGI_PAT_INT || head_kind == STIGI_PAT_CHAR ||
+                    head_kind == STIGI_PAT_RANGE || head_kind == STIGI_PAT_STR)) {
+    const StigiPat *p0 = &rows[0].pats[col];
+    PatRow *then_rows = malloc((size_t)nrows * sizeof *then_rows);
+    StigiPat *row0_pats = malloc((size_t)ncols * sizeof *row0_pats);
+    if (then_rows == NULL || row0_pats == NULL) {
+      free(then_rows);
+      free(row0_pats);
+      ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "pattern OOM");
+      return make_unit_expr(ctx, match_span);
+    }
+    memcpy(then_rows, rows, (size_t)nrows * sizeof *then_rows);
+    memcpy(row0_pats, rows[0].pats, (size_t)ncols * sizeof *row0_pats);
+    memset(&row0_pats[col], 0, sizeof row0_pats[col]);
+    row0_pats[col].kind = STIGI_PAT_WILD;
+    row0_pats[col].name = (StigiStr){"_", 1};
+    then_rows[0].pats = row0_pats;
+    /* Which sides exist: a range over the whole type has no false side; a text whose declared length differs from
+       the scrutinee's literal length has no true side. Only existing sides are compiled (never-reached and
+       not-exhaustive stay exact). */
+    TextPlan tplan = p0->kind == STIGI_PAT_STR ? text_plan(ctx, p0, scruts[col]) : TEXT_TEST_LENGTH;
+    StigiExpr *cond = NULL;
+    if (p0->kind == STIGI_PAT_RANGE) cond = make_range_test(ctx, p0, scruts[col]);
+    if (p0->kind == STIGI_PAT_INT || p0->kind == STIGI_PAT_CHAR) cond = make_eq_lit(ctx, scruts[col], p0, p0->span);
+    bool has_yes = tplan != TEXT_NEVER && tplan != TEXT_BAD_SCRUTINEE;
+    bool has_no = p0->kind == STIGI_PAT_STR || cond != NULL;
+    StigiExpr *yes = has_yes ? compile_matrix(ctx, scruts, ncols, then_rows, nrows, fallback, arm_reached,
+                                              match_span, witness_ctx, depth + 1)
+                             : NULL;
+    StigiExpr *no = has_no ? compile_matrix(ctx, scruts, ncols, rows + 1, nrows - 1U, fallback, arm_reached,
+                                            match_span, "_", depth + 1)
+                           : NULL;
+    free(row0_pats);
+    free(then_rows);
+    if (p0->kind == STIGI_PAT_STR) {
+      return has_yes ? make_text_test(ctx, p0, scruts[col], tplan == TEXT_TEST_LENGTH, yes, no) : no;
+    }
+    return cond == NULL ? yes : make_if_expr(ctx, cond, yes, no, p0->span);
+  }
+
   /* Case D: Int / negative Int / Char literals -> clean `if x == L then ... else ...` chain */
   if (head_kind == STIGI_PAT_INT || head_kind == STIGI_PAT_CHAR) {
     uint32_t next_ncols = ncols - 1U;
@@ -833,8 +1253,60 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
   return make_unit_expr(ctx, match_span);
 }
 
+static StigiExpr *compile_match_core(ElabCtx *ctx, StigiExpr *const *raw_scruts, uint32_t ncols,
+                                     const StigiMatchArm *arms, uint32_t narms, const uint32_t *src_arm,
+                                     StigiSpan match_span);
+
+/* S129: check the sugar of every arm, then give every alternative its own arm (one row each, same guard and body),
+   so `case A | B => e` is exactly `case A => e` and `case B => e`; diagnostics name the arm as written. */
 static StigiExpr *compile_match_expr(ElabCtx *ctx, StigiExpr *const *raw_scruts, uint32_t ncols,
                                      const StigiMatchArm *arms, uint32_t narms,
+                                     StigiSpan match_span) {
+  bool any_or = false;
+  for (uint32_t i = 0; i < narms; i++) {
+    check_pat_sugar(ctx, &arms[i].pat);
+    any_or = any_or || pat_has_or(&arms[i].pat);
+  }
+  if (!any_or) return compile_match_core(ctx, raw_scruts, ncols, arms, narms, NULL, match_span);
+  bool saved_dropped = ctx->arity_dropped; /* nested matches keep their own flag */
+  ctx->arity_dropped = false;
+  uint32_t total = 0, cap = narms * 2U + 1U;
+  StigiMatchArm *xarms = malloc((size_t)cap * sizeof *xarms);
+  uint32_t *src = malloc((size_t)cap * sizeof *src);
+  bool ok = xarms != NULL && src != NULL;
+  for (uint32_t i = 0; ok && i < narms; i++) {
+    uint32_t k = 0;
+    StigiPat *ex = pat_expand(ctx, &arms[i].pat, &k);
+    ok = ex != NULL;
+    if (ok && total + k > cap) {
+      cap = (total + k) * 2U;
+      StigiMatchArm *gx = realloc(xarms, (size_t)cap * sizeof *xarms);
+      if (gx != NULL) xarms = gx;
+      uint32_t *gs = realloc(src, (size_t)cap * sizeof *src);
+      if (gs != NULL) src = gs;
+      ok = gx != NULL && gs != NULL;
+    }
+    for (uint32_t j = 0; ok && j < k; j++) {
+      xarms[total] = arms[i];
+      xarms[total].pat = ex[j];
+      src[total++] = i;
+    }
+  }
+  StigiExpr *res = NULL;
+  if (ok) {
+    res = compile_match_core(ctx, raw_scruts, ncols, xarms, total, src, match_span);
+    if (res != NULL && res->kind == STIGI_EXPR_MATCH && ctx->arity_dropped) res->u.match_expr.arity_rejected = true;
+  } else if (ctx->err == STIGI_OK) {
+    ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "pattern OOM");
+  }
+  free(xarms);
+  free(src);
+  ctx->arity_dropped = saved_dropped;
+  return res != NULL ? res : make_unit_expr(ctx, match_span);
+}
+
+static StigiExpr *compile_match_core(ElabCtx *ctx, StigiExpr *const *raw_scruts, uint32_t ncols,
+                                     const StigiMatchArm *arms, uint32_t narms, const uint32_t *src_arm,
                                      StigiSpan match_span) {
   /* Fast path: simple 1-level match without guards/chars/neg-ints/tuples stays 1-level directly */
   if (ncols == 1) {
@@ -878,7 +1350,8 @@ static StigiExpr *compile_match_expr(ElabCtx *ctx, StigiExpr *const *raw_scruts,
         }
         if (dead) {
           elab_add_diag(ctx, STIGI_TYPE_NEVER_REACHED, arms[i].span,
-                        "unreachable match arm %u is subsumed by earlier patterns", i + 1);
+                        "unreachable match arm %u is subsumed by earlier patterns",
+                        (src_arm != NULL ? src_arm[i] : i) + 1);
         }
       }
       StigiExpr *m = ea_alloc(ctx, sizeof *m);
@@ -955,13 +1428,17 @@ static StigiExpr *compile_match_expr(ElabCtx *ctx, StigiExpr *const *raw_scruts,
   }
 
   report_wildcard_rows(ctx, rows, narms, ncols);
+  StigiExpr *saved_missing = ctx->missing_body;
+  ctx->missing_body = narms > 0 ? rows[0].body : NULL;
   StigiExpr *tree = compile_matrix(ctx, scruts, ncols, rows, narms, NULL, arm_reached,
                                    match_span, "", 0);
+  ctx->missing_body = saved_missing;
 
   for (uint32_t i = 0; i < narms; i++) {
     if (!arm_reached[i]) {
       elab_add_diag(ctx, STIGI_TYPE_NEVER_REACHED, arms[i].span,
-                    "unreachable match arm %u is subsumed by earlier patterns", i + 1);
+                    "unreachable match arm %u is subsumed by earlier patterns",
+                        (src_arm != NULL ? src_arm[i] : i) + 1);
     }
     free(rows[i].pats);
   }
@@ -1028,6 +1505,74 @@ static StigiExpr *elab_block_tail(ElabCtx *ctx, StigiExpr *const *stmts, uint32_
   }
   blk->u.block.count = n;
   return blk;
+}
+
+/* S129: `x is P` is `x match case P => true` plus `=> false` arms for what P leaves out. Over a closed enum each
+   case P does not cover in full gets its own `C(_, ..) => false` arm (no `_` over an enum, T3); otherwise one `_`
+   arm. P's binders end with the match: they are not in scope after `is`. */
+static StigiExpr *elab_is(ElabCtx *ctx, const StigiExpr *e) {
+  const StigiPat *p = &e->u.is_expr.pat;
+  uint32_t nalt = 0;
+  StigiPat *alts = pat_expand(ctx, p, &nalt);
+  if (alts == NULL) return make_unit_expr(ctx, e->span);
+  const StigiDecl *ed = NULL;
+  const char *ename = NULL;
+  for (uint32_t i = 0; i < nalt && ed == NULL; i++) {
+    if (alts[i].kind != STIGI_PAT_CTOR) continue;
+    uint32_t cidx = 0;
+    bool ambig = false;
+    int32_t eidx = stigi_image_resolve_enum_case(ctx->img, ctx->uidx, alts[i].name.ptr, alts[i].name.len, &cidx,
+                                                 &ambig);
+    if (eidx >= 0 && !ambig) {
+      ed = ctx->img->units[eidx].ast->decl;
+      ename = ctx->img->units[eidx].name;
+    }
+  }
+  uint32_t extra = ed != NULL ? ed->u.enum_decl.case_count : 1U;
+  StigiMatchArm *arms = ea_alloc(ctx, (size_t)(1U + extra) * sizeof *arms);
+  if (arms == NULL) return make_unit_expr(ctx, e->span);
+  memset(arms, 0, (size_t)(1U + extra) * sizeof *arms);
+  arms[0].span = e->span;
+  arms[0].pat = *p;
+  arms[0].body = make_bool_expr(ctx, true, e->span);
+  uint32_t n = 1;
+  if (ed == NULL) {
+    arms[n].span = e->span;
+    arms[n].pat.kind = STIGI_PAT_WILD;
+    arms[n].pat.span = e->span;
+    arms[n].pat.name = (StigiStr){"_", 1};
+    arms[n++].body = make_bool_expr(ctx, false, e->span);
+  } else {
+    for (uint32_t c = 0; c < ed->u.enum_decl.case_count; c++) {
+      const StigiEnumCase *ec = &ed->u.enum_decl.cases[c];
+      bool full = false;
+      for (uint32_t i = 0; i < nalt && !full; i++) {
+        if (alts[i].kind != STIGI_PAT_CTOR || !str_eq_ss(case_short_name(alts[i].name), ec->name)) continue;
+        full = true;
+        for (uint32_t s = 0; s < alts[i].subpat_count && full; s++) full = pat_is_wild_or_var(&alts[i].subpats[s]);
+      }
+      if (full) continue;
+      size_t qlen = strlen(ename) + 1U + ec->name.len;
+      char *qname = ea_alloc(ctx, qlen + 1U);
+      if (qname == NULL) return make_unit_expr(ctx, e->span);
+      (void)snprintf(qname, qlen + 1U, "%s.%.*s", ename, (int)ec->name.len, ec->name.ptr);
+      StigiMatchArm *a = &arms[n++];
+      a->span = e->span;
+      a->pat.kind = STIGI_PAT_CTOR;
+      a->pat.span = e->span;
+      a->pat.name = (StigiStr){qname, (uint32_t)qlen};
+      a->pat.has_parens = ec->field_count > 0;
+      if (ec->field_count > 0) {
+        a->pat.fields = ea_alloc(ctx, (size_t)ec->field_count * sizeof *a->pat.fields);
+        if (a->pat.fields == NULL) return make_unit_expr(ctx, e->span);
+        for (uint32_t f = 0; f < ec->field_count; f++) a->pat.fields[f] = (StigiStr){"_", 1};
+        a->pat.field_count = ec->field_count;
+      }
+      a->body = make_bool_expr(ctx, false, e->span);
+    }
+  }
+  StigiExpr *subject = e->u.is_expr.subject;
+  return compile_match_expr(ctx, &subject, 1, arms, n, e->span);
 }
 
 static StigiExpr *elab_expr(ElabCtx *ctx, const StigiExpr *e) {
@@ -1200,11 +1745,15 @@ static StigiExpr *elab_expr(ElabCtx *ctx, const StigiExpr *e) {
       ne->u.assert_expr.expr = elab_expr(ctx, e->u.assert_expr.expr);
       return ne;
     }
+
+    case STIGI_EXPR_IS:
+      return elab_is(ctx, e);
   }
   return (StigiExpr *)e;
 }
 
 static void elab_def_decl(ElabCtx *ctx, StigiDecl *d) {
+  ctx->cur_decl = d;
   if (d->u.def_decl.clause_count > 0) {
     /* S122: Erlang-style multi-head def lowers directly through Maranget over params */
     const StigiDefHead *h = &d->u.def_decl.head;
@@ -1248,6 +1797,7 @@ Status stigi_elaborate_image(StigiImage *img, StigiTypeDiags *diags, Diag *diag)
       elab_def_decl(&ctx, d);
     } else if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST) {
       if (d->u.val_decl.body != NULL) {
+        ctx.cur_decl = d;
         d->u.val_decl.elab_body = elab_expr(&ctx, d->u.val_decl.body);
       }
     } else if (d->kind == STIGI_DECL_HANDLER) {

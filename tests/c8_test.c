@@ -205,6 +205,60 @@ int main(void) {
       "pub def Demo.voidCount(limit: U64) <lessOrEqual(0, limit)>: Unit =\n"
       "  if limit < 1 then () else Demo.voidCount(limit - 1)\n";
 
+  /* Q0c: a scanner with an array index, a decreases measure and a tail call under a nested if is one loop */
+  const char *u_find_scan =
+      "// prompt: index of the first byte equal to target at or after pos, or len when none.\n"
+      "pub def Demo.findByte(len: U64, data: Array[U8](len), pos: U64, remaining: U64, target: U8) "
+      "<lessOrEqual(pos, len), decreases(remaining)>: U64 =\n"
+      "  if remaining > 0 && pos < len then\n"
+      "    if data(pos) == target then pos else Demo.findByte(len, data, pos + 1, remaining - 1, target)\n"
+      "  else len\n";
+
+  /* Q0b (S129): alternatives, byte and int ranges, text patterns and `is`, run in the evaluator (Test) and in the
+   * gcc/clang binaries (main): both must give the written answers */
+  const char *u_sugar_shape =
+      "// prompt: a drawn shape.\n"
+      "pub enum Demo.Sugar.Shape:\n"
+      "  case Dot\n"
+      "  case Line(len: U64)\n"
+      "  case Box(wide: U64, high: U64)\n";
+  const char *u_sugar_digit =
+      "// prompt: the value of a decimal digit byte, ten when the byte is no digit.\n"
+      "pub def Demo.Sugar.digitValue(code: U8): U64 <lessOrEqual(0, result)> =\n"
+      "  code match\n"
+      "    case '0'..'9' => U64.ofU8(code - 48)\n"
+      "    case _ => 10\n";
+  const char *u_sugar_small =
+      "// prompt: whether a byte value is a single decimal digit value.\n"
+      "pub def Demo.Sugar.smallDigit(value: U8): Bool =\n"
+      "  value is 0..9\n";
+  const char *u_sugar_flat =
+      "// prompt: whether a shape has no area.\n"
+      "pub def Demo.Sugar.isFlat(shape: Demo.Sugar.Shape): Bool =\n"
+      "  shape match\n"
+      "    case Dot | Line(_) => true\n"
+      "    case Box(_, _) => false\n";
+  const char *u_sugar_line =
+      "// prompt: whether a shape is a line.\n"
+      "pub def Demo.Sugar.isLine(shape: Demo.Sugar.Shape): Bool =\n"
+      "  shape is Line(_)\n";
+  const char *u_sugar_yes =
+      "// prompt: one when the word is the text yes, else zero.\n"
+      "pub def Demo.Sugar.isYes(count: U64, word: Array[U8](count)): U64 <lessOrEqual(result, 1)> =\n"
+      "  word match\n"
+      "    case \"yes\" => 1\n"
+      "    case _ => 0\n";
+  const char *u_sugar_test =
+      "// prompt: check the pattern sugar on fixed inputs in the evaluator.\n"
+      "val Demo.Sugar.Tests.sugarSuite {Stigi.Test}: Stigi.Test.Result =\n"
+      "  val digitGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.digitValue('x') == 10\n"
+      "  val smallGood: Bool = Demo.Sugar.smallDigit(3) && Demo.Sugar.smallDigit(12) == false\n"
+      "  val flatGood: Bool = Demo.Sugar.isFlat(Dot) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isFlat(Box(2, 3)) == false\n"
+      "  val lineGood: Bool = Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isLine(Dot) == false\n"
+      "  val yesGood: Bool = Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.isYes(2, \"no\") == 0\n"
+      "  Stigi.Test.expect(digitGood && smallGood && flatGood && lineGood && yesGood, true, "
+      "\"pattern sugar gives the written answers\")\n";
+
   const char *u_lemma =
       "// prompt: erased zero bound lemma.\n"
       "pub lemma def Demo.zeroBound(value: U64) <lessOrEqual(0, value)>: <lessOrEqual(0, value)> =\n"
@@ -265,26 +319,29 @@ int main(void) {
       "  val done: U64 = Demo.countDown(5)\n"
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
       "  val tailVal: U64 = Demo.extractTail(Wide(9, 1))\n"
+      "  val foundAt: U64 = Demo.findByte(3, \"abc\", 0, 3, 'c')\n"
+      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1\n"
       "  val negInput: I32 = -5\n"
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
       "  val signedCompareTrue: Bool = (-5 < 0)\n"
-      "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
+      "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && foundAt == 2 && sugarGood && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[26] = {
+  const char *all_srcs[34] = {
       u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
       u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
       u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
       u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail,   u_lemma,
       u_add_one,         u_eq_trait,    u_eq_word,       u_multi_head,  u_test_ok,
-      u_main_ok
+      u_main_ok,         u_find_scan,   u_sugar_shape,   u_sugar_digit, u_sugar_small,
+      u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_test
   };
-  size_t all_lens[26];
-  for (int i = 0; i < 26; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[34];
+  for (int i = 0; i < 34; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 26, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 34, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",
@@ -336,7 +393,17 @@ int main(void) {
   CHECK(st1.defs_emitted >= 9, "defs emitted");
   CHECK(st1.lemmas_erased >= 1, "lemma erased");
   CHECK(st1.spectre_masks >= 3, "Datalog maskIndex masks taintedAt, taintedGuarded, and taintedWrite");
-  CHECK(st1.tail_loops >= 2, "tail-recursive defs (value + void) lowered to loops");
+  CHECK(st1.tail_loops >= 3, "tail-recursive defs (value, void, array scanner) lowered to loops");
+  {
+    /* Q0c: the scanner's definition body (up to its closing brace at column 0) never names itself */
+    const char *def = c1 == NULL ? NULL : strstr(c1, "Stigi_Demo_findByte(uint64_t len, uint8_t * data, uint64_t pos, "
+                                                      "uint64_t remaining, uint8_t target) {");
+    const char *body = def == NULL ? NULL : strchr(def, '{');
+    const char *end = body == NULL ? NULL : strstr(body, "\n}\n");
+    const char *self = body == NULL ? NULL : strstr(body + 1, "Stigi_Demo_findByte(");
+    CHECK(def != NULL && end != NULL, "Q0c: the scanner definition is emitted");
+    CHECK(end != NULL && (self == NULL || self > end), "Q0c: the tail-recursive scanner emits no call of itself");
+  }
   CHECK(st1.pure_defs >= 4 && st1.parallel_safe_sites >= 4,
         "T18: Datalog purity & parallel-safe call sites detected");
   CHECK(st1.stack_objects >= 1 && st1.free_at_exit >= 1,

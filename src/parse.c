@@ -846,7 +846,10 @@ static bool parse_cap_group(Parser *p, StigiCapParam **out_caps, uint32_t *out_c
 
 /* ---- Patterns ---- */
 
-static StigiPat parse_pattern(Parser *p) {
+static StigiPat parse_pattern(Parser *p);
+
+/* One pattern without `|` and without `..` */
+static StigiPat parse_pattern_atom(Parser *p) {
   StigiPat pat;
   memset(&pat, 0, sizeof pat);
   if (p->failed || check_not_in_lang(p)) return pat;
@@ -1005,9 +1008,91 @@ static StigiPat parse_pattern(Parser *p) {
     return pat;
   }
 
+  if (t->kind == TOK_STRING) {
+    advance(p);
+    pat.kind = STIGI_PAT_STR;
+    pat.name = tok_str(t);
+    pat.int_val = decoded_str_len(t->ptr, t->len);
+    if (pat.int_val > 0) {
+      uint8_t *bytes = p_alloc(p, (size_t)pat.int_val);
+      if (bytes == NULL) { p_fail_oom(p); p_leave_depth(p); return pat; }
+      uint32_t q = 1, w = 0, end = t->len - 1U;
+      while (q < end && w < pat.int_val) {
+        if (t->ptr[q] == '\\') {
+          q++;
+          bytes[w++] = decode_escape(t->ptr, end, &q);
+        } else {
+          bytes[w++] = (uint8_t)t->ptr[q++];
+        }
+      }
+      pat.str_bytes = bytes;
+    }
+    p_leave_depth(p);
+    return pat;
+  }
+
   p_fail(p, t->span, "expected pattern, got '%s'", stigi_tok_kind_name(t->kind));
   p_leave_depth(p);
   return pat;
+}
+
+/* S129: a literal, optionally `lo..hi` (both int or both byte literals) */
+static StigiPat parse_pattern_range(Parser *p) {
+  StigiPat lo = parse_pattern_atom(p);
+  if (p->failed || peek(p)->kind != TOK_DOTDOT) return lo;
+  if (lo.kind != STIGI_PAT_INT && lo.kind != STIGI_PAT_CHAR) {
+    p_fail(p, peek(p)->span, "a range '..' needs an integer or byte literal on its left");
+    return lo;
+  }
+  advance(p);
+  StigiPat hi = parse_pattern_atom(p);
+  if (p->failed) return lo;
+  if (hi.kind != lo.kind) {
+    p_fail(p, hi.span, "a range '..' needs literals of one kind on both sides");
+    return lo;
+  }
+  StigiPat r;
+  memset(&r, 0, sizeof r);
+  r.kind = STIGI_PAT_RANGE;
+  r.span = lo.span;
+  r.subpats = p_alloc(p, 2U * sizeof *r.subpats);
+  if (r.subpats == NULL) { p_fail_oom(p); return lo; }
+  r.subpats[0] = lo;
+  r.subpats[1] = hi;
+  r.subpat_count = 2;
+  return r;
+}
+
+/* S129: alternatives `p | q | ...` at any pattern position */
+static StigiPat parse_pattern(Parser *p) {
+  StigiPat first = parse_pattern_range(p);
+  if (p->failed || peek(p)->kind != TOK_BAR) return first;
+  StigiPat *alts = NULL;
+  uint32_t cnt = 0, cap = 0;
+  if (!p_grow(p, (void **)&alts, &cap, sizeof *alts)) return first;
+  alts[cnt++] = first;
+  while (!p->failed && peek(p)->kind == TOK_BAR) {
+    advance(p);
+    skip_newlines(p);
+    StigiPat next = parse_pattern_range(p);
+    if (p->failed) break;
+    if (cnt == cap && !p_grow(p, (void **)&alts, &cap, sizeof *alts)) break;
+    alts[cnt++] = next;
+  }
+  StigiPat o;
+  memset(&o, 0, sizeof o);
+  o.kind = STIGI_PAT_OR;
+  o.span = first.span;
+  o.subpats = p_alloc(p, (size_t)cnt * sizeof *alts);
+  if (o.subpats == NULL) {
+    free(alts);
+    p_fail_oom(p);
+    return first;
+  }
+  memcpy(o.subpats, alts, (size_t)cnt * sizeof *alts);
+  o.subpat_count = cnt;
+  free(alts);
+  return o;
 }
 
 static StigiExpr *parse_match(Parser *p, uint32_t base_col);
@@ -1393,6 +1478,19 @@ static StigiExpr *parse_binop(Parser *p, uint32_t base_col, int min_prec) {
         peek_skip_nl(p)->kind == TOK_PIPE_GT &&
         peek_skip_nl(p)->span.col > base_col) {
       skip_newlines(p);
+    }
+    if (peek(p)->kind == TOK_KW_IS && min_prec <= 4) {
+      /* S129: `expr is Pattern` binds like a comparison */
+      advance(p);
+      StigiExpr *ie = p_alloc(p, sizeof *ie);
+      if (ie == NULL) { p_fail_oom(p); return NULL; }
+      ie->kind = STIGI_EXPR_IS;
+      ie->span = lhs->span;
+      ie->u.is_expr.subject = lhs;
+      ie->u.is_expr.pat = parse_pattern(p);
+      if (p->failed) return NULL;
+      lhs = ie;
+      continue;
     }
     StigiOp op = STIGI_OP_ADD;
     int prec = binop_prec(peek(p)->kind, &op);

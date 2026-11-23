@@ -41,6 +41,7 @@ typedef enum {
   TOK_KW_HANDLE,
   TOK_KW_HANDLER,
   TOK_KW_IF,
+  TOK_KW_IS,     /* is: pattern test (S129) */
   TOK_KW_LEMMA,
   TOK_KW_MATCH,
   TOK_KW_NOT,
@@ -85,6 +86,8 @@ typedef enum {
   TOK_AND,       /* && */
   TOK_OR,        /* || */
   TOK_PIPE_GT,   /* |> */
+  TOK_BAR,       /* | : pattern alternative (S129) */
+  TOK_DOTDOT,    /* .. : closed pattern range (S129) */
   TOK_BANG       /* ! */
 } StigiTokKind;
 

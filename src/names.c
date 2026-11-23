@@ -776,6 +776,7 @@ static void hc_encode_pat(HashCtx *hc, const StigiPat *pat) {
   cb_u8(hc->out, (uint8_t)(0x20 + pat->kind));
   if (pat->kind == STIGI_PAT_INT) {
     cb_uleb(hc->out, pat->int_val);
+    cb_u8(hc->out, pat->int_neg ? 1 : 0); /* `case -5` and `case 5` are two patterns */
   } else if (pat->kind == STIGI_PAT_CHAR) {
     cb_u8(hc->out, pat->char_val);
   } else if (pat->kind == STIGI_PAT_BOOL) {
@@ -801,6 +802,20 @@ static void hc_encode_pat(HashCtx *hc, const StigiPat *pat) {
         hc_push_binder(hc, pat->fields[i]);
       }
     }
+  } else if (pat->kind == STIGI_PAT_OR) {
+    /* S129: every alternative binds the same names; the first one's binders stay in scope */
+    cb_uleb(hc->out, pat->subpat_count);
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      uint32_t saved_b = hc->binder_count;
+      hc_encode_pat(hc, &pat->subpats[i]);
+      if (i > 0) hc->binder_count = saved_b;
+    }
+  } else if (pat->kind == STIGI_PAT_RANGE) {
+    hc_encode_pat(hc, &pat->subpats[0]);
+    hc_encode_pat(hc, &pat->subpats[1]);
+  } else if (pat->kind == STIGI_PAT_STR) {
+    cb_uleb(hc->out, pat->int_val);
+    for (uint64_t i = 0; i < pat->int_val; i++) cb_u8(hc->out, pat->str_bytes[i]);
   }
 }
 
@@ -1062,6 +1077,16 @@ static void hc_encode_expr(HashCtx *hc, const StigiExpr *e) {
       hc_push_binder(hc, e->u.local_decl.decl->name);
       hc_encode_decl(hc, e->u.local_decl.decl);
       break;
+    case STIGI_EXPR_IS: {
+      /* the source form (S129): subject, then pattern; the elaborated IR holds no `is` */
+      hc_encode_expr(hc, e->u.is_expr.subject);
+      uint32_t saved_b = hc->binder_count;
+      uint32_t saved_m = hc->marker_binder_count;
+      hc_encode_pat(hc, &e->u.is_expr.pat);
+      hc->binder_count = saved_b;
+      hc->marker_binder_count = saved_m;
+      break;
+    }
   }
 }
 
@@ -1702,7 +1727,7 @@ static bool dec_pat(DecCtx *dc) {
   size_t off = dc->pos;
   uint8_t tag = 0;
   if (!dec_u8_raw(dc, &tag, true)) return false;
-  if (tag < 0x20 || tag > (uint8_t)(0x20 + STIGI_PAT_TUPLE)) {
+  if (tag < 0x20 || tag > (uint8_t)(0x20 + STIGI_PAT_STR)) {
     return dec_fail(dc, STIGI_DECODE_UNKNOWN_TAG, off, "unknown pattern tag");
   }
   StigiPatKind pk = (StigiPatKind)(tag - 0x20);
@@ -1710,7 +1735,8 @@ static bool dec_pat(DecCtx *dc) {
   if (pk == STIGI_PAT_VAR) { dc->binder_count++; return true; }
   if (pk == STIGI_PAT_INT) {
     uint64_t v = 0;
-    return dec_uleb_raw(dc, &v, true);
+    bool neg = false;
+    return dec_uleb_raw(dc, &v, true) && dec_bool_u8(dc, &neg);
   }
   if (pk == STIGI_PAT_CHAR) {
     uint8_t cv = 0;
@@ -1739,6 +1765,26 @@ static bool dec_pat(DecCtx *dc) {
     }
     return true;
   }
+  if (pk == STIGI_PAT_OR) {
+    uint64_t ac = 0;
+    if (!dec_uleb_raw(dc, &ac, true)) return false;
+    for (uint64_t i = 0; i < ac; i++) {
+      uint32_t saved = dc->binder_count;
+      if (!dec_pat(dc)) return false;
+      if (i > 0) dc->binder_count = saved;
+    }
+    return true;
+  }
+  if (pk == STIGI_PAT_RANGE) return dec_pat(dc) && dec_pat(dc);
+  if (pk == STIGI_PAT_STR) {
+    uint64_t sl = 0;
+    if (!dec_uleb_raw(dc, &sl, true)) return false;
+    for (uint64_t i = 0; i < sl; i++) {
+      uint8_t bv = 0;
+      if (!dec_u8_raw(dc, &bv, true)) return false;
+    }
+    return true;
+  }
   return dec_fail(dc, STIGI_DECODE_UNKNOWN_TAG, off, "unknown pattern kind");
 }
 
@@ -1748,7 +1794,7 @@ static bool dec_expr(DecCtx *dc) {
   uint8_t tag = 0;
   if (!dec_u8_raw(dc, &tag, true)) { dc->depth--; return false; }
   if (tag == 0x00) { dc->depth--; return true; }
-  if (tag < 0x30 || tag > (uint8_t)(0x30 + STIGI_EXPR_LOCAL_DECL)) {
+  if (tag < 0x30 || tag > (uint8_t)(0x30 + STIGI_EXPR_IS)) {
     dc->depth--;
     return dec_fail(dc, STIGI_DECODE_UNKNOWN_TAG, off, "unknown expression tag");
   }
@@ -1900,6 +1946,14 @@ static bool dec_expr(DecCtx *dc) {
       dc->binder_count++;
       ok = dec_decl(dc);
       break;
+    case STIGI_EXPR_IS: {
+      /* S129 source form: subject, then the pattern; its binders end with it */
+      ok = dec_expr(dc);
+      uint32_t saved = dc->binder_count;
+      if (ok) ok = dec_pat(dc);
+      dc->binder_count = saved;
+      break;
+    }
   }
   dc->depth--;
   return ok;
@@ -3304,6 +3358,17 @@ static Status walk_pat(ResCtx *ctx, const StigiPat *pat, bool check_dup) {
     }
     return STIGI_OK;
   }
+  if (pat->kind == STIGI_PAT_OR) {
+    /* every alternative binds the same names (checked by the elaborator): the first one binds them, the others
+       only resolve their constructors */
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      uint32_t saved = ctx->local_count;
+      Status st = walk_pat(ctx, &pat->subpats[i], i == 0 ? check_dup : false);
+      if (st != STIGI_OK) return st;
+      if (i > 0) ctx->local_count = saved;
+    }
+    return STIGI_OK;
+  }
   if (pat->kind == STIGI_PAT_CTOR) {
     Status st = resolve_ref(ctx, pat->name, pat->span, true);
     if (st != STIGI_OK) return st;
@@ -3398,6 +3463,15 @@ static Status walk_expr(ResCtx *ctx, const StigiExpr *e) {
         if (st != STIGI_OK) return st;
       }
       return walk_match_arms(ctx, e->u.match_expr.arms, e->u.match_expr.arm_count);
+    case STIGI_EXPR_IS: {
+      /* S129: the pattern's binders are not in scope after `is` */
+      st = walk_expr(ctx, e->u.is_expr.subject);
+      if (st != STIGI_OK) return st;
+      uint32_t saved = ctx->local_count;
+      st = walk_pat(ctx, &e->u.is_expr.pat, false);
+      ctx->local_count = saved;
+      return st;
+    }
     case STIGI_EXPR_VAL:
       if (e->u.val_stmt.type != NULL) {
         st = walk_type(ctx, e->u.val_stmt.type);

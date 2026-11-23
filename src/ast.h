@@ -126,7 +126,10 @@ typedef enum {
   STIGI_PAT_CHAR,
   STIGI_PAT_BOOL,
   STIGI_PAT_CTOR,
-  STIGI_PAT_TUPLE
+  STIGI_PAT_TUPLE,
+  STIGI_PAT_OR,    /* p | q: subpats are the alternatives (S129) */
+  STIGI_PAT_RANGE, /* lo..hi: subpats[0] = lo, subpats[1] = hi, int or char literals (S129) */
+  STIGI_PAT_STR    /* "text": name = the literal as written, int_val = decoded length (S129) */
 } StigiPatKind;
 
 typedef struct StigiPat StigiPat;
@@ -143,6 +146,7 @@ struct StigiPat {
   uint32_t field_count;
   StigiPat *subpats;   /* recursive sub-patterns for CTOR and TUPLE (S121) */
   uint32_t subpat_count;
+  const uint8_t *str_bytes; /* STIGI_PAT_STR: the decoded bytes, int_val of them (S129) */
   bool has_parens;
 };
 
@@ -178,7 +182,8 @@ typedef enum {
   STIGI_EXPR_ASSERT,
   STIGI_EXPR_DENY,
   STIGI_EXPR_BLOCK,
-  STIGI_EXPR_LOCAL_DECL
+  STIGI_EXPR_LOCAL_DECL,
+  STIGI_EXPR_IS /* expr is Pattern: Bool; the elaborator rewrites it into a match (S129) */
 } StigiExprKind;
 
 struct StigiExpr {
@@ -239,7 +244,13 @@ struct StigiExpr {
       uint32_t scrutinee_count; /* 0 or 1 for single, >= 2 for tuple */
       StigiMatchArm *arms;
       uint32_t arm_count;
+      bool arity_rejected; /* the elaborator reported pattern-arity and dropped an alternative: no
+                              not-exhaustive follows from that drop (S129) */
     } match_expr;
+    struct {
+      StigiExpr *subject;
+      StigiPat pat;
+    } is_expr;
     struct {
       StigiPat pat;
       StigiType *type; /* optional */

@@ -34,6 +34,7 @@ static StigiTokKind classify_word(const char *s, uint32_t n) {
     case 2:
       if (s[0] == 'd' && s[1] == 'o') return TOK_KW_DO;
       if (s[0] == 'i' && s[1] == 'f') return TOK_KW_IF;
+      if (s[0] == 'i' && s[1] == 's') return TOK_KW_IS;
       return TOK_IDENT;
     case 3:
       if (memcmp(s, "def", 3) == 0) return TOK_KW_DEF;
@@ -419,6 +420,9 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       if (p + 2 < n && s[p + 1] == '.' && s[p + 2] == '.') {
         kind = TOK_ELLIPSIS;
         advance = 3;
+      } else if (p + 1 < n && s[p + 1] == '.') {
+        kind = TOK_DOTDOT;
+        advance = 2;
       } else {
         lex->err_msg = "unexpected '.'";
       }
@@ -485,7 +489,7 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
         kind = TOK_PIPE_GT;
         advance = 2;
       } else {
-        lex->err_msg = "unexpected '|'; use '||' for logical or or '|>' for pipe";
+        kind = TOK_BAR;
       }
       break;
     default:
@@ -591,6 +595,7 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_KW_HANDLE: return "handle";
     case TOK_KW_HANDLER: return "handler";
     case TOK_KW_IF: return "if";
+    case TOK_KW_IS: return "is";
     case TOK_KW_LEMMA: return "lemma";
     case TOK_KW_MATCH: return "match";
     case TOK_KW_NOT: return "not";
@@ -633,6 +638,8 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_AND: return "&&";
     case TOK_OR: return "||";
     case TOK_PIPE_GT: return "|>";
+    case TOK_BAR: return "|";
+    case TOK_DOTDOT: return "..";
     case TOK_BANG: return "!";
   }
   return "UNKNOWN";

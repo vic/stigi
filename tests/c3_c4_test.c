@@ -43,6 +43,99 @@ static void add_unit(StigiImage *img, const char *src, StigiNameDiags *diags) {
   }
 }
 
+/* S119 parity of S129 sugar: `sugar` and `plain` define Demo.form; both images hold Demo.Shape; the elaborated IR,
+ * hence the runtime id, must be the same. */
+static void check_sugar_parity(const char *label, const char *sugar, const char *plain, bool want_same) {
+  static const char *shape =
+      "// prompt: a drawn shape.\n"
+      "pub enum Demo.Shape:\n"
+      "  case Dot\n"
+      "  case Line(len: U64)\n"
+      "  case Box(wide: U64, high: U64)\n";
+  StigiImage a, b;
+  StigiNameDiags na, nb;
+  Diag d;
+  diag_clear(&d);
+  stigi_image_init(&a);
+  stigi_image_init(&b);
+  stigi_name_diags_init(&na);
+  stigi_name_diags_init(&nb);
+  add_unit(&a, shape, &na);
+  add_unit(&a, sugar, &na);
+  add_unit(&b, shape, &nb);
+  add_unit(&b, plain, &nb);
+  bool resolved = stigi_image_resolve(&a, &na, &d) == STIGI_OK && stigi_image_resolve(&b, &nb, &d) == STIGI_OK;
+  int32_t ia = stigi_image_find(&a, "Demo.form", strlen("Demo.form"));
+  int32_t ib = stigi_image_find(&b, "Demo.form", strlen("Demo.form"));
+  bool same = resolved && ia >= 0 && ib >= 0 && memcmp(a.units[ia].unit_id, b.units[ib].unit_id, 32) == 0;
+  if (same != want_same) {
+    fprintf(stderr, "FAIL S129 parity[%s]: runtime ids %s\n", label, want_same ? "differ" : "are equal");
+    g_failures++;
+  }
+  stigi_name_diags_free(&na);
+  stigi_name_diags_free(&nb);
+  stigi_image_free(&a);
+  stigi_image_free(&b);
+}
+
+static void test_s129_sugar_parity(void) {
+  check_sugar_parity("alternatives",
+                     "// prompt: whether a shape has no area.\n"
+                     "pub def Demo.form(shape: Demo.Shape): Bool =\n"
+                     "  shape match\n"
+                     "    case Dot | Line(_) => true\n"
+                     "    case Box(_, _) => false\n",
+                     "// prompt: whether a shape has no area.\n"
+                     "pub def Demo.form(shape: Demo.Shape): Bool =\n"
+                     "  shape match\n"
+                     "    case Dot => true\n"
+                     "    case Line(_) => true\n"
+                     "    case Box(_, _) => false\n", true);
+  check_sugar_parity("is",
+                     "// prompt: whether a shape is a line.\n"
+                     "pub def Demo.form(shape: Demo.Shape): Bool =\n"
+                     "  shape is Line(_)\n",
+                     "// prompt: whether a shape is a line.\n"
+                     "pub def Demo.form(shape: Demo.Shape): Bool =\n"
+                     "  shape match\n"
+                     "    case Line(_) => true\n"
+                     "    case Dot => false\n"
+                     "    case Box(_, _) => false\n", true);
+  check_sugar_parity("range",
+                     "// prompt: the value of a digit byte, ten otherwise.\n"
+                     "pub def Demo.form(code: U8): U64 =\n"
+                     "  code match\n"
+                     "    case '0'..'9' => U64.ofU8(code - 48)\n"
+                     "    case _ => 10\n",
+                     "// prompt: the value of a digit byte, ten otherwise.\n"
+                     "pub def Demo.form(code: U8): U64 =\n"
+                     "  if code >= '0' && code <= '9' then U64.ofU8(code - 48) else 10\n", true);
+  check_sugar_parity("text",
+                     "// prompt: one when the word is yes.\n"
+                     "pub def Demo.form(count: U64, word: Array[U8](count)): U64 =\n"
+                     "  word match\n"
+                     "    case \"yes\" => 1\n"
+                     "    case _ => 0\n",
+                     "// prompt: one when the word is yes.\n"
+                     "pub def Demo.form(count: U64, word: Array[U8](count)): U64 =\n"
+                     "  if count == 3 then if word(0) == 121 then if word(1) == 101 then if word(2) == 115 then 1 "
+                     "else 0 else 0 else 0 else 0\n", true);
+  /* identity: `case -5` and `case 5` are different computations */
+  check_sugar_parity("negative literal",
+                     "// prompt: one for minus five.\n"
+                     "pub def Demo.form(value: I64): U64 =\n"
+                     "  value match\n"
+                     "    case -5 => 1\n"
+                     "    case _ => 0\n",
+                     "// prompt: one for minus five.\n"
+                     "pub def Demo.form(value: I64): U64 =\n"
+                     "  value match\n"
+                     "    case 5 => 1\n"
+                     "    case _ => 0\n",
+                     false);
+  printf("c3 S129 sugar parity: done (alternatives, is, range, text, negative literal)\n");
+}
+
 /* ---- C3 Tests ---- */
 
 static void test_names_lookup_and_id_invariance(void) {
@@ -1249,6 +1342,7 @@ static void test_phase2_patterns_multihead_pipe(void) {
 
 int main(void) {
   test_names_lookup_and_id_invariance();
+  test_s129_sugar_parity();
   test_alpha_equiv_and_dep_propagation();
   test_names_diagnostics();
   test_linear_normalizer();

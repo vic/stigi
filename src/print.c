@@ -222,6 +222,19 @@ static void print_cap_group(PrintBuf *b, const StigiCapParam *caps, uint32_t cou
 }
 
 static void print_pat(PrintBuf *b, const StigiPat *pat) {
+  if (pat->kind == STIGI_PAT_OR) {
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      if (i > 0) pb_cstr(b, " | ");
+      print_pat(b, &pat->subpats[i]);
+    }
+    return;
+  }
+  if (pat->kind == STIGI_PAT_RANGE) {
+    print_pat(b, &pat->subpats[0]);
+    pb_cstr(b, "..");
+    print_pat(b, &pat->subpats[1]);
+    return;
+  }
   if (pat->kind == STIGI_PAT_TUPLE) {
     pb_char(b, '(');
     for (uint32_t i = 0; i < pat->subpat_count; i++) {
@@ -380,16 +393,31 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       }
       break;
     }
+    case STIGI_EXPR_IS: {
+      /* `is` binds like a comparison (S129) */
+      const StigiExpr *sj = e->u.is_expr.subject;
+      bool spar = (sj->kind == STIGI_EXPR_IF || sj->kind == STIGI_EXPR_WHILE ||
+                   sj->kind == STIGI_EXPR_MATCH || sj->kind == STIGI_EXPR_BLOCK ||
+                   (sj->kind == STIGI_EXPR_BINOP && op_prec(sj->u.binop.op) < op_prec(STIGI_OP_EQ)));
+      if (spar) pb_char(b, '(');
+      print_expr(b, sj, indent);
+      if (spar) pb_char(b, ')');
+      pb_cstr(b, " is ");
+      print_pat(b, &e->u.is_expr.pat);
+      break;
+    }
     case STIGI_EXPR_BINOP: {
       int p = op_prec(e->u.binop.op);
       const StigiExpr *lh = e->u.binop.lhs;
       const StigiExpr *rh = e->u.binop.rhs;
       bool lpar = (lh->kind == STIGI_EXPR_IF || lh->kind == STIGI_EXPR_WHILE ||
                    lh->kind == STIGI_EXPR_MATCH || lh->kind == STIGI_EXPR_BLOCK ||
-                   (lh->kind == STIGI_EXPR_BINOP && op_prec(lh->u.binop.op) < p));
+                   (lh->kind == STIGI_EXPR_BINOP && op_prec(lh->u.binop.op) < p) ||
+                   (lh->kind == STIGI_EXPR_IS && op_prec(STIGI_OP_EQ) < p));
       bool rpar = (rh->kind == STIGI_EXPR_IF || rh->kind == STIGI_EXPR_WHILE ||
                    rh->kind == STIGI_EXPR_MATCH || rh->kind == STIGI_EXPR_BLOCK ||
-                   (rh->kind == STIGI_EXPR_BINOP && op_prec(rh->u.binop.op) <= p));
+                   (rh->kind == STIGI_EXPR_BINOP && op_prec(rh->u.binop.op) <= p) ||
+                   (rh->kind == STIGI_EXPR_IS && op_prec(STIGI_OP_EQ) <= p));
       if (lpar) pb_char(b, '(');
       print_expr(b, lh, indent);
       if (lpar) pb_char(b, ')');

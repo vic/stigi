@@ -2479,7 +2479,7 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,
                           "allocation result match must cover both success and failure cases");
         }
-      } else if (enum_d != NULL && covered != NULL && !has_wild) {
+      } else if (enum_d != NULL && covered != NULL && !has_wild && !e->u.match_expr.arity_rejected) {
         for (uint32_t c = 0; c < case_count; c++) {
           if (!covered[c]) {
             (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,

@@ -1375,6 +1375,7 @@ static bool expr_is_pure_total_leaf(const StigiImage *img, uint32_t uidx, const 
     case STIGI_EXPR_ASSERT:
     case STIGI_EXPR_DENY:
     case STIGI_EXPR_LOCAL_DECL:
+    case STIGI_EXPR_IS: /* not a leaf: the elaborator turns it into a match */
       return false;
   }
   return false;
@@ -1470,6 +1471,9 @@ static void collect_assigned_vars(ExtCtx *ctx, const StigiExpr *e, bool *assigne
       break;
     case STIGI_EXPR_UNOP:
       collect_assigned_vars(ctx, e->u.unop.operand, assigned, var_limit);
+      break;
+    case STIGI_EXPR_IS:
+      collect_assigned_vars(ctx, e->u.is_expr.subject, assigned, var_limit);
       break;
     case STIGI_EXPR_INDEX_READ:
     case STIGI_EXPR_INDEX_WRITE:
@@ -3469,6 +3473,10 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
       return last;
     }
 
+    case STIGI_EXPR_IS:
+      /* the elaborator rewrites every `is` into a match (S129); one that reaches the extractor is refused */
+      ctx->err = diag_set(ctx->diag, STIGI_ERR_INVALID, -1, "an `is` expression reached the extractor unelaborated");
+      return ext_new_val(ctx, "Bool");
     case STIGI_EXPR_LOCAL_DECL:
       return ext_new_val(ctx, "Unit");
   }
