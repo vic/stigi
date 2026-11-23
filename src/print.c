@@ -434,7 +434,7 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       const StigiExpr *opnd = e->u.unop.operand;
       bool upar = (opnd->kind == STIGI_EXPR_BINOP || opnd->kind == STIGI_EXPR_IF ||
                    opnd->kind == STIGI_EXPR_WHILE || opnd->kind == STIGI_EXPR_MATCH ||
-                   opnd->kind == STIGI_EXPR_BLOCK ||
+                   opnd->kind == STIGI_EXPR_BLOCK || opnd->kind == STIGI_EXPR_IS ||
                    (opnd->kind == STIGI_EXPR_UNOP && opnd->u.unop.op == STIGI_OP_NEG &&
                     e->u.unop.op == STIGI_OP_NEG));
       if (upar) pb_char(b, '(');

@@ -66,9 +66,10 @@ static void test_roundtrips(void) {
       "  val flat: Bool = shape is Dot | Line(_)\n"
       "  val digit: Bool = code is '0'..'9' | 'a'..'f'\n"
       "  val pair: Bool = shape is Box(1 | 2, _) && code is 0..9\n"
+      "  val other: Bool = !(code is 'a'..'z') && !(shape is Dot)\n"
       "  word match\n"
       "    case \"yes\" | \"y\" => 1\n"
-      "    case _ => if flat && digit || pair then 2 else 3\n",
+      "    case _ => if flat && digit || pair || other then 2 else 3\n",
       STIGI_DECL_DEF);
 
   check_roundtrip(
