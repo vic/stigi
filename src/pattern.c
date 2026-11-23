@@ -255,6 +255,39 @@ static bool lit_pats_equal(const StigiPat *a, const StigiPat *b) {
 
 static StigiExpr *elab_expr(ElabCtx *ctx, const StigiExpr *e);
 
+/* Name of the closed enum a column ranges over: the enum of the first resolvable constructor pattern in it. */
+static const char *column_enum_name(const ElabCtx *ctx, const PatRow *rows, uint32_t nrows, uint32_t col) {
+  for (uint32_t r = 0; r < nrows; r++) {
+    const StigiPat *p = &rows[r].pats[col];
+    if (p->kind != STIGI_PAT_CTOR) continue;
+    uint32_t case_idx = 0;
+    bool ambig = false;
+    int32_t eidx = stigi_image_resolve_enum_case(ctx->img, ctx->uidx, p->name.ptr, p->name.len,
+                                                 &case_idx, &ambig);
+    if (eidx >= 0 && !ambig) return ctx->img->units[eidx].name;
+  }
+  return NULL;
+}
+
+/* T3 / S121: a source row whose every column is `_` or a binder, without guard, is a catch-all; it is
+ * `wildcard-arm` when any column ranges over a closed enum. Checked on the source rows, not on the
+ * specialised sub-matrices, so `(Miss, _)` stays legal. */
+static void report_wildcard_rows(ElabCtx *ctx, const PatRow *rows, uint32_t nrows, uint32_t ncols) {
+  const char *enum_name = NULL;
+  for (uint32_t c = 0; c < ncols && enum_name == NULL; c++) {
+    enum_name = column_enum_name(ctx, rows, nrows, c);
+  }
+  if (enum_name == NULL) return;
+  for (uint32_t r = 0; r < nrows; r++) {
+    bool catch_all = rows[r].guard == NULL;
+    for (uint32_t c = 0; c < ncols && catch_all; c++) catch_all = pat_is_wild_or_var(&rows[r].pats[c]);
+    if (catch_all) {
+      elab_add_diag(ctx, STIGI_TYPE_WILDCARD_ARM, rows[r].pats[0].span,
+                    "wildcard '_' arm over closed enum '%s' is forbidden; name every case", enum_name);
+    }
+  }
+}
+
 /* ---- Maranget (2007/2008) Pattern Matrix Decision-Tree Compiler ---- */
 
 static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_t ncols,
@@ -498,17 +531,6 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
 
     const StigiDecl *ed = ctx->img->units[eidx].ast->decl;
     uint32_t ncases = ed->u.enum_decl.case_count;
-
-    /* T3 / S121: standalone wildcard row over closed enum (when ncols == 1) is wildcard-arm */
-    if (ncols == 1) {
-      for (uint32_t r = 0; r < nrows; r++) {
-        if (rows[r].pats[0].kind == STIGI_PAT_WILD && rows[r].guard == NULL) {
-          elab_add_diag(ctx, STIGI_TYPE_WILDCARD_ARM, rows[r].pats[0].span,
-                        "wildcard '_' arm over closed enum '%s' is forbidden; name every case",
-                        ctx->img->units[eidx].name);
-        }
-      }
-    }
 
     StigiMatchArm *out_arms = ea_alloc(ctx, (size_t)ncases * sizeof *out_arms);
     if (out_arms == NULL) return make_unit_expr(ctx, match_span);
@@ -932,6 +954,7 @@ static StigiExpr *compile_match_expr(ElabCtx *ctx, StigiExpr *const *raw_scruts,
     }
   }
 
+  report_wildcard_rows(ctx, rows, narms, ncols);
   StigiExpr *tree = compile_matrix(ctx, scruts, ncols, rows, narms, NULL, arm_reached,
                                    match_span, "", 0);
 

@@ -26,4 +26,10 @@ pub def Stigi.Posix.verifyContracts {region: Stigi.Region, clock: Stigi.Clock, S
       val unlinked: Bool = Stigi.Posix.removePath(23, pathBuf)
       (readOutcome, unlinked) match
         case (RunSuccess, true) => RunSuccess
-        case (_, _) => RunContractError
+        case (RunSuccess, false) => RunContractError
+        case (RunCliError, _) => RunContractError
+        case (RunFileError, _) => RunContractError
+        case (RunOutOfMemory, _) => RunContractError
+        case (RunDoorRejected, _) => RunContractError
+        case (RunEmitError, _) => RunContractError
+        case (RunContractError, _) => RunContractError
