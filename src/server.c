@@ -1175,9 +1175,16 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
       sncnt++;
     }
     char ebuf[256] = {0};
-    Status st = stigi_store_dir_subset(ctx->door, dir_cstr,
-                                       (const char *const *)snames, sncnt,
-                                       ebuf, sizeof ebuf);
+    Diag prune_diag;
+    diag_clear(&prune_diag);
+    Status st = stigi_door_prune_caches(ctx->door, &prune_diag);
+    if (st == STIGI_OK) {
+      st = stigi_store_dir_subset(ctx->door, dir_cstr,
+                                  (const char *const *)snames, sncnt,
+                                  ebuf, sizeof ebuf);
+    } else {
+      (void)snprintf(ebuf, sizeof ebuf, "cache prune: %.200s", prune_diag.msg);
+    }
     if (st != STIGI_OK) {
       status_tag = "error";
       rb_fmt(&rb, "error store: %s\n", ebuf);

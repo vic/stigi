@@ -163,17 +163,54 @@ static Status compute_active_rules_hash(const StigiDoor *door, const StigiImage 
   return STIGI_OK;
 }
 
-/* Verdict key includes unit verdict_key, active rules hash, row_budget, AND kernel_mode */
+/* Verdict key includes unit verdict_key, active rules hash, seed build id, row_budget, AND kernel_mode */
 static void effective_verdict_key(const uint8_t base_key[32], const uint8_t rules_hash[32],
-                                  uint64_t budget, bool kernel_mode, uint8_t out[32]) {
-  uint8_t buf[73];
+                                  const uint8_t seed_id[32], uint64_t budget, bool kernel_mode,
+                                  uint8_t out[32]) {
+  uint8_t buf[105];
   memcpy(buf, base_key, 32);
   memcpy(buf + 32, rules_hash, 32);
+  memcpy(buf + 64, seed_id, 32);
   for (int i = 0; i < 8; i++) {
-    buf[64 + i] = (uint8_t)((budget >> (i * 8)) & 0xFFU);
+    buf[96 + i] = (uint8_t)((budget >> (i * 8)) & 0xFFU);
   }
-  buf[72] = kernel_mode ? 1U : 0U;
+  buf[104] = kernel_mode ? 1U : 0U;
   blake3_hash(buf, sizeof buf, out);
+}
+
+/* BLAKE3 of the running seed binary: any change of the C logic changes every verdict key */
+static Status compute_seed_id(uint8_t out[32], Diag *diag) {
+  FILE *f = fopen("/proc/self/exe", "rb");
+  if (f == NULL) return diag_set(diag, STIGI_ERR_IO, errno, "cannot open /proc/self/exe for the seed id");
+  size_t cap = 1U << 20, len = 0;
+  uint8_t *buf = malloc(cap);
+  if (buf == NULL) {
+    (void)fclose(f);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "seed id OOM");
+  }
+  size_t got;
+  while ((got = fread(buf + len, 1, cap - len, f)) > 0) {
+    len += got;
+    if (len == cap) {
+      uint8_t *grown = realloc(buf, cap * 2U);
+      if (grown == NULL) {
+        free(buf);
+        (void)fclose(f);
+        return diag_set(diag, STIGI_ERR_OOM, -1, "seed id OOM");
+      }
+      buf = grown;
+      cap *= 2U;
+    }
+  }
+  bool failed = ferror(f) != 0;
+  (void)fclose(f);
+  if (failed) {
+    free(buf);
+    return diag_set(diag, STIGI_ERR_IO, errno, "cannot read /proc/self/exe for the seed id");
+  }
+  blake3_hash(buf, len, out);
+  free(buf);
+  return STIGI_OK;
 }
 
 /* ---- Preprocessor for base all.dl ---- */
@@ -549,12 +586,44 @@ Status stigi_door_init(StigiDoor *door, const char *all_dl_path,
 
   blake3_hash((const uint8_t *)door->base_rules_dl, door->base_rules_dl_len,
               door->base_rules_hash);
+  st = compute_seed_id(door->seed_id, diag);
+  if (st != STIGI_OK) {
+    stigi_door_free(door);
+    return st;
+  }
   st = stigi_dl_open(&door->dl, door->rules_dl, door->rules_dl_len, "all.dl",
                      door->row_budget, 1, diag);
   if (st != STIGI_OK) {
     stigi_door_free(door);
     return st;
   }
+  return STIGI_OK;
+}
+
+Status stigi_door_prune_caches(StigiDoor *door, Diag *diag) {
+  uint8_t rules_hash[32];
+  Status st = compute_active_rules_hash(door, &door->image, rules_hash, diag);
+  if (st != STIGI_OK) return st;
+  StigiKeySet kept_verdicts = {NULL, 0, 0};
+  StigiKeySet kept_tests = {NULL, 0, 0};
+  for (uint32_t i = 0; i < door->image.unit_count && st == STIGI_OK; i++) {
+    uint8_t key[32];
+    effective_verdict_key(door->image.units[i].verdict_key, rules_hash, door->seed_id,
+                          door->row_budget, door->kernel_mode, key);
+    if (keyset_contains(&door->verdict_cache, key)) st = keyset_insert(&kept_verdicts, key, diag);
+    if (st == STIGI_OK && keyset_contains(&door->test_cache, key)) {
+      st = keyset_insert(&kept_tests, key, diag);
+    }
+  }
+  if (st != STIGI_OK) {
+    keyset_free(&kept_verdicts);
+    keyset_free(&kept_tests);
+    return st;
+  }
+  keyset_free(&door->verdict_cache);
+  keyset_free(&door->test_cache);
+  door->verdict_cache = kept_verdicts;
+  door->test_cache = kept_tests;
   return STIGI_OK;
 }
 
@@ -1499,7 +1568,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         StigiDeclKind k = cand.units[i].ast->decl->kind;
         if (k == STIGI_DECL_NEG_TEST) continue;
         uint8_t vkey[32];
-        effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->row_budget,
+        effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->seed_id, door->row_budget,
                               door->kernel_mode, vkey);
         if (keyset_contains(&door->verdict_cache, vkey)) {
           out->verdicts_cached++;
@@ -1593,7 +1662,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
     for (uint32_t i = 0; i < cand.unit_count && tx_st == STIGI_OK; i++) {
       if (cand.units[i].ast->decl->kind != STIGI_DECL_NEG_TEST) continue;
       uint8_t ntkey[32];
-      effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->row_budget,
+      effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->seed_id, door->row_budget,
                             door->kernel_mode, ntkey);
       if (keyset_contains(&door->test_cache, ntkey)) {
         out->tests_cached++;
@@ -1616,7 +1685,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
       StigiDeclKind k = cand.units[i].ast->decl->kind;
       if (k == STIGI_DECL_TEST) {
         uint8_t tkey[32];
-        effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->row_budget,
+        effective_verdict_key(cand.units[i].verdict_key, rules_hash, door->seed_id, door->row_budget,
                               door->kernel_mode, tkey);
         if (keyset_contains(&door->test_cache, tkey)) {
           out->tests_cached++;

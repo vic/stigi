@@ -54,6 +54,7 @@ typedef struct {
   char *rules_dl;
   size_t rules_dl_len;
   uint8_t base_rules_hash[32];
+  uint8_t seed_id[32]; /* BLAKE3 of this seed binary: the verdict logic is part of every cache key (T1) */
   uint64_t row_budget;
   bool kernel_mode;
 
@@ -68,6 +69,9 @@ void stigi_door_result_free(StigiDoorResult *r);
 Status stigi_door_init(StigiDoor *door, const char *all_dl_path,
                        uint64_t row_budget, bool kernel_mode, Diag *diag);
 void stigi_door_free(StigiDoor *door);
+
+/* Keep only the cache keys that the current image, rules and seed produce (a stored cache holds no garbage) */
+Status stigi_door_prune_caches(StigiDoor *door, Diag *diag);
 
 /* Atomic transaction: submit adds/replaces units; check runs pipeline and drops candidate */
 Status stigi_door_submit(StigiDoor *door, const char *const *srcs, const size_t *lens,
