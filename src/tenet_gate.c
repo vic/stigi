@@ -520,7 +520,8 @@ static void resolve_gate_alias(const StigiTok *tok, const GateAlias *aliases, ui
 static bool is_decl_intro_kw(StigiTokKind k) {
   return k == TOK_KW_DEF || k == TOK_KW_VAL || k == TOK_KW_VAR || k == TOK_KW_CASE ||
          k == TOK_KW_TYPE || k == TOK_KW_ENUM || k == TOK_KW_HANDLER ||
-         k == TOK_KW_CAPABILITY || k == TOK_KW_RELATION || k == TOK_KW_RULE;
+         k == TOK_KW_CAPABILITY || k == TOK_KW_TRAIT || k == TOK_KW_GIVEN ||
+         k == TOK_KW_RELATION || k == TOK_KW_RULE;
 }
 
 static Status check_expect_call(const StigiTok *toks, uint32_t count, uint32_t idx,
@@ -775,16 +776,27 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
       uint32_t n = next_sig_tok(toks, count, i + 1);
       if (n < count && toks[n].kind == TOK_IDENT) {
         uint32_t after = next_sig_tok(toks, count, n + 1);
-        /* In `val Pair(a, b) = p`, `Pair` is a constructor pattern; check its binders */
+        /* In `val Pair(View(a), b) = p`, uppercase idents are constructors; check lowercase binders */
         if (t->kind == TOK_KW_VAL && after < count && toks[after].kind == TOK_LPAREN) {
           loop_st = check_name_rules(&toks[n], true, false, out, diag);
           if (loop_st != STIGI_OK) break;
+          int pdepth = 1;
           uint32_t b = next_sig_tok(toks, count, after + 1);
-          while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_ASSIGN &&
+          while (b < count && pdepth > 0 && toks[b].kind != TOK_ASSIGN &&
                  toks[b].kind != TOK_NEWLINE && toks[b].kind != TOK_EOF) {
-            if (toks[b].kind == TOK_IDENT) {
-              loop_st = check_name_rules(&toks[b], false, true, out, diag);
-              if (loop_st != STIGI_OK) break;
+            if (toks[b].kind == TOK_LPAREN) {
+              pdepth++;
+            } else if (toks[b].kind == TOK_RPAREN) {
+              pdepth--;
+            } else if (toks[b].kind == TOK_IDENT && toks[b].len > 0) {
+              const char *last = toks[b].ptr;
+              for (uint32_t k = 0; k < toks[b].len; k++) {
+                if (toks[b].ptr[k] == '.' && k + 1 < toks[b].len) last = toks[b].ptr + k + 1;
+              }
+              if (is_lower((unsigned char)last[0])) {
+                loop_st = check_name_rules(&toks[b], false, true, out, diag);
+                if (loop_st != STIGI_OK) break;
+              }
             }
             b = next_sig_tok(toks, count, b + 1);
           }
@@ -802,7 +814,8 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
         if (loop_st != STIGI_OK) break;
       }
     } else if (t->kind == TOK_KW_ENUM || t->kind == TOK_KW_TYPE ||
-               t->kind == TOK_KW_CAPABILITY || t->kind == TOK_KW_HANDLER) {
+               t->kind == TOK_KW_CAPABILITY || t->kind == TOK_KW_HANDLER ||
+               t->kind == TOK_KW_TRAIT || t->kind == TOK_KW_GIVEN) {
       uint32_t n = next_sig_tok(toks, count, i + 1);
       if (n < count && toks[n].kind == TOK_IDENT) {
         loop_st = check_name_rules(&toks[n], true, true, out, diag);
@@ -810,33 +823,34 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
       }
     } else if (t->kind == TOK_KW_CASE) {
       uint32_t n = next_sig_tok(toks, count, i + 1);
-      if (n < count && toks[n].kind == TOK_IDENT) {
+      if (n < count && (toks[n].kind == TOK_IDENT || toks[n].kind == TOK_LPAREN)) {
         bool is_match_arm = false;
-        for (uint32_t k = n + 1; k < count && toks[k].kind != TOK_NEWLINE &&
+        for (uint32_t k = n; k < count && toks[k].kind != TOK_NEWLINE &&
              toks[k].kind != TOK_EOF; k++) {
           if (toks[k].kind == TOK_ARROW) {
             is_match_arm = true;
             break;
           }
         }
-        if (!is_match_arm) {
+        if (!is_match_arm && toks[n].kind == TOK_IDENT) {
           loop_st = check_name_rules(&toks[n], true, true, out, diag);
           if (loop_st != STIGI_OK) break;
-        } else {
-          uint32_t after = next_sig_tok(toks, count, n + 1);
-          if (after < count && toks[after].kind == TOK_LPAREN) {
-            uint32_t b = next_sig_tok(toks, count, after + 1);
-            while (b < count && toks[b].kind != TOK_RPAREN && toks[b].kind != TOK_ARROW &&
-                   toks[b].kind != TOK_NEWLINE && toks[b].kind != TOK_EOF) {
-              if (toks[b].kind == TOK_IDENT) {
+        } else if (is_match_arm) {
+          /* S121: scan nested/tuple pattern up to `if` guard or `=>`, checking lowercase binders */
+          uint32_t b = n;
+          while (b < count && toks[b].kind != TOK_KW_IF && toks[b].kind != TOK_ARROW &&
+                 toks[b].kind != TOK_NEWLINE && toks[b].kind != TOK_EOF) {
+            if (toks[b].kind == TOK_IDENT && toks[b].len > 0) {
+              const char *last = toks[b].ptr;
+              for (uint32_t k = 0; k < toks[b].len; k++) {
+                if (toks[b].ptr[k] == '.' && k + 1 < toks[b].len) last = toks[b].ptr + k + 1;
+              }
+              if (is_lower((unsigned char)last[0])) {
                 loop_st = check_name_rules(&toks[b], false, true, out, diag);
                 if (loop_st != STIGI_OK) break;
               }
-              b = next_sig_tok(toks, count, b + 1);
             }
-          } else if (toks[n].len > 0 && is_lower((unsigned char)toks[n].ptr[0])) {
-            loop_st = check_name_rules(&toks[n], false, true, out, diag);
-            if (loop_st != STIGI_OK) break;
+            b = next_sig_tok(toks, count, b + 1);
           }
         }
       }

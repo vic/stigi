@@ -1,3 +1,3 @@
-// prompt: check whether one byte is an uppercase ASCII letter.
-def Stigi.Lex.isUpperByte(byte: U8) <lessOrEqual(0, 1)>: Bool =
+// prompt: test whether an ASCII byte is an uppercase letter.
+def Stigi.Lex.isUpperByte(byte: U8): Bool =
   byte >= 65 && byte <= 90

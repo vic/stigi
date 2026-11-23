@@ -67,8 +67,8 @@ static StigiTokKind classify_word(const char *s, uint32_t n) {
       if (memcmp(s, "state", 5) == 0) return TOK_KW_STATE;
       if (memcmp(s, "while", 5) == 0) return TOK_KW_WHILE;
       if (memcmp(s, "class", 5) == 0) return TOK_NOT_IN_LANG;
-      if (memcmp(s, "trait", 5) == 0) return TOK_NOT_IN_LANG;
-      if (memcmp(s, "given", 5) == 0) return TOK_NOT_IN_LANG;
+      if (memcmp(s, "trait", 5) == 0) return TOK_KW_TRAIT;
+      if (memcmp(s, "given", 5) == 0) return TOK_KW_GIVEN;
       if (memcmp(s, "throw", 5) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "catch", 5) == 0) return TOK_NOT_IN_LANG;
       if (memcmp(s, "async", 5) == 0) return TOK_NOT_IN_LANG;
@@ -481,8 +481,11 @@ StigiTok stigi_lex_next(StigiLexer *lex) {
       if (p + 1 < n && s[p + 1] == '|') {
         kind = TOK_OR;
         advance = 2;
+      } else if (p + 1 < n && s[p + 1] == '>') {
+        kind = TOK_PIPE_GT;
+        advance = 2;
       } else {
-        lex->err_msg = "unexpected '|'; use '||' for logical or";
+        lex->err_msg = "unexpected '|'; use '||' for logical or or '|>' for pipe";
       }
       break;
     default:
@@ -584,6 +587,7 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_KW_EXTERN: return "extern";
     case TOK_KW_FALSE: return "false";
     case TOK_KW_FOR: return "for";
+    case TOK_KW_GIVEN: return "given";
     case TOK_KW_HANDLE: return "handle";
     case TOK_KW_HANDLER: return "handler";
     case TOK_KW_IF: return "if";
@@ -597,6 +601,7 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_KW_STATE: return "state";
     case TOK_KW_STOP: return "stop";
     case TOK_KW_THEN: return "then";
+    case TOK_KW_TRAIT: return "trait";
     case TOK_KW_TRUE: return "true";
     case TOK_KW_TYPE: return "type";
     case TOK_KW_VAL: return "val";
@@ -627,6 +632,7 @@ const char *stigi_tok_kind_name(StigiTokKind kind) {
     case TOK_NE: return "!=";
     case TOK_AND: return "&&";
     case TOK_OR: return "||";
+    case TOK_PIPE_GT: return "|>";
     case TOK_BANG: return "!";
   }
   return "UNKNOWN";

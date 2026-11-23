@@ -139,6 +139,64 @@ static void test_roundtrips(void) {
       STIGI_DECL_RULE);
 
   check_roundtrip(
+      "nested_match_and_guard",
+      "// prompt: nested constructor pattern with guard.\n"
+      "def Demo.unpack(pair: Demo.Pair): U64 =\n"
+      "  pair match\n"
+      "    case Pair(Some(value), flag) if value > 0 => value\n"
+      "    case Pair(Some(_), _) => 0\n"
+      "    case Pair(None, _) => 1\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "multi_scrutinee_match",
+      "// prompt: two-scrutinee tuple match.\n"
+      "def Demo.bothFlags(left: Bool, right: Bool): U64 =\n"
+      "  (left, right) match\n"
+      "    case (true, true) => 3\n"
+      "    case (true, false) => 2\n"
+      "    case (false, true) => 1\n"
+      "    case (false, false) => 0\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "multi_head_def",
+      "// prompt: Erlang-style multi-head function.\n"
+      "def Demo.classify(first: Bool, second: Bool): U64 =\n"
+      "  case (true, true) => 3\n"
+      "  case (true, false) => 2\n"
+      "  case (false, true) => 1\n"
+      "  case (false, false) => 0\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "val_else_and_pipe",
+      "// prompt: flat exhaustive val-else binding and pipe.\n"
+      "def Demo.pipeline(input: Demo.Maybe): U64 =\n"
+      "  val Some(value) = input else\n"
+      "    case None => 0\n"
+      "  value |> Demo.step(1) |> Demo.double\n",
+      STIGI_DECL_DEF);
+
+  check_roundtrip(
+      "trait_and_given",
+      "// prompt: structural equality trait protocol.\n"
+      "pub trait Demo.Equal [A: Type]:\n"
+      "  def equal(left: A, right: A): Bool\n",
+      STIGI_DECL_TRAIT);
+
+  check_roundtrip(
+      "parametric_given",
+      "// prompt: recursive equality given for optional values.\n"
+      "pub given Demo.Equal.Maybe [A: Type] {Demo.Equal[A]}: Demo.Equal[Demo.Maybe[A]]:\n"
+      "  def equal(left: Demo.Maybe[A], right: Demo.Maybe[A]): Bool =\n"
+      "    case (Some(first), Some(second)) => Demo.Equal.equal(first, second)\n"
+      "    case (None, None) => true\n"
+      "    case (Some(_), None) => false\n"
+      "    case (None, Some(_)) => false\n",
+      STIGI_DECL_GIVEN);
+
+  check_roundtrip(
       "test",
       "// prompt: larger gives the right operand when it is greater.\n"
       "val Demo.Tests.largerRight {Stigi.Test}: Stigi.Test.Result =\n"

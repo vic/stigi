@@ -66,6 +66,7 @@ typedef enum {
   STIGI_OP_NE,
   STIGI_OP_AND,
   STIGI_OP_OR,
+  STIGI_OP_PIPE,
   STIGI_OP_NOT,
   STIGI_OP_NEG
 } StigiOp;
@@ -122,25 +123,33 @@ typedef enum {
   STIGI_PAT_WILD = 0,
   STIGI_PAT_VAR,
   STIGI_PAT_INT,
+  STIGI_PAT_CHAR,
   STIGI_PAT_BOOL,
-  STIGI_PAT_CTOR
+  STIGI_PAT_CTOR,
+  STIGI_PAT_TUPLE
 } StigiPatKind;
 
-typedef struct {
+typedef struct StigiPat StigiPat;
+struct StigiPat {
   StigiPatKind kind;
   StigiSpan span;
   StigiStr name;
   uint64_t int_val;
+  bool int_neg;
   bool int_overflow;
+  uint8_t char_val;
   bool bool_val;
-  StigiStr *fields; /* for CTOR: name or "_" */
+  StigiStr *fields;    /* 1-level CTOR binder names (synced for 1-level IR) */
   uint32_t field_count;
+  StigiPat *subpats;   /* recursive sub-patterns for CTOR and TUPLE (S121) */
+  uint32_t subpat_count;
   bool has_parens;
-} StigiPat;
+};
 
 typedef struct {
   StigiSpan span;
   StigiPat pat;
+  StigiExpr *guard; /* optional `if <expr>` guard (S121) */
   StigiExpr *body;
 } StigiMatchArm;
 
@@ -225,7 +234,9 @@ struct StigiExpr {
       StigiExpr *body;
     } while_expr;
     struct {
-      StigiExpr *scrutinee;
+      StigiExpr *scrutinee;     /* single scrutinee (or scrutinees[0]) */
+      StigiExpr **scrutinees;   /* multi-scrutinee `(a, b) match` (S121) */
+      uint32_t scrutinee_count; /* 0 or 1 for single, >= 2 for tuple */
       StigiMatchArm *arms;
       uint32_t arm_count;
     } match_expr;
@@ -233,6 +244,8 @@ struct StigiExpr {
       StigiPat pat;
       StigiType *type; /* optional */
       StigiExpr *init;
+      StigiMatchArm *else_arms; /* optional `else case ...` (S123) */
+      uint32_t else_arm_count;
     } val_stmt;
     struct {
       StigiStr name;
@@ -289,6 +302,8 @@ typedef enum {
   STIGI_DECL_VAL,
   STIGI_DECL_CAPABILITY,
   STIGI_DECL_HANDLER,
+  STIGI_DECL_TRAIT,
+  STIGI_DECL_GIVEN,
   STIGI_DECL_EXTERN,
   STIGI_DECL_RELATION,
   STIGI_DECL_RULE,
@@ -330,13 +345,17 @@ struct StigiDecl {
   union {
     struct {
       StigiDefHead head;
-      StigiExpr *body; /* NULL for capability op or bodyless extern */
+      StigiExpr *body;         /* surface body (NULL for cap op, bodyless extern, or multi-head) */
+      StigiExpr *elab_body;    /* Maranget-elaborated 1-level checked IR (S121-S123) */
+      StigiMatchArm *clauses;  /* Erlang-style multi-head `case ... => ...` (S122) */
+      uint32_t clause_count;
     } def_decl;
     struct {
       StigiCapParam *caps;
       uint32_t cap_count;
       StigiType *type;
       StigiExpr *body;
+      StigiExpr *elab_body;
     } val_decl;
     struct {
       StigiParam *type_params;
@@ -382,6 +401,22 @@ struct StigiDecl {
       uint32_t def_count;
     } handler_decl;
     struct {
+      StigiParam *type_params;
+      uint32_t type_param_count;
+      StigiDecl **members; /* STIGI_DECL_DEF without body */
+      uint32_t member_count;
+    } trait_decl;
+    struct {
+      StigiParam *type_params;
+      uint32_t type_param_count;
+      StigiCapParam *cap_params;
+      uint32_t cap_param_count;
+      StigiStr trait_name;
+      StigiType *trait_type;
+      StigiDecl **defs; /* STIGI_DECL_DEF */
+      uint32_t def_count;
+    } given_decl;
+    struct {
       StigiStr abi;
       bool is_val;
       StigiDefHead head; /* for extern def */
@@ -416,5 +451,21 @@ typedef struct {
   uint32_t alias_count;
   StigiDecl *decl;
 } StigiUnit;
+
+static inline const StigiExpr *stigi_def_body(const StigiDecl *d) {
+  if (d == NULL) return NULL;
+  if (d->kind == STIGI_DECL_DEF || d->kind == STIGI_DECL_LEMMA_DEF) {
+    return d->u.def_decl.elab_body != NULL ? d->u.def_decl.elab_body : d->u.def_decl.body;
+  }
+  return NULL;
+}
+
+static inline const StigiExpr *stigi_val_body(const StigiDecl *d) {
+  if (d == NULL) return NULL;
+  if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST || d->kind == STIGI_DECL_NEG_TEST) {
+    return d->u.val_decl.elab_body != NULL ? d->u.val_decl.elab_body : d->u.val_decl.body;
+  }
+  return NULL;
+}
 
 #endif

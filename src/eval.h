@@ -66,5 +66,8 @@ StigiEvalResult stigi_eval_unit(const StigiImage *img, uint32_t unit_idx,
                                 uint64_t fuel_max, Arena *arena);
 StigiEvalResult stigi_eval_test(const StigiImage *img, uint32_t unit_idx,
                                 uint64_t fuel_max, Arena *arena);
+StigiEvalResult stigi_eval_const_call(const StigiImage *img, uint32_t unit_idx,
+                                      const StigiVal *args, uint32_t argc,
+                                      uint64_t fuel_max, Arena *arena);
 
 #endif

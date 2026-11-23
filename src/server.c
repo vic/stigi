@@ -167,6 +167,8 @@ static const char *decl_kind_label(StigiDeclKind k) {
     case STIGI_DECL_VAL: return "val";
     case STIGI_DECL_CAPABILITY: return "capability";
     case STIGI_DECL_HANDLER: return "handler";
+    case STIGI_DECL_TRAIT: return "trait";
+    case STIGI_DECL_GIVEN: return "given";
     case STIGI_DECL_EXTERN: return "extern";
     case STIGI_DECL_RELATION: return "relation";
     case STIGI_DECL_RULE: return "rule";
@@ -1508,8 +1510,48 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
       free(rb.buf);
       return tx_err;
     }
+    /* S126: automatic image GC on batch commit */
+    if (is_batch) {
+      uint32_t gc_removed = 0U;
+      StigiDoorResult gc_r;
+      stigi_door_result_init(&gc_r);
+      if (stigi_door_gc(ctx->door, &gc_removed, &gc_r, diag) == STIGI_OK && gc_removed > 0U) {
+        rb_fmt(&rb, "gc collected %u unreachable units (%u remaining)\n",
+               gc_removed, ctx->door->image.unit_count);
+      }
+      stigi_door_result_free(&gc_r);
+    }
     Status fin = finalize_reply(ctx, &rb, status_tag, &all_diags, out_reply, out_len, diag);
     stigi_door_result_free(&all_diags);
+    return fin;
+  }
+
+  /* S126 / S127: explicit image tree-shaking / garbage collection frame */
+  if ((cmd_len == 9 && memcmp(frame, "treeshake", 9) == 0) ||
+      (cmd_len == 2 && memcmp(frame, "gc", 2) == 0)) {
+    clear_fixes(ctx);
+    uint32_t gc_removed = 0U;
+    StigiDoorResult gc_r;
+    stigi_door_result_init(&gc_r);
+    Status gst = stigi_door_gc(ctx->door, &gc_removed, &gc_r, diag);
+    if (gst != STIGI_OK) {
+      stigi_door_result_free(&gc_r);
+      free(rb.buf);
+      return gst;
+    }
+    if (!gc_r.accepted) {
+      status_tag = "rejected";
+      rb_cstr(&rb, "rejected gc\n");
+      for (uint32_t i = 0; i < gc_r.reject_count; i++) {
+        rb_fmt(&rb, "  error[%s] %s: %s\n",
+               gc_r.rejects[i].code, gc_r.rejects[i].subject, gc_r.rejects[i].msg);
+      }
+    } else {
+      rb_fmt(&rb, "accepted gc (removed=%u remaining=%u)\n",
+             gc_removed, ctx->door->image.unit_count);
+    }
+    Status fin = finalize_reply(ctx, &rb, status_tag, &gc_r, out_reply, out_len, diag);
+    stigi_door_result_free(&gc_r);
     return fin;
   }
 

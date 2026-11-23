@@ -44,6 +44,8 @@ static const char *unit_kind_str(StigiDeclKind k) {
     case STIGI_DECL_VAL: return "Val";
     case STIGI_DECL_CAPABILITY: return "Capability";
     case STIGI_DECL_HANDLER: return "Handler";
+    case STIGI_DECL_TRAIT: return "Trait";
+    case STIGI_DECL_GIVEN: return "Given";
     case STIGI_DECL_EXTERN: return "Extern";
     case STIGI_DECL_RELATION: return "Relation";
     case STIGI_DECL_RULE: return "Rule";
@@ -56,7 +58,7 @@ static const char *unit_kind_str(StigiDeclKind k) {
 static bool is_valid_kind_str(const char *s, size_t len) {
   static const char *const KINDS[] = {
       "Enum", "Type", "Def", "Lemma", "Val", "Capability",
-      "Handler", "Extern", "Relation", "Rule", "Test", "NegTest"
+      "Handler", "Trait", "Given", "Extern", "Relation", "Rule", "Test", "NegTest"
   };
   for (size_t i = 0; i < sizeof(KINDS) / sizeof(KINDS[0]); i++) {
     if (strlen(KINDS[i]) == len && memcmp(KINDS[i], s, len) == 0) return true;
@@ -532,8 +534,8 @@ Status stigi_store_dir_subset(const StigiDoor *door, const char *dir,
     res = write_cache_file(door, dir, err_buf, err_cap);
   }
 
-  /* O(N log N) prune of stale .sc files when storing full image */
-  if (res == STIGI_OK && name_count == 0 && old_files.count > 0) {
+  /* O(N log N) prune of stale .sc files when storing a non-empty full image */
+  if (res == STIGI_OK && name_count == 0 && old_files.count > 0 && door->image.unit_count > 0) {
     if (written_files.count > 1U) {
       qsort(written_files.paths, written_files.count, sizeof *written_files.paths, cmp_cstr);
     }

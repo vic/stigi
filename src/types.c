@@ -1,5 +1,6 @@
 #include "types.h"
 #include "eval.h"
+#include "pattern.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -38,6 +39,7 @@ const char *stigi_type_code_name(StigiTypeCode code) {
     case STIGI_TYPE_EXTERN_FORGES_FACTS: return "extern-forges-facts";
     case STIGI_TYPE_LITERAL_OUT_OF_RANGE: return "literal-out-of-range";
     case STIGI_TYPE_LENGTH_NOT_LINEAR: return "length-not-linear";
+    case STIGI_TYPE_NEVER_REACHED: return "never-reached";
   }
   return "unknown";
 }
@@ -476,10 +478,27 @@ static uint32_t push_ty_type_param(TyCtx *ctx, StigiStr name, StigiTy *subst) {
 }
 
 static void push_ty_cap_binder(TyCtx *ctx, StigiStr name, int32_t cap_unit_idx) {
-  TyBinding *b = push_ty_binding(ctx, name);
-  if (b != NULL) {
-    b->cap_unit_idx = cap_unit_idx;
+  if (ctx->local_count == ctx->local_cap) {
+    uint32_t ncap = ctx->local_cap == 0 ? 32U : ctx->local_cap * 2U;
+    if (ncap <= ctx->local_cap) return;
+    TyBinding *nl = realloc(ctx->locals, (size_t)ncap * sizeof *nl);
+    if (nl == NULL) return;
+    ctx->locals = nl;
+    ctx->local_cap = ncap;
   }
+  TyBinding *b = &ctx->locals[ctx->local_count++];
+  memset(b, 0, sizeof *b);
+  b->name = name;
+  b->binder_id = ++ctx->next_binder_id;
+  b->cap_unit_idx = cap_unit_idx;
+}
+
+static int32_t find_cap_in_scope(const TyCtx *ctx, int32_t cap_unit_idx) {
+  if (ctx == NULL || cap_unit_idx < 0) return -1;
+  for (uint32_t i = ctx->local_count; i > 0; i--) {
+    if (ctx->locals[i - 1].cap_unit_idx == cap_unit_idx) return cap_unit_idx;
+  }
+  return -1;
 }
 
 static StigiTy *alloc_ty(Arena *a, StigiTyKind kind) {
@@ -833,7 +852,7 @@ Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t 
     intern_init(&lin);
     uint64_t bytes = 0;
     bool has_call = false;
-    frame_walk_expr(img, unit_idx, d->u.val_decl.body, &tmp, &lin, &bytes, &has_call);
+    frame_walk_expr(img, unit_idx, stigi_val_body(d), &tmp, &lin, &bytes, &has_call);
     if (has_call) bytes = align_up_u64(bytes, 16) + 48ULL;
     intern_free(&lin);
     arena_free(&tmp);
@@ -848,7 +867,7 @@ Status stigi_def_frame_bytes(const StigiImage *img, uint32_t unit_idx, uint64_t 
   const StigiDefHead *h = (d->kind == STIGI_DECL_EXTERN) ? &d->u.extern_decl.head
                                                          : &d->u.def_decl.head;
   const StigiExpr *body = (d->kind == STIGI_DECL_EXTERN) ? d->u.extern_decl.body
-                                                         : d->u.def_decl.body;
+                                                         : stigi_def_body(d);
   Arena tmp;
   arena_init(&tmp);
   InternPool lin;
@@ -2131,14 +2150,32 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           return res;
         }
 
-        /* Capability operation call `binder.op(...)` */
-        const char *dot = memchr(cn.ptr, '.', cn.len);
+        /* Capability operation call `binder.op(...)` or unnamed `Cap.op(...)` (S125) */
+        const char *dot = NULL;
+        for (size_t i = 0; i < cn.len; i++) {
+          if (cn.ptr[i] == '.') dot = cn.ptr + i;
+        }
         if (dot != NULL) {
           StigiStr prefix = { cn.ptr, (size_t)(dot - cn.ptr) };
           StigiStr op_name = { dot + 1, cn.len - prefix.len - 1U };
+          int32_t cap_idx = -1;
           const TyBinding *cb = find_local(ctx, prefix);
           if (cb != NULL && cb->cap_unit_idx >= 0) {
-            uint32_t cidx = (uint32_t)cb->cap_unit_idx;
+            cap_idx = cb->cap_unit_idx;
+          } else {
+            int32_t cand_cap = stigi_image_resolve_name(ctx->img, ctx->uidx,
+                                                        prefix.ptr, prefix.len);
+            if (cand_cap >= 0 &&
+                ctx->img->units[cand_cap].ast->decl->kind == STIGI_DECL_CAPABILITY &&
+                find_cap_in_scope(ctx, cand_cap) >= 0) {
+              cap_idx = cand_cap;
+            } else if (cand_cap >= 0 &&
+                       ctx->img->units[cand_cap].ast->decl->kind == STIGI_DECL_TRAIT) {
+              cap_idx = cand_cap;
+            }
+          }
+          if (cap_idx >= 0) {
+            uint32_t cidx = (uint32_t)cap_idx;
             const StigiDecl *cd = ctx->img->units[cidx].ast->decl;
             if (cd->kind == STIGI_DECL_CAPABILITY) {
               for (uint32_t m = 0; m < cd->u.cap_decl.member_count; m++) {
@@ -2146,6 +2183,20 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
                 if (op->kind == STIGI_DECL_DEF && str_eq_ss(op->name, op_name)) {
                   return check_call_with_head(ctx, cidx, ctx->img->units[cidx].name,
                                               &op->u.def_decl.head, e, expected);
+                }
+              }
+            } else if (cd->kind == STIGI_DECL_TRAIT) {
+              for (uint32_t m = 0; m < cd->u.trait_decl.member_count; m++) {
+                const StigiDecl *op = cd->u.trait_decl.members[m];
+                if (op->kind == STIGI_DECL_DEF && str_eq_ss(op->name, op_name)) {
+                  /* Combine trait's type parameters with op's head so inference works cleanly */
+                  StigiDefHead combined = op->u.def_decl.head;
+                  if (cd->u.trait_decl.type_param_count > 0 && combined.type_param_count == 0) {
+                    combined.type_params = cd->u.trait_decl.type_params;
+                    combined.type_param_count = cd->u.trait_decl.type_param_count;
+                  }
+                  return check_call_with_head(ctx, cidx, ctx->img->units[cidx].name,
+                                              &combined, e, expected);
                 }
               }
             }
@@ -2268,11 +2319,6 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
             } else {
               const StigiEnumCase *ec = &enum_d->u.enum_decl.cases[found_c];
               if (covered != NULL) {
-                if (covered[found_c]) {
-                  (void)add_tdiag(ctx->diags, STIGI_TYPE_MISMATCH, pat->span, ctx->diag,
-                                  "duplicate match arm for case '%.*s'",
-                                  (int)ec->name.len, ec->name.ptr);
-                }
                 covered[found_c] = true;
               }
               if (pat->field_count != ec->field_count) {
@@ -2433,7 +2479,7 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
           (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,
                           "allocation result match must cover both success and failure cases");
         }
-      } else if (enum_d != NULL && covered != NULL) {
+      } else if (enum_d != NULL && covered != NULL && !has_wild) {
         for (uint32_t c = 0; c < case_count; c++) {
           if (!covered[c]) {
             (void)add_tdiag(ctx->diags, STIGI_TYPE_NOT_EXHAUSTIVE, e->span, ctx->diag,
@@ -2502,14 +2548,14 @@ static StigiTy *check_expr(TyCtx *ctx, const StigiExpr *e, const StigiTy *expect
       }
       if (e->u.handle_stmt.body != NULL) {
         uint32_t saved = ctx->local_count;
-        if (e->u.handle_stmt.binder.len > 0) {
+        if (cap_u >= 0 || e->u.handle_stmt.binder.len > 0) {
           push_ty_cap_binder(ctx, e->u.handle_stmt.binder, cap_u);
         }
         StigiTy *bt = check_expr(ctx, e->u.handle_stmt.body, expected);
         ctx->local_count = saved;
         return bt;
       }
-      if (e->u.handle_stmt.binder.len > 0) {
+      if (cap_u >= 0 || e->u.handle_stmt.binder.len > 0) {
         push_ty_cap_binder(ctx, e->u.handle_stmt.binder, cap_u);
       }
       return alloc_ty(ctx->arena, STIGI_TY_UNIT);
@@ -2541,7 +2587,7 @@ static void check_def_like(const StigiImage *img, uint32_t uidx, const StigiDefH
   for (uint32_t g = 0; g < h->pre_group_count; g++) {
     if (!h->pre_groups[g].is_fact) {
       for (uint32_t c = 0; c < h->pre_groups[g].cap_count; c++) {
-        if (h->pre_groups[g].caps[c].name.len > 0 && h->pre_groups[g].caps[c].cap_type != NULL) {
+        if (h->pre_groups[g].caps[c].cap_type != NULL) {
           int32_t cidx = stigi_image_resolve_name(img, uidx,
                                                   h->pre_groups[g].caps[c].cap_type->name.ptr,
                                                   h->pre_groups[g].caps[c].cap_type->name.len);
@@ -2648,7 +2694,7 @@ static void check_handler_decl(const StigiImage *img, uint32_t uidx, const Stigi
                         ? resolve_ast_type_ctx(img, uidx, oh->ret_type, arena, lin_intern,
                                                &hctx, diags, diag, 0)
                         : alloc_ty(arena, STIGI_TY_UNIT);
-    StigiTy *obody = check_expr(&hctx, op->u.def_decl.body, oret);
+    StigiTy *obody = check_expr(&hctx, stigi_def_body(op), oret);
     if (!stigi_ty_assignable(oret, obody)) {
       (void)add_tdiag(diags, STIGI_TYPE_MISMATCH, op->span, diag,
                       "handler operation '%.*s' body does not match return type",
@@ -2737,10 +2783,164 @@ static void check_handler_decl(const StigiImage *img, uint32_t uidx, const Stigi
   ty_ctx_free(&hctx);
 }
 
+static void check_given_decl(const StigiImage *img, uint32_t uidx, const StigiDecl *d,
+                             Arena *arena, InternPool *lin_intern,
+                             StigiTypeDiags *diags, Diag *diag) {
+  int32_t tr_idx = stigi_image_resolve_name(img, uidx, d->u.given_decl.trait_name.ptr,
+                                            d->u.given_decl.trait_name.len);
+  const StigiDecl *tr_d = NULL;
+  if (tr_idx >= 0 && img->units[tr_idx].ast->decl->kind == STIGI_DECL_TRAIT) {
+    tr_d = img->units[tr_idx].ast->decl;
+  } else {
+    (void)add_tdiag(diags, STIGI_TYPE_HANDLER_SIGNATURE, d->span, diag,
+                    "given '%s' target '%.*s' is not a trait",
+                    img->units[uidx].name, (int)d->u.given_decl.trait_name.len,
+                    d->u.given_decl.trait_name.ptr);
+  }
+
+  TyCtx gctx;
+  memset(&gctx, 0, sizeof gctx);
+  gctx.img = img;
+  gctx.uidx = uidx;
+  gctx.arena = arena;
+  gctx.lin_intern = lin_intern;
+  gctx.diags = diags;
+  gctx.diag = diag;
+
+  for (uint32_t tp = 0; tp < d->u.given_decl.type_param_count; tp++) {
+    (void)push_ty_type_param(&gctx, d->u.given_decl.type_params[tp].name, NULL);
+  }
+  for (uint32_t cp = 0; cp < d->u.given_decl.cap_param_count; cp++) {
+    if (d->u.given_decl.cap_params[cp].cap_type != NULL) {
+      int32_t cidx = stigi_image_resolve_name(img, uidx,
+                                              d->u.given_decl.cap_params[cp].cap_type->name.ptr,
+                                              d->u.given_decl.cap_params[cp].cap_type->name.len);
+      push_ty_cap_binder(&gctx, d->u.given_decl.cap_params[cp].name, cidx);
+    }
+  }
+
+  /* Resolve trait_type args in given's scope for member signature verification */
+  StigiTy **tr_targs = NULL;
+  uint32_t tr_targ_cnt = 0;
+  if (d->u.given_decl.trait_type != NULL && d->u.given_decl.trait_type->type_arg_count > 0) {
+    tr_targ_cnt = d->u.given_decl.trait_type->type_arg_count;
+    tr_targs = arena_alloc(arena, (size_t)tr_targ_cnt * sizeof *tr_targs);
+    for (uint32_t k = 0; k < tr_targ_cnt && tr_targs != NULL; k++) {
+      tr_targs[k] = resolve_ast_type_ctx(img, uidx, d->u.given_decl.trait_type->type_args[k],
+                                         arena, lin_intern, &gctx, diags, diag, 0);
+    }
+  }
+
+  for (uint32_t i = 0; i < d->u.given_decl.def_count; i++) {
+    const StigiDecl *op = d->u.given_decl.defs[i];
+    if (op->kind != STIGI_DECL_DEF) continue;
+    uint32_t saved = gctx.local_count;
+    const StigiDefHead *oh = &op->u.def_decl.head;
+    for (uint32_t tp = 0; tp < oh->type_param_count; tp++) {
+      (void)push_ty_type_param(&gctx, oh->type_params[tp].name, NULL);
+    }
+    uint32_t obase = gctx.local_count;
+    for (uint32_t p = 0; p < oh->param_count; p++) {
+      push_ty_local(&gctx, oh->params[p].name, NULL, false);
+    }
+    for (uint32_t p = 0; p < oh->param_count; p++) {
+      StigiTy *pt = resolve_ast_type_ctx(img, uidx, oh->params[p].type, arena, lin_intern,
+                                         &gctx, diags, diag, 0);
+      if (obase + p < gctx.local_count) gctx.locals[obase + p].ty = pt;
+    }
+    StigiTy *oret = oh->ret_type != NULL
+                        ? resolve_ast_type_ctx(img, uidx, oh->ret_type, arena, lin_intern,
+                                               &gctx, diags, diag, 0)
+                        : alloc_ty(arena, STIGI_TY_UNIT);
+    const StigiExpr *obody = stigi_def_body(op);
+    if (obody != NULL) {
+      StigiTy *bt = check_expr(&gctx, obody, oret);
+      if (!stigi_ty_assignable(oret, bt)) {
+        (void)add_tdiag(diags, STIGI_TYPE_MISMATCH, op->span, diag,
+                        "given method '%.*s' body type does not match return type",
+                        (int)op->name.len, op->name.ptr);
+      }
+    }
+    if (tr_d != NULL) {
+      const StigiDecl *tr_op = NULL;
+      for (uint32_t m = 0; m < tr_d->u.trait_decl.member_count; m++) {
+        const StigiDecl *tm = tr_d->u.trait_decl.members[m];
+        if (tm->kind == STIGI_DECL_DEF && str_eq_ss(tm->name, op->name)) {
+          tr_op = tm;
+          break;
+        }
+      }
+      if (tr_op == NULL) {
+        (void)add_tdiag(diags, STIGI_TYPE_HANDLER_SIGNATURE, op->span, diag,
+                        "given '%s' defines unknown method '%.*s' for trait '%s'",
+                        img->units[uidx].name, (int)op->name.len, op->name.ptr,
+                        img->units[tr_idx].name);
+      } else {
+        const StigiDefHead *th = &tr_op->u.def_decl.head;
+        bool sig_ok = (oh->param_count == th->param_count);
+        if (sig_ok) {
+          TyCtx tctx;
+          memset(&tctx, 0, sizeof tctx);
+          tctx.img = img;
+          tctx.uidx = (uint32_t)tr_idx;
+          tctx.arena = arena;
+          tctx.lin_intern = lin_intern;
+          for (uint32_t tp = 0; tp < tr_d->u.trait_decl.type_param_count; tp++) {
+            StigiTy *subst = (tr_targs != NULL && tp < tr_targ_cnt) ? tr_targs[tp] : NULL;
+            (void)push_ty_type_param(&tctx, tr_d->u.trait_decl.type_params[tp].name, subst);
+          }
+          for (uint32_t p = 0; p < th->param_count; p++) {
+            StigiTy *tt = resolve_ast_type_ctx(img, (uint32_t)tr_idx, th->params[p].type,
+                                               arena, lin_intern, &tctx, NULL, NULL, 0);
+            StigiTy *gt = (obase + p < gctx.local_count) ? gctx.locals[obase + p].ty : NULL;
+            if (!stigi_ty_equal(tt, gt)) sig_ok = false;
+          }
+          StigiTy *tret = th->ret_type != NULL
+                              ? resolve_ast_type_ctx(img, (uint32_t)tr_idx, th->ret_type,
+                                                     arena, lin_intern, &tctx, NULL, NULL, 0)
+                              : alloc_ty(arena, STIGI_TY_UNIT);
+          if (!stigi_ty_equal(tret, oret)) sig_ok = false;
+          ty_ctx_free(&tctx);
+        }
+        if (!sig_ok) {
+          (void)add_tdiag(diags, STIGI_TYPE_HANDLER_SIGNATURE, op->span, diag,
+                          "given method '%.*s' signature does not match trait '%s'",
+                          (int)op->name.len, op->name.ptr, img->units[tr_idx].name);
+        }
+      }
+    }
+    gctx.local_count = saved;
+  }
+
+  if (tr_d != NULL) {
+    for (uint32_t m = 0; m < tr_d->u.trait_decl.member_count; m++) {
+      const StigiDecl *tm = tr_d->u.trait_decl.members[m];
+      if (tm->kind != STIGI_DECL_DEF) continue;
+      bool found = false;
+      for (uint32_t i = 0; i < d->u.given_decl.def_count; i++) {
+        if (str_eq_ss(d->u.given_decl.defs[i]->name, tm->name)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        (void)add_tdiag(diags, STIGI_TYPE_HANDLER_SIGNATURE, d->span, diag,
+                        "given '%s' is missing trait method '%.*s'",
+                        img->units[uidx].name, (int)tm->name.len, tm->name.ptr);
+      }
+    }
+  }
+  ty_ctx_free(&gctx);
+}
+
 Status stigi_typecheck_image(const StigiImage *img, StigiTypeDiags *diags, Diag *diag) {
   if (img == NULL) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_typecheck_image: invalid arguments");
   }
+
+  /* 0. Elaborate S121-S123 patterns, multi-head defs, val-else, and pipes (Maranget) */
+  Status est = stigi_elaborate_image((StigiImage *)img, diags, diag);
+  if (est != STIGI_OK) return est;
 
   /* 1. Check recursive types (S43/S69) across all enum and type units */
   if (img->unit_count > 0) {
@@ -2803,7 +3003,7 @@ Status stigi_typecheck_image(const StigiImage *img, StigiTypeDiags *diags, Diag 
     }
 
     if (d->kind == STIGI_DECL_DEF || d->kind == STIGI_DECL_LEMMA_DEF) {
-      check_def_like(img, i, &d->u.def_decl.head, d->u.def_decl.body,
+      check_def_like(img, i, &d->u.def_decl.head, stigi_def_body(d),
                      d->kind == STIGI_DECL_LEMMA_DEF, false, &arena, &lin_intern, diags, diag);
     } else if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST) {
       TyCtx ctx;
@@ -2816,7 +3016,7 @@ Status stigi_typecheck_image(const StigiImage *img, StigiTypeDiags *diags, Diag 
       ctx.diag = diag;
       StigiTy *decl_ty = resolve_ast_type(img, i, d->u.val_decl.type, &arena, &lin_intern,
                                           diags, diag, 0);
-      StigiTy *body_ty = check_expr(&ctx, d->u.val_decl.body, decl_ty);
+      StigiTy *body_ty = check_expr(&ctx, stigi_val_body(d), decl_ty);
       if (!stigi_ty_assignable(decl_ty, body_ty)) {
         (void)add_tdiag(diags, STIGI_TYPE_MISMATCH, d->span, diag,
                         "initializer of val '%s' does not match declared type",
@@ -2870,6 +3070,8 @@ Status stigi_typecheck_image(const StigiImage *img, StigiTypeDiags *diags, Diag 
       ty_ctx_free(&tctx);
     } else if (d->kind == STIGI_DECL_HANDLER) {
       check_handler_decl(img, i, d, &arena, &lin_intern, diags, diag);
+    } else if (d->kind == STIGI_DECL_GIVEN) {
+      check_given_decl(img, i, d, &arena, &lin_intern, diags, diag);
     }
   }
 

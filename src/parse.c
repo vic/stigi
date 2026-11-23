@@ -851,12 +851,31 @@ static StigiPat parse_pattern(Parser *p) {
   memset(&pat, 0, sizeof pat);
   if (p->failed || check_not_in_lang(p)) return pat;
   const StigiTok *t = peek(p);
+  if (!p_enter_depth(p, t->span)) return pat;
   pat.span = t->span;
 
   if (t->kind == TOK_UNDERSCORE) {
     advance(p);
     pat.kind = STIGI_PAT_WILD;
     pat.name = tok_str(t);
+    p_leave_depth(p);
+    return pat;
+  }
+  if (t->kind == TOK_MINUS) {
+    const StigiTok *m = advance(p);
+    const StigiTok *nt = peek(p);
+    if (nt->kind != TOK_INT) {
+      p_fail(p, nt->span, "expected integer literal after '-' in pattern");
+      p_leave_depth(p);
+      return pat;
+    }
+    advance(p);
+    pat.kind = STIGI_PAT_INT;
+    pat.int_neg = true;
+    pat.name.ptr = m->ptr;
+    pat.name.len = (uint32_t)((nt->ptr + nt->len) - m->ptr);
+    pat.int_val = parse_u64_lit(nt->ptr, nt->len, &pat.int_overflow);
+    p_leave_depth(p);
     return pat;
   }
   if (t->kind == TOK_INT) {
@@ -864,6 +883,15 @@ static StigiPat parse_pattern(Parser *p) {
     pat.kind = STIGI_PAT_INT;
     pat.name = tok_str(t);
     pat.int_val = parse_u64_lit(t->ptr, t->len, &pat.int_overflow);
+    p_leave_depth(p);
+    return pat;
+  }
+  if (t->kind == TOK_CHAR) {
+    advance(p);
+    pat.kind = STIGI_PAT_CHAR;
+    pat.name = tok_str(t);
+    pat.char_val = parse_char_lit(t->ptr, t->len);
+    p_leave_depth(p);
     return pat;
   }
   if (t->kind == TOK_KW_TRUE || t->kind == TOK_KW_FALSE) {
@@ -871,6 +899,50 @@ static StigiPat parse_pattern(Parser *p) {
     pat.kind = STIGI_PAT_BOOL;
     pat.name = tok_str(t);
     pat.bool_val = (t->kind == TOK_KW_TRUE);
+    p_leave_depth(p);
+    return pat;
+  }
+  if (t->kind == TOK_LPAREN) {
+    advance(p);
+    skip_newlines(p);
+    StigiPat *subs = NULL;
+    uint32_t cnt = 0, cap = 0;
+    if (peek(p)->kind != TOK_RPAREN) {
+      for (;;) {
+        skip_newlines(p);
+        StigiPat sp = parse_pattern(p);
+        if (p->failed) { free(subs); p_leave_depth(p); return pat; }
+        if (cnt == cap && !p_grow(p, (void **)&subs, &cap, sizeof *subs)) {
+          free(subs); p_leave_depth(p); return pat;
+        }
+        subs[cnt++] = sp;
+        skip_newlines(p);
+        if (peek(p)->kind == TOK_COMMA) {
+          advance(p);
+          skip_newlines(p);
+        } else {
+          break;
+        }
+      }
+    }
+    skip_newlines(p);
+    if (!expect(p, TOK_RPAREN)) { free(subs); p_leave_depth(p); return pat; }
+    if (cnt == 1) {
+      StigiPat single = subs[0];
+      free(subs);
+      p_leave_depth(p);
+      return single;
+    }
+    pat.kind = STIGI_PAT_TUPLE;
+    pat.has_parens = true;
+    if (cnt > 0) {
+      pat.subpats = p_alloc(p, (size_t)cnt * sizeof *subs);
+      if (pat.subpats == NULL) { free(subs); p_fail_oom(p); p_leave_depth(p); return pat; }
+      memcpy(pat.subpats, subs, (size_t)cnt * sizeof *subs);
+      pat.subpat_count = cnt;
+    }
+    free(subs);
+    p_leave_depth(p);
     return pat;
   }
   if (is_ident_like(t->kind)) {
@@ -882,17 +954,17 @@ static StigiPat parse_pattern(Parser *p) {
       pat.has_parens = true;
       advance(p);
       skip_newlines(p);
-      StigiStr *fields = NULL;
+      StigiPat *subs = NULL;
       uint32_t cnt = 0, cap = 0;
       if (peek(p)->kind != TOK_RPAREN) {
         for (;;) {
           skip_newlines(p);
-          StigiStr fn = parse_binder_name(p);
-          if (p->failed) { free(fields); return pat; }
-          if (cnt == cap && !p_grow(p, (void **)&fields, &cap, sizeof *fields)) {
-            free(fields); return pat;
+          StigiPat sp = parse_pattern(p);
+          if (p->failed) { free(subs); p_leave_depth(p); return pat; }
+          if (cnt == cap && !p_grow(p, (void **)&subs, &cap, sizeof *subs)) {
+            free(subs); p_leave_depth(p); return pat;
           }
-          fields[cnt++] = fn;
+          subs[cnt++] = sp;
           skip_newlines(p);
           if (peek(p)->kind == TOK_COMMA) {
             advance(p);
@@ -903,22 +975,80 @@ static StigiPat parse_pattern(Parser *p) {
         }
       }
       skip_newlines(p);
-      if (!expect(p, TOK_RPAREN)) { free(fields); return pat; }
+      if (!expect(p, TOK_RPAREN)) { free(subs); p_leave_depth(p); return pat; }
       if (cnt > 0) {
-        pat.fields = p_alloc(p, (size_t)cnt * sizeof *pat.fields);
-        if (pat.fields == NULL) { free(fields); p_fail_oom(p); return pat; }
-        memcpy(pat.fields, fields, (size_t)cnt * sizeof *fields);
-        pat.field_count = cnt;
+        pat.subpats = p_alloc(p, (size_t)cnt * sizeof *subs);
+        if (pat.subpats == NULL) { free(subs); p_fail_oom(p); p_leave_depth(p); return pat; }
+        memcpy(pat.subpats, subs, (size_t)cnt * sizeof *subs);
+        pat.subpat_count = cnt;
+        /* Keep flat fields[] populated for 1-level patterns */
+        bool all_flat = true;
+        for (uint32_t i = 0; i < cnt; i++) {
+          if (subs[i].kind != STIGI_PAT_VAR && subs[i].kind != STIGI_PAT_WILD) {
+            all_flat = false;
+            break;
+          }
+        }
+        if (all_flat) {
+          pat.fields = p_alloc(p, (size_t)cnt * sizeof *pat.fields);
+          if (pat.fields == NULL) { free(subs); p_fail_oom(p); p_leave_depth(p); return pat; }
+          for (uint32_t i = 0; i < cnt; i++) pat.fields[i] = subs[i].name;
+          pat.field_count = cnt;
+        }
       }
-      free(fields);
+      free(subs);
+      p_leave_depth(p);
       return pat;
     }
     pat.kind = is_upper_start ? STIGI_PAT_CTOR : STIGI_PAT_VAR;
+    p_leave_depth(p);
     return pat;
   }
 
   p_fail(p, t->span, "expected pattern, got '%s'", stigi_tok_kind_name(t->kind));
+  p_leave_depth(p);
   return pat;
+}
+
+static StigiExpr *parse_match(Parser *p, uint32_t base_col);
+
+static bool parse_case_arms(Parser *p, uint32_t arm_col,
+                            StigiMatchArm **out_arms, uint32_t *out_count) {
+  StigiMatchArm *arms = NULL;
+  uint32_t cnt = 0, cap = 0;
+  for (;;) {
+    const StigiTok *nxt = peek_skip_nl(p);
+    if (nxt->kind != TOK_KW_CASE || nxt->span.col != arm_col) break;
+    skip_newlines(p);
+    StigiMatchArm arm;
+    memset(&arm, 0, sizeof arm);
+    arm.span = advance(p)->span; /* 'case' */
+    arm.pat = parse_pattern(p);
+    if (p->failed) { free(arms); return false; }
+    if (peek(p)->kind == TOK_KW_IF) {
+      advance(p);
+      arm.guard = parse_match(p, arm_col);
+      if (p->failed) { free(arms); return false; }
+    }
+    if (!expect(p, TOK_ARROW)) { free(arms); return false; }
+    arm.body = parse_block_or_expr(p, arm_col);
+    if (p->failed) { free(arms); return false; }
+    if (cnt == cap && !p_grow(p, (void **)&arms, &cap, sizeof *arms)) {
+      free(arms); return false;
+    }
+    arms[cnt++] = arm;
+  }
+  if (cnt > 0) {
+    *out_arms = p_alloc(p, (size_t)cnt * sizeof *arms);
+    if (*out_arms == NULL) { free(arms); p_fail_oom(p); return false; }
+    memcpy(*out_arms, arms, (size_t)cnt * sizeof *arms);
+    *out_count = cnt;
+  } else {
+    *out_arms = NULL;
+    *out_count = 0;
+  }
+  free(arms);
+  return true;
 }
 
 /* ---- Expressions ---- */
@@ -1015,9 +1145,60 @@ static StigiExpr *parse_primary(Parser *p, uint32_t base_col) {
     StigiExpr *inner = parse_expr(p, base_col);
     skip_newlines(p);
     if (!p->failed && peek(p)->kind == TOK_COMMA) {
-      p_fail_not_in_lang(p, peek(p)->span, "lambda");
+      /* Multi-scrutinee `(e1, e2, ...) match` (S121); reject `(a, b) =>` as lambda */
+      StigiExpr **scs = NULL;
+      uint32_t sc_cnt = 0, sc_cap = 0;
+      if (!p_grow(p, (void **)&scs, &sc_cap, sizeof *scs)) { p_leave_depth(p); return NULL; }
+      scs[sc_cnt++] = inner;
+      while (peek(p)->kind == TOK_COMMA) {
+        advance(p);
+        skip_newlines(p);
+        StigiExpr *nxt_e = parse_expr(p, base_col);
+        if (p->failed) { free(scs); p_leave_depth(p); return NULL; }
+        if (sc_cnt == sc_cap && !p_grow(p, (void **)&scs, &sc_cap, sizeof *scs)) {
+          free(scs); p_leave_depth(p); return NULL;
+        }
+        scs[sc_cnt++] = nxt_e;
+        skip_newlines(p);
+      }
+      if (!expect(p, TOK_RPAREN)) { free(scs); p_leave_depth(p); return NULL; }
+      if (peek(p)->kind == TOK_ARROW) {
+        free(scs);
+        p_fail_not_in_lang(p, peek(p)->span, "lambda");
+        p_leave_depth(p);
+        return NULL;
+      }
+      if (peek(p)->kind != TOK_KW_MATCH) {
+        free(scs);
+        p_fail_not_in_lang(p, t->span, "tuple");
+        p_leave_depth(p);
+        return NULL;
+      }
+      advance(p); /* 'match' */
+      StigiExpr *m = p_alloc(p, sizeof *m);
+      if (m == NULL) { free(scs); p_fail_oom(p); p_leave_depth(p); return NULL; }
+      m->kind = STIGI_EXPR_MATCH;
+      m->span = t->span;
+      m->u.match_expr.scrutinees = p_alloc(p, (size_t)sc_cnt * sizeof *scs);
+      if (m->u.match_expr.scrutinees == NULL) { free(scs); p_fail_oom(p); p_leave_depth(p); return NULL; }
+      memcpy(m->u.match_expr.scrutinees, scs, (size_t)sc_cnt * sizeof *scs);
+      m->u.match_expr.scrutinee_count = sc_cnt;
+      m->u.match_expr.scrutinee = m->u.match_expr.scrutinees[0];
+      free(scs);
+      skip_newlines(p);
+      const StigiTok *first_arm = peek(p);
+      if (first_arm->kind != TOK_KW_CASE) {
+        p_fail(p, first_arm->span, "expected 'case' arm after 'match'");
+        p_leave_depth(p);
+        return NULL;
+      }
+      if (!parse_case_arms(p, first_arm->span.col, &m->u.match_expr.arms,
+                           &m->u.match_expr.arm_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
       p_leave_depth(p);
-      return NULL;
+      return m;
     }
     if (!expect(p, TOK_RPAREN)) { p_leave_depth(p); return NULL; }
     if (peek(p)->kind == TOK_ARROW) {
@@ -1185,19 +1366,20 @@ static StigiExpr *parse_unary(Parser *p, uint32_t base_col) {
 
 static int binop_prec(StigiTokKind k, StigiOp *out_op) {
   switch (k) {
-    case TOK_OR: *out_op = STIGI_OP_OR; return 1;
-    case TOK_AND: *out_op = STIGI_OP_AND; return 2;
-    case TOK_EQ: *out_op = STIGI_OP_EQ; return 3;
-    case TOK_NE: *out_op = STIGI_OP_NE; return 3;
-    case TOK_LT: *out_op = STIGI_OP_LT; return 3;
-    case TOK_LE: *out_op = STIGI_OP_LE; return 3;
-    case TOK_GT: *out_op = STIGI_OP_GT; return 3;
-    case TOK_GE: *out_op = STIGI_OP_GE; return 3;
-    case TOK_PLUS: *out_op = STIGI_OP_ADD; return 4;
-    case TOK_MINUS: *out_op = STIGI_OP_SUB; return 4;
-    case TOK_STAR: *out_op = STIGI_OP_MUL; return 5;
-    case TOK_SLASH: *out_op = STIGI_OP_DIV; return 5;
-    case TOK_PERCENT: *out_op = STIGI_OP_MOD; return 5;
+    case TOK_PIPE_GT: *out_op = STIGI_OP_PIPE; return 1;
+    case TOK_OR: *out_op = STIGI_OP_OR; return 2;
+    case TOK_AND: *out_op = STIGI_OP_AND; return 3;
+    case TOK_EQ: *out_op = STIGI_OP_EQ; return 4;
+    case TOK_NE: *out_op = STIGI_OP_NE; return 4;
+    case TOK_LT: *out_op = STIGI_OP_LT; return 4;
+    case TOK_LE: *out_op = STIGI_OP_LE; return 4;
+    case TOK_GT: *out_op = STIGI_OP_GT; return 4;
+    case TOK_GE: *out_op = STIGI_OP_GE; return 4;
+    case TOK_PLUS: *out_op = STIGI_OP_ADD; return 5;
+    case TOK_MINUS: *out_op = STIGI_OP_SUB; return 5;
+    case TOK_STAR: *out_op = STIGI_OP_MUL; return 6;
+    case TOK_SLASH: *out_op = STIGI_OP_DIV; return 6;
+    case TOK_PERCENT: *out_op = STIGI_OP_MOD; return 6;
     default: return 0;
   }
 }
@@ -1207,6 +1389,11 @@ static StigiExpr *parse_binop(Parser *p, uint32_t base_col, int min_prec) {
   if (p->failed) return NULL;
 
   for (;;) {
+    if (peek(p)->kind == TOK_NEWLINE &&
+        peek_skip_nl(p)->kind == TOK_PIPE_GT &&
+        peek_skip_nl(p)->span.col > base_col) {
+      skip_newlines(p);
+    }
     StigiOp op = STIGI_OP_ADD;
     int prec = binop_prec(peek(p)->kind, &op);
     if (prec < min_prec) break;
@@ -1246,34 +1433,10 @@ static StigiExpr *parse_match(Parser *p, uint32_t base_col) {
       p_fail(p, first_arm->span, "expected 'case' arm after 'match'");
       return NULL;
     }
-    uint32_t arm_col = first_arm->span.col;
-    StigiMatchArm *arms = NULL;
-    uint32_t cnt = 0, cap = 0;
-
-    for (;;) {
-      const StigiTok *nxt = peek_skip_nl(p);
-      if (nxt->kind != TOK_KW_CASE || nxt->span.col != arm_col) break;
-      skip_newlines(p);
-      StigiMatchArm arm;
-      memset(&arm, 0, sizeof arm);
-      arm.span = advance(p)->span; /* 'case' */
-      arm.pat = parse_pattern(p);
-      if (p->failed) { free(arms); return NULL; }
-      if (!expect(p, TOK_ARROW)) { free(arms); return NULL; }
-      arm.body = parse_block_or_expr(p, arm_col);
-      if (p->failed) { free(arms); return NULL; }
-      if (cnt == cap && !p_grow(p, (void **)&arms, &cap, sizeof *arms)) {
-        free(arms); return NULL;
-      }
-      arms[cnt++] = arm;
+    if (!parse_case_arms(p, first_arm->span.col, &m->u.match_expr.arms,
+                         &m->u.match_expr.arm_count)) {
+      return NULL;
     }
-    if (cnt > 0) {
-      m->u.match_expr.arms = p_alloc(p, (size_t)cnt * sizeof *arms);
-      if (m->u.match_expr.arms == NULL) { free(arms); p_fail_oom(p); return NULL; }
-      memcpy(m->u.match_expr.arms, arms, (size_t)cnt * sizeof *arms);
-      m->u.match_expr.arm_count = cnt;
-    }
-    free(arms);
     e = m;
   }
   return e;
@@ -1358,6 +1521,7 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
   /* Local declarations inside NegTest blocks */
   if (t->kind == TOK_KW_DEF || t->kind == TOK_KW_LEMMA || t->kind == TOK_KW_ENUM ||
       t->kind == TOK_KW_TYPE || t->kind == TOK_KW_CAPABILITY || t->kind == TOK_KW_HANDLER ||
+      t->kind == TOK_KW_TRAIT || t->kind == TOK_KW_GIVEN ||
       t->kind == TOK_KW_EXTERN || t->kind == TOK_KW_RELATION || t->kind == TOK_KW_RULE) {
     StigiDecl *d = parse_decl(p, false, stmt_col);
     if (p->failed) return NULL;
@@ -1385,6 +1549,48 @@ static StigiExpr *parse_stmt(Parser *p, uint32_t stmt_col) {
     }
     if (!expect(p, TOK_ASSIGN)) return NULL;
     vs->u.val_stmt.init = parse_block_or_expr(p, stmt_col);
+    if (p->failed) return NULL;
+    /* S123: flat exhaustive binding `val Pat = expr else case ...` */
+    bool has_else = (peek(p)->kind == TOK_KW_ELSE);
+    if (!has_else && peek(p)->kind == TOK_NEWLINE &&
+        peek_skip_nl(p)->kind == TOK_KW_ELSE && peek_skip_nl(p)->span.col == stmt_col) {
+      skip_newlines(p);
+      has_else = true;
+    }
+    if (has_else) {
+      advance(p); /* 'else' */
+      if (peek(p)->kind == TOK_KW_CASE) {
+        /* Single inline `else case Pat => expr` */
+        StigiMatchArm arm;
+        memset(&arm, 0, sizeof arm);
+        arm.span = advance(p)->span;
+        arm.pat = parse_pattern(p);
+        if (p->failed) return NULL;
+        if (peek(p)->kind == TOK_KW_IF) {
+          advance(p);
+          arm.guard = parse_match(p, stmt_col);
+          if (p->failed) return NULL;
+        }
+        if (!expect(p, TOK_ARROW)) return NULL;
+        arm.body = parse_block_or_expr(p, stmt_col);
+        if (p->failed) return NULL;
+        vs->u.val_stmt.else_arms = p_alloc(p, sizeof *vs->u.val_stmt.else_arms);
+        if (vs->u.val_stmt.else_arms == NULL) { p_fail_oom(p); return NULL; }
+        vs->u.val_stmt.else_arms[0] = arm;
+        vs->u.val_stmt.else_arm_count = 1;
+      } else {
+        skip_newlines(p);
+        const StigiTok *fa = peek(p);
+        if (fa->kind != TOK_KW_CASE || fa->span.col <= stmt_col) {
+          p_fail(p, fa->span, "expected 'case' arm after 'val ... else'");
+          return NULL;
+        }
+        if (!parse_case_arms(p, fa->span.col, &vs->u.val_stmt.else_arms,
+                             &vs->u.val_stmt.else_arm_count)) {
+          return NULL;
+        }
+      }
+    }
     return vs;
   }
 
@@ -1811,7 +2017,19 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       return NULL;
     }
     if (!expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
-    d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    /* S122: Erlang-style multi-head def `def f(...): R =\n  case ... => ...` */
+    if (peek(p)->kind == TOK_NEWLINE &&
+        peek_skip_nl(p)->kind == TOK_KW_CASE &&
+        peek_skip_nl(p)->span.col > decl_col) {
+      skip_newlines(p);
+      uint32_t arm_col = peek(p)->span.col;
+      if (!parse_case_arms(p, arm_col, &d->u.def_decl.clauses, &d->u.def_decl.clause_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    } else {
+      d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    }
     p_leave_depth(p);
     return d;
   }
@@ -1830,7 +2048,19 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       return NULL;
     }
     if (!expect(p, TOK_ASSIGN)) { p_leave_depth(p); return NULL; }
-    d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    /* S122: Erlang-style multi-head def `def f(...): R =\n  case ... => ...` */
+    if (peek(p)->kind == TOK_NEWLINE &&
+        peek_skip_nl(p)->kind == TOK_KW_CASE &&
+        peek_skip_nl(p)->span.col > decl_col) {
+      skip_newlines(p);
+      uint32_t arm_col = peek(p)->span.col;
+      if (!parse_case_arms(p, arm_col, &d->u.def_decl.clauses, &d->u.def_decl.clause_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    } else {
+      d->u.def_decl.body = parse_block_or_expr(p, decl_col);
+    }
     p_leave_depth(p);
     return d;
   }
@@ -2192,6 +2422,126 @@ static StigiDecl *parse_decl(Parser *p, bool is_pub, uint32_t decl_col) {
       if (d->u.handler_decl.defs == NULL) { free(defs); p_fail_oom(p); p_leave_depth(p); return NULL; }
       memcpy(d->u.handler_decl.defs, defs, (size_t)dcnt * sizeof *defs);
       d->u.handler_decl.def_count = dcnt;
+    }
+    free(defs);
+    p_leave_depth(p);
+    return d;
+  }
+
+  if (t->kind == TOK_KW_TRAIT) {
+    advance(p);
+    StigiDecl *d = p_alloc(p, sizeof *d);
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
+    d->kind = STIGI_DECL_TRAIT;
+    d->span = t->span;
+    d->is_pub = is_pub;
+    d->name = parse_name(p);
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    if (peek(p)->kind == TOK_LBRACKET) {
+      if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
+                            &d->u.trait_decl.type_params, &d->u.trait_decl.type_param_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    }
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
+    skip_newlines(p);
+    const StigiTok *fm = peek(p);
+    if (fm->kind != TOK_KW_DEF || fm->span.col <= decl_col) {
+      p_fail(p, fm->span, "expected indented 'def' operations in trait body");
+      p_leave_depth(p);
+      return NULL;
+    }
+    uint32_t body_col = fm->span.col;
+    StigiDecl **members = NULL;
+    uint32_t mcnt = 0, mcap = 0;
+    for (;;) {
+      const StigiTok *nxt = peek_skip_nl(p);
+      if (nxt->kind != TOK_KW_DEF || nxt->span.col != body_col) break;
+      skip_newlines(p);
+      StigiSpan osp = advance(p)->span;
+      StigiDecl *m = p_alloc(p, sizeof *m);
+      if (m == NULL) { free(members); p_fail_oom(p); p_leave_depth(p); return NULL; }
+      m->kind = STIGI_DECL_DEF;
+      m->span = osp;
+      m->name = parse_name(p);
+      if (p->failed || !parse_def_head(p, false, body_col, &m->u.def_decl.head)) {
+        free(members);
+        p_leave_depth(p);
+        return NULL;
+      }
+      if (mcnt == mcap && !p_grow(p, (void **)&members, &mcap, sizeof *members)) {
+        free(members); p_leave_depth(p); return NULL;
+      }
+      members[mcnt++] = m;
+    }
+    if (mcnt > 0) {
+      d->u.trait_decl.members = p_alloc(p, (size_t)mcnt * sizeof *members);
+      if (d->u.trait_decl.members == NULL) { free(members); p_fail_oom(p); p_leave_depth(p); return NULL; }
+      memcpy(d->u.trait_decl.members, members, (size_t)mcnt * sizeof *members);
+      d->u.trait_decl.member_count = mcnt;
+    }
+    free(members);
+    p_leave_depth(p);
+    return d;
+  }
+
+  if (t->kind == TOK_KW_GIVEN) {
+    advance(p);
+    StigiDecl *d = p_alloc(p, sizeof *d);
+    if (d == NULL) { p_fail_oom(p); p_leave_depth(p); return NULL; }
+    d->kind = STIGI_DECL_GIVEN;
+    d->span = t->span;
+    d->is_pub = is_pub;
+    d->name = parse_name(p);
+    if (p->failed) { p_leave_depth(p); return NULL; }
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind == TOK_LBRACKET) {
+      if (!parse_param_list(p, TOK_LBRACKET, TOK_RBRACKET,
+                            &d->u.given_decl.type_params, &d->u.given_decl.type_param_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    }
+    skip_head_cont_nl(p, decl_col);
+    if (peek(p)->kind == TOK_LBRACE) {
+      if (!parse_cap_group(p, &d->u.given_decl.cap_params, &d->u.given_decl.cap_param_count)) {
+        p_leave_depth(p);
+        return NULL;
+      }
+    }
+    skip_head_cont_nl(p, decl_col);
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
+    d->u.given_decl.trait_type = parse_type(p);
+    if (p->failed || d->u.given_decl.trait_type == NULL) { p_leave_depth(p); return NULL; }
+    d->u.given_decl.trait_name = d->u.given_decl.trait_type->name;
+    if (!expect(p, TOK_COLON)) { p_leave_depth(p); return NULL; }
+    skip_newlines(p);
+    const StigiTok *fm = peek(p);
+    if (fm->kind != TOK_KW_DEF || fm->span.col <= decl_col) {
+      p_fail(p, fm->span, "expected indented 'def' implementations in given body");
+      p_leave_depth(p);
+      return NULL;
+    }
+    uint32_t body_col = fm->span.col;
+    StigiDecl **defs = NULL;
+    uint32_t dcnt = 0, dcap = 0;
+    for (;;) {
+      const StigiTok *nxt = peek_skip_nl(p);
+      if (nxt->kind != TOK_KW_DEF || nxt->span.col != body_col) break;
+      skip_newlines(p);
+      StigiDecl *op = parse_decl(p, false, body_col);
+      if (p->failed) { free(defs); p_leave_depth(p); return NULL; }
+      if (dcnt == dcap && !p_grow(p, (void **)&defs, &dcap, sizeof *defs)) {
+        free(defs); p_leave_depth(p); return NULL;
+      }
+      defs[dcnt++] = op;
+    }
+    if (dcnt > 0) {
+      d->u.given_decl.defs = p_alloc(p, (size_t)dcnt * sizeof *defs);
+      if (d->u.given_decl.defs == NULL) { free(defs); p_fail_oom(p); p_leave_depth(p); return NULL; }
+      memcpy(d->u.given_decl.defs, defs, (size_t)dcnt * sizeof *defs);
+      d->u.given_decl.def_count = dcnt;
     }
     free(defs);
     p_leave_depth(p);

@@ -1,0 +1,22 @@
+// prompt: classify a single-byte punctuation symbol into its token kind or TokEnd if unknown.
+def Stigi.Lex.singlePunct(byte: U8): Stigi.Lex.TokenKind =
+  case 40 => TokLeftParen
+  case 41 => TokRightParen
+  case 91 => TokLeftBrack
+  case 93 => TokRightBrack
+  case 123 => TokLeftBrace
+  case 125 => TokRightBrace
+  case 44 => TokComma
+  case 46 => TokDot
+  case 58 => TokColon
+  case 61 => TokAssign
+  case 60 => TokLess
+  case 62 => TokGreat
+  case 43 => TokPlus
+  case 45 => TokMinus
+  case 42 => TokStar
+  case 47 => TokSlash
+  case 37 => TokPercent
+  case 64 => TokAt
+  case 33 => TokBang
+  case _ => TokEnd

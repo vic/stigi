@@ -1026,6 +1026,227 @@ static void test_wave2_hardening(void) {
   }
 }
 
+static void test_phase2_patterns_multihead_pipe(void) {
+  Diag d;
+  diag_clear(&d);
+
+  /* 1. S119 runtime_id parity: multi-head def == multi-scrutinee match, and pipe == direct call */
+  {
+    StigiImage img1, img2;
+    StigiNameDiags nd1, nd2;
+    stigi_image_init(&img1);
+    stigi_image_init(&img2);
+    stigi_name_diags_init(&nd1);
+    stigi_name_diags_init(&nd2);
+
+    const char *step_u =
+        "// prompt: add delta to base.\n"
+        "def Demo.addDelta(base: U64, delta: U64): U64 = base + delta\n";
+    add_unit(&img1, step_u, &nd1);
+    add_unit(&img1,
+             "// prompt: multi-head classify.\n"
+             "pub def Demo.classify(left: Bool, right: Bool): U64 =\n"
+             "  case (true, true) => 3\n"
+             "  case (true, false) => 2\n"
+             "  case (false, true) => 1\n"
+             "  case (false, false) => 0\n",
+             &nd1);
+    add_unit(&img1,
+             "// prompt: piped add.\n"
+             "pub def Demo.piped(start: U64): U64 =\n"
+             "  start |> Demo.addDelta(5)\n",
+             &nd1);
+    add_unit(&img1,
+             "// prompt: outside reader for pub defs.\n"
+             "val Other.Tests.useBoth {Stigi.Test}: Stigi.Test.Result =\n"
+             "  Stigi.Test.expect(Demo.classify(true, false) + Demo.piped(1), 8, \"2 + 6 == 8\")\n",
+             &nd1);
+
+    add_unit(&img2, step_u, &nd2);
+    add_unit(&img2,
+             "// prompt: explicit multi-scrutinee classify.\n"
+             "pub def Demo.classify(left: Bool, right: Bool): U64 =\n"
+             "  (left, right) match\n"
+             "    case (true, true) => 3\n"
+             "    case (true, false) => 2\n"
+             "    case (false, true) => 1\n"
+             "    case (false, false) => 0\n",
+             &nd2);
+    add_unit(&img2,
+             "// prompt: direct add.\n"
+             "pub def Demo.piped(start: U64): U64 =\n"
+             "  Demo.addDelta(start, 5)\n",
+             &nd2);
+    add_unit(&img2,
+             "// prompt: outside reader for pub defs.\n"
+             "val Other.Tests.useBoth {Stigi.Test}: Stigi.Test.Result =\n"
+             "  Stigi.Test.expect(Demo.classify(true, false) + Demo.piped(1), 8, \"2 + 6 == 8\")\n",
+             &nd2);
+
+    CHECK(stigi_image_resolve(&img1, &nd1, &d) == STIGI_OK && nd1.count == 0, "p2 names img1");
+    CHECK(stigi_image_resolve(&img2, &nd2, &d) == STIGI_OK && nd2.count == 0, "p2 names img2");
+
+    int32_t c1 = stigi_image_find(&img1, "Demo.classify", strlen("Demo.classify"));
+    int32_t c2 = stigi_image_find(&img2, "Demo.classify", strlen("Demo.classify"));
+    CHECK(c1 >= 0 && c2 >= 0 && memcmp(img1.units[c1].unit_id, img2.units[c2].unit_id, 32) == 0,
+          "S119: multi-head def and multi-scrutinee match have identical runtime_id");
+
+    int32_t p1 = stigi_image_find(&img1, "Demo.piped", strlen("Demo.piped"));
+    int32_t p2 = stigi_image_find(&img2, "Demo.piped", strlen("Demo.piped"));
+    CHECK(p1 >= 0 && p2 >= 0 && memcmp(img1.units[p1].unit_id, img2.units[p2].unit_id, 32) == 0,
+          "S119: pipe |> and direct call have identical runtime_id");
+
+    stigi_name_diags_free(&nd1);
+    stigi_name_diags_free(&nd2);
+    stigi_image_free(&img1);
+    stigi_image_free(&img2);
+  }
+
+  /* 2. Maranget exhaustiveness (concrete witness), never-reached, wildcard-arm, and evaluation */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+
+    add_unit(&img,
+             "// prompt: optional word.\n"
+             "enum Demo.Maybe:\n"
+             "  case Some(value: U64)\n"
+             "  case None\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: pair of optional words.\n"
+             "enum Demo.Pair:\n"
+             "  case Pair(first: Demo.Maybe, second: Demo.Maybe)\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: double a word.\n"
+             "def Demo.double(value: U64): U64 = value + value\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: add two words.\n"
+             "def Demo.plus(left: U64, right: U64): U64 = left + right\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: nested match with guard and multi-head def and val-else and pipe.\n"
+             "def Demo.score(pair: Demo.Pair): U64 =\n"
+             "  case Pair(Some(left), Some(right)) if left < right => right |> Demo.plus(left) |> Demo.double\n"
+             "  case Pair(Some(left), Some(right)) => left + right\n"
+             "  case Pair(Some(left), None) => left\n"
+             "  case Pair(None, Some(right)) => right\n"
+             "  case Pair(None, None) => 0\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: val-else chaining.\n"
+             "def Demo.addMaybes(first: Demo.Maybe, second: Demo.Maybe): U64 =\n"
+             "  val Some(left) = first else\n"
+             "    case None => 0\n"
+             "  val Some(right) = second else\n"
+             "    case None => left\n"
+             "  left + right\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: test nested patterns, guards, val-else, pipe.\n"
+             "val Demo.Tests.phaseTwoOk {Stigi.Test}: Stigi.Test.Result =\n"
+             "  val one: U64 = Demo.score(Pair(Some(2), Some(5)))\n"
+             "  val two: U64 = Demo.score(Pair(Some(6), Some(3)))\n"
+             "  val three: U64 = Demo.score(Pair(None, Some(4)))\n"
+             "  val four: U64 = Demo.addMaybes(Some(10), Some(7))\n"
+             "  val five: U64 = Demo.addMaybes(Some(10), None)\n"
+             "  val six: U64 = Demo.addMaybes(None, Some(9))\n"
+             "  Stigi.Test.expect(one + two + three + four + five + six, 14 + 9 + 4 + 17 + 10 + 0, \"all S121-S123 evals match\")\n",
+             &nd);
+
+    CHECK(stigi_image_resolve(&img, &nd, &d) == STIGI_OK && nd.count == 0, "p2 eval names ok");
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK && td.count == 0, "p2 eval types ok");
+    Arena eva;
+    arena_init(&eva);
+    int32_t tidx = stigi_image_find(&img, "Demo.Tests.phaseTwoOk", strlen("Demo.Tests.phaseTwoOk"));
+    CHECK(tidx >= 0, "find phaseTwoOk");
+    StigiEvalResult er = stigi_eval_test(&img, (uint32_t)tidx, STIGI_DEFAULT_FUEL, &eva);
+    if (er.status != STIGI_OK) {
+      fprintf(stderr, "phaseTwoOk eval failed: code=%s msg=%s\n",
+              er.diag_code ? er.diag_code : "NULL", er.msg);
+    }
+    CHECK(er.status == STIGI_OK && er.value.kind == STIGI_VAL_TEST_OK,
+          "Phase 2.2+2.3: nested patterns + guards + multi-head + val-else + pipe evaluate accurately");
+    arena_free(&eva);
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+
+  /* 3. Negative checks: not-exhaustive with witness, never-reached, wildcard-arm */
+  {
+    StigiImage img;
+    StigiNameDiags nd;
+    StigiTypeDiags td;
+    stigi_image_init(&img);
+    stigi_name_diags_init(&nd);
+    stigi_type_diags_init(&td);
+
+    add_unit(&img,
+             "// prompt: optional word.\n"
+             "enum Demo.Maybe:\n"
+             "  case Some(value: U64)\n"
+             "  case None\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: pair.\n"
+             "enum Demo.Pair:\n"
+             "  case Pair(first: Demo.Maybe, second: Demo.Maybe)\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: missing Pair(None, Some(_)).\n"
+             "pub def Demo.missingCase(pair: Demo.Pair): U64 =\n"
+             "  pair match\n"
+             "    case Pair(Some(_), _) => 1\n"
+             "    case Pair(None, None) => 0\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: dead arm.\n"
+             "pub def Demo.deadArm(flag: Bool): U64 =\n"
+             "  flag match\n"
+             "    case true => 1\n"
+             "    case false => 0\n"
+             "    case true => 2\n",
+             &nd);
+    add_unit(&img,
+             "// prompt: wildcard on closed enum.\n"
+             "pub def Demo.wildEnum(item: Demo.Maybe): U64 =\n"
+             "  item match\n"
+             "    case Some(value) => value\n"
+             "    case _ => 0\n",
+             &nd);
+
+    CHECK(stigi_image_resolve(&img, &nd, &d) == STIGI_OK, "p2 neg names");
+    CHECK(stigi_typecheck_image(&img, &td, &d) == STIGI_OK, "p2 neg types");
+    bool got_non_exh = false, got_witness = false, got_dead = false, got_wild = false;
+    for (uint32_t i = 0; i < td.count; i++) {
+      if (td.items[i].code == STIGI_TYPE_NOT_EXHAUSTIVE) {
+        got_non_exh = true;
+        if (strstr(td.items[i].msg, "Pair") != NULL &&
+            strstr(td.items[i].msg, "None") != NULL &&
+            strstr(td.items[i].msg, "Some") != NULL) {
+          got_witness = true;
+        }
+      }
+      if (td.items[i].code == STIGI_TYPE_NEVER_REACHED) got_dead = true;
+      if (td.items[i].code == STIGI_TYPE_WILDCARD_ARM) got_wild = true;
+    }
+    CHECK(got_non_exh && got_witness, "Maranget reports not-exhaustive with concrete witness Pair(None, Some(_))");
+    CHECK(got_dead, "Maranget reports never-reached on shadowed arm");
+    CHECK(got_wild, "Maranget reports wildcard-arm on closed enum");
+
+    stigi_type_diags_free(&td);
+    stigi_name_diags_free(&nd);
+    stigi_image_free(&img);
+  }
+}
+
 int main(void) {
   test_names_lookup_and_id_invariance();
   test_alpha_equiv_and_dep_propagation();
@@ -1035,6 +1256,7 @@ int main(void) {
   test_evaluator();
   test_pro_review_regressions();
   test_wave2_hardening();
+  test_phase2_patterns_multihead_pipe();
 
   if (g_failures == 0) {
     printf("c3_c4_test: ALL PASS\n");

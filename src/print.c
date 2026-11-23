@@ -84,6 +84,7 @@ static const char *op_str(StigiOp op) {
     case STIGI_OP_NE: return "!=";
     case STIGI_OP_AND: return "&&";
     case STIGI_OP_OR: return "||";
+    case STIGI_OP_PIPE: return "|>";
     case STIGI_OP_NOT: return "!";
     case STIGI_OP_NEG: return "-";
   }
@@ -92,20 +93,21 @@ static const char *op_str(StigiOp op) {
 
 static int op_prec(StigiOp op) {
   switch (op) {
-    case STIGI_OP_OR: return 1;
-    case STIGI_OP_AND: return 2;
+    case STIGI_OP_PIPE: return 1;
+    case STIGI_OP_OR: return 2;
+    case STIGI_OP_AND: return 3;
     case STIGI_OP_EQ:
     case STIGI_OP_NE:
     case STIGI_OP_LT:
     case STIGI_OP_LE:
     case STIGI_OP_GT:
-    case STIGI_OP_GE: return 3;
+    case STIGI_OP_GE: return 4;
     case STIGI_OP_ADD:
-    case STIGI_OP_SUB: return 4;
+    case STIGI_OP_SUB: return 5;
     case STIGI_OP_MUL:
     case STIGI_OP_DIV:
-    case STIGI_OP_MOD: return 5;
-    default: return 6;
+    case STIGI_OP_MOD: return 6;
+    default: return 7;
   }
 }
 
@@ -220,14 +222,48 @@ static void print_cap_group(PrintBuf *b, const StigiCapParam *caps, uint32_t cou
 }
 
 static void print_pat(PrintBuf *b, const StigiPat *pat) {
+  if (pat->kind == STIGI_PAT_TUPLE) {
+    pb_char(b, '(');
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      if (i > 0) pb_cstr(b, ", ");
+      print_pat(b, &pat->subpats[i]);
+    }
+    pb_char(b, ')');
+    return;
+  }
   pb_str(b, pat->name);
   if (pat->kind == STIGI_PAT_CTOR && pat->has_parens) {
     pb_char(b, '(');
-    for (uint32_t i = 0; i < pat->field_count; i++) {
-      if (i > 0) pb_cstr(b, ", ");
-      pb_str(b, pat->fields[i]);
+    if (pat->subpat_count > 0) {
+      for (uint32_t i = 0; i < pat->subpat_count; i++) {
+        if (i > 0) pb_cstr(b, ", ");
+        print_pat(b, &pat->subpats[i]);
+      }
+    } else {
+      for (uint32_t i = 0; i < pat->field_count; i++) {
+        if (i > 0) pb_cstr(b, ", ");
+        pb_str(b, pat->fields[i]);
+      }
     }
     pb_char(b, ')');
+  }
+}
+
+static void print_body_after_sep(PrintBuf *b, const StigiExpr *body, uint32_t indent);
+
+static void print_match_arms(PrintBuf *b, const StigiMatchArm *arms, uint32_t count,
+                             uint32_t indent) {
+  for (uint32_t i = 0; i < count; i++) {
+    pb_char(b, '\n');
+    pb_indent(b, indent + 2);
+    pb_cstr(b, "case ");
+    print_pat(b, &arms[i].pat);
+    if (arms[i].guard != NULL) {
+      pb_cstr(b, " if ");
+      print_expr(b, arms[i].guard, indent + 2);
+    }
+    pb_cstr(b, " =>");
+    print_body_after_sep(b, arms[i].body, indent + 2);
   }
 }
 
@@ -399,21 +435,23 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       print_body_after_sep(b, e->u.while_expr.body, indent);
       break;
     case STIGI_EXPR_MATCH: {
-      const StigiExpr *sc = e->u.match_expr.scrutinee;
-      bool spar = (sc->kind == STIGI_EXPR_IF || sc->kind == STIGI_EXPR_WHILE ||
-                   sc->kind == STIGI_EXPR_MATCH || sc->kind == STIGI_EXPR_BLOCK);
-      if (spar) pb_char(b, '(');
-      print_expr(b, sc, indent);
-      if (spar) pb_char(b, ')');
-      pb_cstr(b, " match");
-      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
-        pb_char(b, '\n');
-        pb_indent(b, indent + 2);
-        pb_cstr(b, "case ");
-        print_pat(b, &e->u.match_expr.arms[i].pat);
-        pb_cstr(b, " =>");
-        print_body_after_sep(b, e->u.match_expr.arms[i].body, indent + 2);
+      if (e->u.match_expr.scrutinee_count >= 2 && e->u.match_expr.scrutinees != NULL) {
+        pb_char(b, '(');
+        for (uint32_t i = 0; i < e->u.match_expr.scrutinee_count; i++) {
+          if (i > 0) pb_cstr(b, ", ");
+          print_expr(b, e->u.match_expr.scrutinees[i], indent);
+        }
+        pb_char(b, ')');
+      } else {
+        const StigiExpr *sc = e->u.match_expr.scrutinee;
+        bool spar = (sc->kind == STIGI_EXPR_IF || sc->kind == STIGI_EXPR_WHILE ||
+                     sc->kind == STIGI_EXPR_MATCH || sc->kind == STIGI_EXPR_BLOCK);
+        if (spar) pb_char(b, '(');
+        print_expr(b, sc, indent);
+        if (spar) pb_char(b, ')');
       }
+      pb_cstr(b, " match");
+      print_match_arms(b, e->u.match_expr.arms, e->u.match_expr.arm_count, indent);
       break;
     }
     case STIGI_EXPR_VAL:
@@ -425,6 +463,10 @@ static void print_expr(PrintBuf *b, const StigiExpr *e, uint32_t indent) {
       }
       pb_cstr(b, " =");
       print_body_after_sep(b, e->u.val_stmt.init, indent);
+      if (e->u.val_stmt.else_arm_count > 0) {
+        pb_cstr(b, " else");
+        print_match_arms(b, e->u.val_stmt.else_arms, e->u.val_stmt.else_arm_count, indent);
+      }
       break;
     case STIGI_EXPR_VAR:
       pb_cstr(b, "var ");
@@ -574,7 +616,10 @@ static void print_decl(PrintBuf *b, const StigiDecl *d, uint32_t indent) {
       pb_cstr(b, "def ");
       pb_str(b, d->name);
       print_def_head(b, &d->u.def_decl.head, false);
-      if (d->u.def_decl.body != NULL) {
+      if (d->u.def_decl.clause_count > 0) {
+        pb_cstr(b, " =");
+        print_match_arms(b, d->u.def_decl.clauses, d->u.def_decl.clause_count, indent);
+      } else if (d->u.def_decl.body != NULL) {
         pb_cstr(b, " =");
         print_body_after_sep(b, d->u.def_decl.body, indent);
       }
@@ -583,7 +628,10 @@ static void print_decl(PrintBuf *b, const StigiDecl *d, uint32_t indent) {
       pb_cstr(b, "lemma def ");
       pb_str(b, d->name);
       print_def_head(b, &d->u.def_decl.head, true);
-      if (d->u.def_decl.body != NULL) {
+      if (d->u.def_decl.clause_count > 0) {
+        pb_cstr(b, " =");
+        print_match_arms(b, d->u.def_decl.clauses, d->u.def_decl.clause_count, indent);
+      } else if (d->u.def_decl.body != NULL) {
         pb_cstr(b, " =");
         print_body_after_sep(b, d->u.def_decl.body, indent);
       }
@@ -716,6 +764,44 @@ static void print_decl(PrintBuf *b, const StigiDecl *d, uint32_t indent) {
         pb_char(b, '\n');
         pb_indent(b, indent + 2);
         print_decl(b, d->u.handler_decl.defs[i], indent + 2);
+      }
+      break;
+    case STIGI_DECL_TRAIT:
+      pb_cstr(b, "trait ");
+      pb_str(b, d->name);
+      if (d->u.trait_decl.type_param_count > 0) {
+        pb_char(b, ' ');
+        print_params(b, '[', ']', d->u.trait_decl.type_params, d->u.trait_decl.type_param_count);
+      }
+      pb_char(b, ':');
+      for (uint32_t i = 0; i < d->u.trait_decl.member_count; i++) {
+        pb_char(b, '\n');
+        pb_indent(b, indent + 2);
+        print_decl(b, d->u.trait_decl.members[i], indent + 2);
+      }
+      break;
+    case STIGI_DECL_GIVEN:
+      pb_cstr(b, "given ");
+      pb_str(b, d->name);
+      if (d->u.given_decl.type_param_count > 0) {
+        pb_char(b, ' ');
+        print_params(b, '[', ']', d->u.given_decl.type_params, d->u.given_decl.type_param_count);
+      }
+      if (d->u.given_decl.cap_param_count > 0) {
+        pb_char(b, ' ');
+        print_cap_group(b, d->u.given_decl.cap_params, d->u.given_decl.cap_param_count);
+      }
+      pb_cstr(b, ": ");
+      if (d->u.given_decl.trait_type != NULL) {
+        print_type(b, d->u.given_decl.trait_type);
+      } else {
+        pb_str(b, d->u.given_decl.trait_name);
+      }
+      pb_char(b, ':');
+      for (uint32_t i = 0; i < d->u.given_decl.def_count; i++) {
+        pb_char(b, '\n');
+        pb_indent(b, indent + 2);
+        print_decl(b, d->u.given_decl.defs[i], indent + 2);
       }
       break;
     case STIGI_DECL_EXTERN:

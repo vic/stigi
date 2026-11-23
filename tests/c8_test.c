@@ -121,9 +121,9 @@ int main(void) {
 
   const char *u_alloc_use =
       "// prompt: allocate a 64-byte cache-line aligned stack buffer via Array.tryFill.\n"
-      "pub def Demo.allocAndRead {region: Stigi.Region} () <lessOrEqual(0, 1)>: U8 =\n"
+      "pub def Demo.allocAndRead {region: Stigi.Region} (slot: U64) <below(slot, 64)>: U8 =\n"
       "  Array.tryFill{region}(64, 'Z') match\n"
-      "    case Filled(buffer) => buffer(0)\n"
+      "    case Filled(buffer) => buffer(slot)\n"
       "    case FillFailed => 0\n";
 
   const char *u_alloc_dyn =
@@ -146,7 +146,7 @@ int main(void) {
 
   const char *u_extract =
       "// prompt: extract value from tag enum.\n"
-      "pub def Demo.extractTag(item: Demo.Tag) <lessOrEqual(0, 1)>: U64 =\n"
+      "pub def Demo.extractTag(item: Demo.Tag): U64 =\n"
       "  item match\n"
       "    case Number(value) => value\n"
       "    case Mixed(_, _, _) => 1\n"
@@ -154,7 +154,7 @@ int main(void) {
 
   const char *u_extract_tail =
       "// prompt: extract word from tail-packed enum using expression-position and integer match.\n"
-      "pub def Demo.extractTail(packed: Demo.TailPack) <lessOrEqual(0, 1)>: U64 =\n"
+      "pub def Demo.extractTail(packed: Demo.TailPack): U64 =\n"
       "  val chosen: U64 = packed match\n"
       "    case Wide(word, flag) =>\n"
       "      flag match\n"
@@ -165,7 +165,7 @@ int main(void) {
 
   const char *u_signed =
       "// prompt: signed negative literal comparison.\n"
-      "pub def Demo.signCheck(value: I32) <lessOrEqual(0, 1)>: I32 =\n"
+      "pub def Demo.signCheck(value: I32): I32 =\n"
       "  if value < 0 then -1 else 1\n";
 
   const char *u_at =
@@ -190,9 +190,9 @@ int main(void) {
 
   const char *u_apply_wrap =
       "// prompt: void match over BufferWrap (Defects 3 and 4).\n"
-      "pub def Demo.applyWrap {file: Stigi.File, mut: Stigi.Mut} (wrap: Demo.BufferWrap) <lessOrEqual(0, 1)>: Unit =\n"
+      "pub def Demo.applyWrap {file: Stigi.File, mut: Stigi.Mut} (wrap: Demo.BufferWrap, slot: U64) <below(slot, 4)>: Unit =\n"
       "  wrap match\n"
-      "    case Slice(data) => Demo.taintedWrite(4, data, 0, 1)\n"
+      "    case Slice(data) => Demo.taintedWrite(4, data, slot, 1)\n"
       "    case Absent => ()\n";
 
   const char *u_tailsum_ok =
@@ -210,21 +210,57 @@ int main(void) {
       "pub lemma def Demo.zeroBound(value: U64) <lessOrEqual(0, value)>: <lessOrEqual(0, value)> =\n"
       "  @<lessOrEqual(0, value)>\n";
 
+  const char *u_add_one =
+      "// prompt: add offset to bounded value.\n"
+      "def Demo.plusBound(value: U64, offset: U64) <below(value, 1000), below(offset, 1000)>: U64 =\n"
+      "  value + offset\n";
+
+  const char *u_eq_trait =
+      "// prompt: equality trait protocol for C11 direct given dispatch.\n"
+      "pub trait Demo.Equal [A: Type]:\n"
+      "  def equal(left: A, right: A): Bool\n";
+
+  const char *u_eq_word =
+      "// prompt: concrete equality given for U64 words.\n"
+      "pub given Demo.Equal.Word: Demo.Equal[U64]:\n"
+      "  def equal(left: U64, right: U64): Bool = left == right\n";
+
+  const char *u_multi_head =
+      "// prompt: Erlang-style multi-head function with pipe and val-else.\n"
+      "pub def Demo.modernFlow {region: Stigi.Region} (item: Demo.Tag, flag: Bool): U64 <lessOrEqual(0, result)> =\n"
+      "  case (Number(value), true) if value < 100 =>\n"
+      "    val Filled(words) = Array.tryFill{region}(4, value) else\n"
+      "      case FillFailed => 0\n"
+      "    val elem: U64 = words(2)\n"
+      "    if elem < 100 then elem |> Demo.plusBound(10) else 0\n"
+      "  case (Number(_), true) => 1\n"
+      "  case (Number(_), false) => 2\n"
+      "  case (Mixed(_, _, _), _) => 3\n"
+      "  case (Empty, _) => 4\n";
+
   const char *u_test_ok =
-      "// prompt: verify countDown and extractTag.\n"
+      "// prompt: verify countDown, extractTag, modernFlow, and trait given dispatch.\n"
       "val Demo.Tests.checkAll {Stigi.Test}: Stigi.Test.Result =\n"
-      "  Stigi.Test.expect(Demo.countDown(5) + Demo.extractTag(Number(7)), 7, \"0 + 7 == 7\")\n";
+      "  val flowOut: U64 = Demo.modernFlow{Stigi.Region}(Number(7), true)\n"
+      "  val equalMatch: Bool = Demo.Equal.equal(flowOut, 17)\n"
+      "  val total: U64 = Demo.countDown(5) + Demo.extractTag(Number(7)) + (if equalMatch then flowOut else 0)\n"
+      "  Stigi.Test.expect(total, 24, \"0 + 7 + 17 == 24\")\n";
 
   const char *u_main_ok =
       "// prompt: program entry exercising all lowered constructs.\n"
-      "pub def main {file: Stigi.File, mut: Stigi.Mut, region: Stigi.Region} () <lessOrEqual(0, 1)>: I32 =\n"
+      "pub def main {file: Stigi.File, mut: Stigi.Mut, region: Stigi.Region} (): I32 <lessOrEqual(0, result)> =\n"
       "  Demo.zeroBound(5)\n"
       "  Demo.voidCount(3)\n"
-      "  Demo.applyWrap(Absent)\n"
+      "  Demo.applyWrap(Absent, 0)\n"
+      "  val enumArrayGood: Bool = Array.tryFill(4, Number(42)) match\n"
+      "    case Filled(tags) => Demo.extractTag(tags(2)) == 42\n"
+      "    case FillFailed => false\n"
+      "  val modernOut: U64 = Demo.modernFlow(Number(7), true)\n"
+      "  val givenEqualGood: Bool = Demo.Equal.equal(modernOut, 17)\n"
       "  val first: U8 = Demo.byteAt(3, \"abc\", 0)\n"
       "  val second: U8 = Demo.taintedAt(3, \"abc\", 1)\n"
       "  val guarded: U8 = Demo.taintedGuarded(3, \"abc\", 2)\n"
-      "  val filledByte: U8 = Demo.allocAndRead()\n"
+      "  val filledByte: U8 = Demo.allocAndRead(0)\n"
       "  val dynamicByte: U8 = Demo.allocLoop(200, 64)\n"
       "  val done: U64 = Demo.countDown(5)\n"
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
@@ -233,21 +269,22 @@ int main(void) {
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
       "  val signedCompareTrue: Bool = (-5 < 0)\n"
-      "  if done == 0 && tagVal == 7 && tailVal == 9 && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
+      "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[22] = {
+  const char *all_srcs[26] = {
       u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
       u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
       u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
       u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail,   u_lemma,
-      u_test_ok,         u_main_ok
+      u_add_one,         u_eq_trait,    u_eq_word,       u_multi_head,  u_test_ok,
+      u_main_ok
   };
-  size_t all_lens[22];
-  for (int i = 0; i < 22; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[26];
+  for (int i = 0; i < 26; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 22, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 26, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",

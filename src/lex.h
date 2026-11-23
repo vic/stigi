@@ -37,6 +37,7 @@ typedef enum {
   TOK_KW_EXTERN,
   TOK_KW_FALSE,
   TOK_KW_FOR,
+  TOK_KW_GIVEN,
   TOK_KW_HANDLE,
   TOK_KW_HANDLER,
   TOK_KW_IF,
@@ -50,6 +51,7 @@ typedef enum {
   TOK_KW_STATE,
   TOK_KW_STOP,
   TOK_KW_THEN,
+  TOK_KW_TRAIT,
   TOK_KW_TRUE,
   TOK_KW_TYPE,
   TOK_KW_VAL,
@@ -82,6 +84,7 @@ typedef enum {
   TOK_NE,        /* != */
   TOK_AND,       /* && */
   TOK_OR,        /* || */
+  TOK_PIPE_GT,   /* |> */
   TOK_BANG       /* ! */
 } StigiTokKind;
 

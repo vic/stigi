@@ -338,7 +338,7 @@ int main(void) {
 
     const char *i64_min_ok =
         "// prompt: exact I64 minimum literal.\n"
-        "pub def main(value: I64) <lessOrEqual(0, 1)>: I64 =\n"
+        "pub def main(value: I64): I64 <lessOrEqual(-9223372036854775808, result)> =\n"
         "  if value < 0 then -9223372036854775808 else value\n";
     srcs[0] = i64_min_ok;
     lens[0] = strlen(i64_min_ok);
@@ -383,7 +383,7 @@ int main(void) {
     /* 9d. Real D1 unit: Stigi.Lex.step (while + && + invariant + decreases(len - pos)) */
     const char *d1_is_ident =
         "// prompt: return true when byte is ASCII identifier byte.\n"
-        "def Stigi.Lex.isIdentByte(byte: U8) <lessOrEqual(byte, byte)>: Bool =\n"
+        "def Stigi.Lex.isIdentByte(byte: U8): Bool =\n"
         "  (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '_' || byte == '.'\n";
     const char *d1_lex_step =
         "// prompt: scan one identifier span forward in source starting at start.\n"
@@ -590,6 +590,258 @@ int main(void) {
           "Wave 3: dropping root tree-shakes orphaned private helper");
     stigi_door_result_free(&r);
     stigi_door_free(&ddoor);
+  }
+
+  /* 9h. Phase 2.1 oracles: fact-idle, (A || B) && C, val Ctor, nominal type T = U <facts>, protocol-only sigs */
+  {
+    StigiDoor p2door;
+    CHECK(stigi_door_init(&p2door, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &d) == STIGI_OK,
+          "init p2door");
+    const char *p2s[6];
+    size_t p2l[6];
+    StigiDoorResult r;
+
+    /* (a) fact-idle rejects vacuous <lessOrEqual(0, 1)> */
+    const char *vac_bad =
+        "// prompt: vacuous fact must be rejected.\n"
+        "pub def main(value: U64) <lessOrEqual(0, 1)>: U64 = value\n";
+    p2s[0] = vac_bad; p2l[0] = strlen(vac_bad);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 1, &r, &d) == STIGI_OK, "check vac_bad");
+    CHECK(!r.accepted && has_reject_code(&r, "fact-idle"),
+          "Phase 2.1: vacuous <lessOrEqual(0, 1)> rejected with fact-idle");
+    stigi_door_result_free(&r);
+
+    /* (b) (A || B) && C credits C into then-branch without NULL-scope disconnect */
+    const char *or_and_ok =
+        "// prompt: disjunction before conjunction preserves inner bounds.\n"
+        "pub def main(flagOne: Bool, flagTwo: Bool, count: U64, items: Array[U64](count), index: U64): U64 <lessOrEqual(0, result)> =\n"
+        "  if (flagOne || flagTwo) && index < count then items(index) else 0\n";
+    p2s[0] = or_and_ok; p2l[0] = strlen(or_and_ok);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 1, &r, &d) == STIGI_OK, "check or_and_ok");
+    if (!r.accepted) dump_rejects("or_and_ok", &r);
+    CHECK(r.accepted, "Phase 2.1: (A || B) && C credits C cleanly");
+    stigi_door_result_free(&r);
+
+    /* (c) val Ctor(a, b) = expr destructuring carries array length & enum case facts */
+    const char *pair_enum =
+        "// prompt: single-case enum carrying slice and valid index.\n"
+        "pub enum Demo.SliceView:\n"
+        "  case View(count: U64, items: Array[U64](count), index: U64) <below(index, count)>\n";
+    const char *val_ctor_ok =
+        "// prompt: destructure single-case enum with val and index directly.\n"
+        "pub def main(view: Demo.SliceView): U64 <lessOrEqual(0, result)> =\n"
+        "  val View(count, items, index) = view\n"
+        "  items(index)\n";
+    p2s[0] = pair_enum; p2l[0] = strlen(pair_enum);
+    p2s[1] = val_ctor_ok; p2l[1] = strlen(val_ctor_ok);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 2, &r, &d) == STIGI_OK, "check val_ctor_ok");
+    if (!r.accepted) dump_rejects("val_ctor_ok", &r);
+    CHECK(r.accepted, "Phase 2.1: val Ctor(...) destructuring carries array length & case facts");
+    stigi_door_result_free(&r);
+
+    /* (d) nominal refinement type T = U <facts> credits on entry and owes refinement-unproved */
+    const char *ref_ty =
+        "// prompt: refined index bounded below 10.\n"
+        "pub type Demo.Small = U64 <below(self, 10)>\n";
+    const char *ref_ok =
+        "// prompt: refined parameter proves safe addition without explicit entry group.\n"
+        "pub def main(small: Demo.Small): U64 = small + 1\n";
+    const char *ref_bad =
+        "// prompt: unguarded return into refined type must fail refinement-unproved.\n"
+        "pub def main(raw: U64): Demo.Small = raw\n";
+    p2s[0] = ref_ty; p2l[0] = strlen(ref_ty);
+    p2s[1] = ref_ok; p2l[1] = strlen(ref_ok);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 2, &r, &d) == STIGI_OK, "check ref_ok");
+    if (!r.accepted) dump_rejects("ref_ok", &r);
+    CHECK(r.accepted, "Phase 2.1: nominal type T = U <facts> credits entry bound");
+    stigi_door_result_free(&r);
+
+    p2s[1] = ref_bad; p2l[1] = strlen(ref_bad);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 2, &r, &d) == STIGI_OK, "check ref_bad");
+    CHECK(!r.accepted && has_reject_code(&r, "refinement-unproved"),
+          "Phase 2.1: unguarded conversion to refined type rejected with refinement-unproved");
+    stigi_door_result_free(&r);
+
+    /* (e) protocol-only capability signature rejects concrete handler in {...} */
+    const char *cap_u =
+        "// prompt: counter capability protocol.\n"
+        "capability Demo.Counter:\n"
+        "  def next(): U64\n";
+    const char *hdl_u =
+        "// prompt: concrete handler for Demo.Counter.\n"
+        "pub handler Demo.MemCounter(initial: U64) for Demo.Counter:\n"
+        "  var current: U64 = initial\n"
+        "  def next(): U64 = current\n";
+    const char *bad_proto =
+        "// prompt: signature naming concrete handler must fail concrete-protocol-in-signature.\n"
+        "pub def main {counter: Demo.MemCounter} (): U64 <lessOrEqual(0, result)> = 0\n";
+    p2s[0] = cap_u; p2l[0] = strlen(cap_u);
+    p2s[1] = hdl_u; p2l[1] = strlen(hdl_u);
+    p2s[2] = bad_proto; p2l[2] = strlen(bad_proto);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p2s, p2l, 3, &r, &d) == STIGI_OK, "check bad_proto");
+    if (!has_reject_code(&r, "concrete-protocol-in-signature")) dump_rejects("bad_proto", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "concrete-protocol-in-signature"),
+          "Phase 2.1: concrete handler in signature rejected with concrete-protocol-in-signature");
+    stigi_door_result_free(&r);
+
+    /* (f) Phase 2.2+2.3: nested case facts + if-guard bounds + val-else Array.tryFill + multi-head + pipe */
+    const char *wrap_enum =
+        "// prompt: outer wrapper around verified slice view.\n"
+        "pub enum Demo.WrappedSlice:\n"
+        "  case Wrapped(view: Demo.SliceView, bonus: U64)\n"
+        "  case EmptySlice\n";
+    const char *region_u =
+        "// prompt: minimal region capability for val-else allocation.\n"
+        "pub capability Stigi.Region:\n"
+        "  def scratch(): U64\n";
+    const char *add_u =
+        "// prompt: add two words with overflow bound.\n"
+        "pub def Demo.bump(value: U64, delta: U64) <below(value, 1000), below(delta, 1000)>: U64 =\n"
+        "  value + delta\n";
+    const char *p22_ok =
+        "// prompt: nested pattern case facts, guard bounds, val-else alloc, multi-head, pipe.\n"
+        "pub def main {region: Stigi.Region} (wrap: Demo.WrappedSlice, extra: U64) <below(extra, 100)>: U64 =\n"
+        "  val base: U64 = wrap match\n"
+        "    case Wrapped(View(count, items, index), bonus) if bonus < 100 =>\n"
+        "      val elem: U64 = items(index)\n"
+        "      if elem < 500 then elem |> Demo.bump(bonus) else bonus\n"
+        "    case Wrapped(View(_, _, _), _) => 0\n"
+        "    case EmptySlice => 0\n"
+        "  val Filled(scratch) = Array.tryFill{region}(4, extra) else\n"
+        "    case FillFailed => base\n"
+        "  scratch(0)\n";
+    const char *p22s[5] = {pair_enum, wrap_enum, region_u, add_u, p22_ok};
+    size_t p22l[5];
+    for (int i = 0; i < 5; i++) p22l[i] = strlen(p22s[i]);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, p22s, p22l, 5, &r, &d) == STIGI_OK, "check p22_ok");
+    if (!r.accepted) dump_rejects("p22_ok", &r);
+    CHECK(r.accepted, "Phase 2.2+2.3: nested case facts + guard bounds + val-else + pipe pass full door+tupu");
+    stigi_door_result_free(&r);
+
+    /* (g) Phase 2.4 (S125): trait/given + Bezem-bounded uKanren pos + all 5 neg codes */
+    const char *eq_trait =
+        "// prompt: structural equality trait protocol.\n"
+        "pub trait Demo.Equal [A: Type]:\n"
+        "  def equal(left: A, right: A): Bool\n";
+    const char *eq_word =
+        "// prompt: equality given for U64 words.\n"
+        "pub given Demo.Equal.Word: Demo.Equal[U64]:\n"
+        "  def equal(left: U64, right: U64): Bool = left == right\n";
+    const char *maybe_enum =
+        "// prompt: generic optional container.\n"
+        "pub enum Demo.Maybe [A: Type]:\n"
+        "  case Some(value: A)\n"
+        "  case None\n";
+    const char *eq_maybe =
+        "// prompt: recursive equality given for Demo.Maybe.\n"
+        "pub given Demo.Equal.Maybe [A: Type] {Demo.Equal[A]}: Demo.Equal[Demo.Maybe[A]]:\n"
+        "  def equal(left: Demo.Maybe[A], right: Demo.Maybe[A]): Bool =\n"
+        "    case (Some(first), Some(second)) => Demo.Equal.equal(first, second)\n"
+        "    case (None, None) => true\n"
+        "    case (Some(_), None) => false\n"
+        "    case (None, Some(_)) => false\n";
+    const char *same_def =
+        "// prompt: generic helper requiring implicit Demo.Equal protocol.\n"
+        "pub def Demo.same [A: Type] {Demo.Equal[A]} (first: A, second: A): Bool =\n"
+        "  Demo.Equal.equal(first, second)\n";
+    const char *eq_test_ok =
+        "// prompt: verify uKanren concrete and recursive given resolution.\n"
+        "val App.Tests.givenPass {Stigi.Test}: Stigi.Test.Result =\n"
+        "  val direct: Bool = Demo.same[U64](7, 7)\n"
+        "  val nested: Bool = Demo.Equal.equal[Demo.Maybe[U64]](Some(9), Some(9))\n"
+        "  val diff: Bool = Demo.Equal.equal[Demo.Maybe[U64]](Some(9), None)\n"
+        "  Stigi.Test.expect(direct && nested && !diff, true, \"uKanren resolves concrete and recursive givens\")\n";
+    const char *kpos[6] = {eq_trait, eq_word, maybe_enum, eq_maybe, same_def, eq_test_ok};
+    size_t kposl[6];
+    for (int i = 0; i < 6; i++) kposl[i] = strlen(kpos[i]);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kpos, kposl, 6, &r, &d) == STIGI_OK, "check kanren pos");
+    if (!r.accepted) dump_rejects("kanren_pos", &r);
+    CHECK(r.accepted, "Phase 2.4: trait/given + recursive uKanren + Test eval pass full door+tupu");
+    stigi_door_result_free(&r);
+
+    /* NEG 1: no-given */
+    const char *neg_no_given =
+        "// prompt: call Demo.Equal.equal on Bool with no given.\n"
+        "pub def main(): Bool = Demo.Equal.equal(true, false)\n";
+    const char *kn1[3] = {eq_trait, eq_word, neg_no_given};
+    size_t kn1l[3] = {strlen(kn1[0]), strlen(kn1[1]), strlen(kn1[2])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn1, kn1l, 3, &r, &d) == STIGI_OK, "check no-given");
+    if (!has_reject_code(&r, "no-given")) dump_rejects("no-given", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "no-given"), "Phase 2.4: missing given rejected with no-given");
+    stigi_door_result_free(&r);
+
+    /* NEG 2: ambiguous-givens */
+    const char *eq_word_dup =
+        "// prompt: competing equality given for U64 words.\n"
+        "pub given Demo.Equal.WordAlt: Demo.Equal[U64]:\n"
+        "  def equal(left: U64, right: U64): Bool = left == right\n";
+    const char *use_word_eq =
+        "// prompt: call Demo.Equal.equal on U64 with two competing givens.\n"
+        "pub def main(): Bool = Demo.Equal.equal(3, 3)\n";
+    const char *kn2[4] = {eq_trait, eq_word, eq_word_dup, use_word_eq};
+    size_t kn2l[4] = {strlen(kn2[0]), strlen(kn2[1]), strlen(kn2[2]), strlen(kn2[3])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn2, kn2l, 4, &r, &d) == STIGI_OK, "check ambiguous-givens");
+    if (!has_reject_code(&r, "ambiguous-givens")) dump_rejects("ambiguous-givens", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "ambiguous-givens"),
+          "Phase 2.4: competing givens rejected with ambiguous-givens");
+    stigi_door_result_free(&r);
+
+    /* NEG 3: given-fuel (cyclic non-decreasing given) */
+    const char *eq_loop =
+        "// prompt: cyclic given that triggers Bezem fuel limit.\n"
+        "pub given Demo.Equal.Cycle [A: Type] {Demo.Equal[A]}: Demo.Equal[A]:\n"
+        "  def equal(left: A, right: A): Bool = Demo.Equal.equal(left, right)\n";
+    const char *kn3[3] = {eq_trait, eq_loop, neg_no_given};
+    size_t kn3l[3] = {strlen(kn3[0]), strlen(kn3[1]), strlen(kn3[2])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn3, kn3l, 3, &r, &d) == STIGI_OK, "check given-fuel");
+    if (!has_reject_code(&r, "given-fuel")) dump_rejects("given-fuel", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "given-fuel"),
+          "Phase 2.4: cyclic given rejected with given-fuel");
+    stigi_door_result_free(&r);
+
+    /* NEG 4: given-row (effectful capability in given) */
+    const char *eq_eff =
+        "// prompt: effectful given carrying Stigi.Mut must fail given-row.\n"
+        "pub given Demo.Equal.Effectful {Stigi.Mut}: Demo.Equal[U64]:\n"
+        "  def equal(left: U64, right: U64): Bool = left == right\n";
+    const char *kn4[3] = {eq_trait, eq_eff, use_word_eq};
+    size_t kn4l[3] = {strlen(kn4[0]), strlen(kn4[1]), strlen(kn4[2])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn4, kn4l, 3, &r, &d) == STIGI_OK, "check given-row");
+    if (!has_reject_code(&r, "given-row")) dump_rejects("given-row", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "given-row"),
+          "Phase 2.4: effectful given rejected with given-row");
+    stigi_door_result_free(&r);
+
+    /* NEG 5: concrete-protocol-in-signature for given */
+    const char *eq_trait_priv =
+        "// prompt: private equality trait protocol.\n"
+        "trait Demo.Equal [A: Type]:\n"
+        "  def equal(left: A, right: A): Bool\n";
+    const char *bad_given_sig =
+        "// prompt: signature naming concrete given must fail concrete-protocol-in-signature.\n"
+        "pub def main {wordEqual: Demo.Equal.Word} (): Bool = true\n";
+    const char *kn5[3] = {eq_trait_priv, eq_word, bad_given_sig};
+    size_t kn5l[3] = {strlen(kn5[0]), strlen(kn5[1]), strlen(kn5[2])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn5, kn5l, 3, &r, &d) == STIGI_OK, "check concrete given sig");
+    if (!has_reject_code(&r, "concrete-protocol-in-signature")) dump_rejects("concrete_given_sig", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "concrete-protocol-in-signature"),
+          "Phase 2.4: concrete given in signature rejected with concrete-protocol-in-signature");
+    stigi_door_result_free(&r);
+
+    stigi_door_free(&p2door);
   }
 
   /* 10. C7 export parity: export to /tmp/stigi-c7-export, run tupu CLI, assert EXACTLY 0 reject rows */

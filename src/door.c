@@ -366,6 +366,14 @@ static void resolve_rel_dl_name(const StigiImage *img, uint32_t from_idx, const 
     char tmp[160];
     memcpy(tmp, src, len);
     tmp[len] = '\0';
+    if (strcmp(tmp, "lessOrEqual") == 0 && dl_decl_exists(base_dl, "leq")) {
+      memcpy(out, "leq", 4U);
+      return;
+    }
+    if (strcmp(tmp, "notEqual") == 0 && dl_decl_exists(base_dl, "neq")) {
+      memcpy(out, "neq", 4U);
+      return;
+    }
     if (dl_decl_exists(base_dl, tmp)) {
       memcpy(out, tmp, len + 1U);
       return;
@@ -610,6 +618,11 @@ static bool code_has_clearing_rule_in(const char *rules_dl, const char *code) {
     }
   }
 
+  /* Door-sweep codes have no Datalog clearing rule by design (S28, S124) */
+  if (strcmp(code, "fact-idle") == 0 || strcmp(code, "rule-idle") == 0) {
+    return true;
+  }
+
   /* Scan rule heads: line/statement starts with `cleared(` followed by `arg0, "<code>")` then `:-` or `.` */
   const char *p = rules_dl;
   while (*p != '\0') {
@@ -667,6 +680,75 @@ static bool is_kernel_head_name(const StigiImage *img, uint32_t from_idx, StigiS
     return true;
   }
   return false;
+}
+
+static bool fact_item_is_vacuous(const StigiFactItem *it) {
+  if (it == NULL) return false;
+  if (it->kind == STIGI_FACT_ATOM && it->arg_count == 2 &&
+      (str_eq_c(it->atom_name, "lessOrEqual") || str_eq_c(it->atom_name, "Stigi.Facts.lessOrEqual") ||
+       str_eq_c(it->atom_name, "below") || str_eq_c(it->atom_name, "Stigi.Facts.below"))) {
+    const StigiExpr *a = it->args[0];
+    const StigiExpr *b = it->args[1];
+    if (a != NULL && b != NULL) {
+      if (a->kind == STIGI_EXPR_LIT_INT && b->kind == STIGI_EXPR_LIT_INT) return true;
+      if ((str_eq_c(it->atom_name, "lessOrEqual") ||
+           str_eq_c(it->atom_name, "Stigi.Facts.lessOrEqual")) &&
+          (a->kind == STIGI_EXPR_LOCAL || a->kind == STIGI_EXPR_GLOBAL) &&
+          (b->kind == STIGI_EXPR_LOCAL || b->kind == STIGI_EXPR_GLOBAL) &&
+          a->u.ident.name.len == b->u.ident.name.len &&
+          memcmp(a->u.ident.name.ptr, b->u.ident.name.ptr, a->u.ident.name.len) == 0) {
+        return true;
+      }
+    }
+  }
+  if (it->kind == STIGI_FACT_CMP && it->lhs != NULL && it->rhs != NULL) {
+    if (it->lhs->kind == STIGI_EXPR_LIT_INT && it->rhs->kind == STIGI_EXPR_LIT_INT) return true;
+  }
+  return false;
+}
+
+static bool fact_group_has_vacuous(const StigiFactGroup *fg) {
+  if (fg == NULL) return false;
+  for (uint32_t i = 0; i < fg->count; i++) {
+    if (fact_item_is_vacuous(&fg->items[i])) return true;
+  }
+  return false;
+}
+
+static bool expr_has_vacuous_fact(const StigiExpr *e, int depth) {
+  if (e == NULL || depth > 128) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_ASSERT:
+      if (fact_group_has_vacuous(&e->u.assert_expr.facts)) return true;
+      return expr_has_vacuous_fact(e->u.assert_expr.expr, depth + 1);
+    case STIGI_EXPR_VAR:
+      if (e->u.var_stmt.has_inv && fact_group_has_vacuous(&e->u.var_stmt.inv)) return true;
+      return expr_has_vacuous_fact(e->u.var_stmt.init, depth + 1);
+    case STIGI_EXPR_VAL:
+      return expr_has_vacuous_fact(e->u.val_stmt.init, depth + 1);
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        if (expr_has_vacuous_fact(e->u.block.stmts[i], depth + 1)) return true;
+      }
+      return false;
+    case STIGI_EXPR_IF:
+      return expr_has_vacuous_fact(e->u.if_expr.cond, depth + 1) ||
+             expr_has_vacuous_fact(e->u.if_expr.then_br, depth + 1) ||
+             expr_has_vacuous_fact(e->u.if_expr.else_br, depth + 1);
+    case STIGI_EXPR_WHILE:
+      return expr_has_vacuous_fact(e->u.while_expr.cond, depth + 1) ||
+             expr_has_vacuous_fact(e->u.while_expr.body, depth + 1);
+    case STIGI_EXPR_MATCH:
+      if (expr_has_vacuous_fact(e->u.match_expr.scrutinee, depth + 1)) return true;
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        if (expr_has_vacuous_fact(e->u.match_expr.arms[i].body, depth + 1)) return true;
+      }
+      return false;
+    case STIGI_EXPR_HANDLE:
+      return expr_has_vacuous_fact(e->u.handle_stmt.body, depth + 1);
+    default:
+      return false;
+  }
 }
 
 static Status check_boundary_rules(const StigiImage *cand, bool kernel_mode,
@@ -741,6 +823,28 @@ static Status check_boundary_rules(const StigiImage *cand, bool kernel_mode,
         st = add_reject(out, fu->name, "extern-outside-handler",
                         "body-less extern may only be called from a handler or Stigi.*", diag);
       }
+    }
+  }
+  /* S124: reject vacuous / tautological facts (`<lessOrEqual(0, 1)>`, `<lessOrEqual(x, x)>`) as fact-idle */
+  for (uint32_t i = 0; i < cand->unit_count && st == STIGI_OK; i++) {
+    const StigiImageUnit *u = &cand->units[i];
+    const StigiDecl *d = u->ast->decl;
+    if (d->kind != STIGI_DECL_DEF) continue;
+    const StigiDefHead *h = &d->u.def_decl.head;
+    bool idle = false;
+    for (uint32_t g = 0; g < h->pre_group_count && !idle; g++) {
+      if (h->pre_groups[g].is_fact && fact_group_has_vacuous(&h->pre_groups[g].facts)) idle = true;
+    }
+    for (uint32_t g = 0; g < h->post_val_fact_count && !idle; g++) {
+      if (fact_group_has_vacuous(&h->post_val_facts[g])) idle = true;
+    }
+    for (uint32_t g = 0; g < h->exit_fact_count && !idle; g++) {
+      if (fact_group_has_vacuous(&h->exit_facts[g])) idle = true;
+    }
+    if (!idle && expr_has_vacuous_fact(stigi_def_body(d), 0)) idle = true;
+    if (idle) {
+      st = add_reject(out, u->name, "fact-idle",
+                      "vacuous or tautological fact contributes nothing to verification (S124)", diag);
     }
   }
   return st;
@@ -1731,6 +1835,531 @@ Status stigi_door_extract_image(const StigiDoor *door, StigiFactSet *fs, Diag *d
       }
     }
   }
+  return st;
+}
+
+/* ---- S127 Comptime Tree-Shaking: Constant Folding, Pure Call Eval, Dead-Local & Unit GC ---- */
+
+static StigiExpr *ts_make_u64_lit(Arena *a, uint64_t val, StigiSpan sp) {
+  StigiExpr *e = arena_alloc(a, sizeof *e);
+  if (e == NULL) return NULL;
+  memset(e, 0, sizeof *e);
+  e->kind = STIGI_EXPR_LIT_INT;
+  e->span = sp;
+  e->u.lit_int.value = val;
+  char tmp[32];
+  int n = snprintf(tmp, sizeof tmp, "%llu", (unsigned long long)val);
+  if (n > 0) {
+    char *cp = arena_alloc(a, (size_t)n + 1U);
+    if (cp != NULL) {
+      memcpy(cp, tmp, (size_t)n + 1U);
+      e->u.lit_int.raw = (StigiStr){ cp, (uint32_t)n };
+    }
+  }
+  return e;
+}
+
+static StigiExpr *ts_make_bool_lit(Arena *a, bool val, StigiSpan sp) {
+  StigiExpr *e = arena_alloc(a, sizeof *e);
+  if (e == NULL) return NULL;
+  memset(e, 0, sizeof *e);
+  e->kind = STIGI_EXPR_LIT_BOOL;
+  e->span = sp;
+  e->u.lit_bool.value = val;
+  return e;
+}
+
+static bool ts_def_is_pure_computable(const StigiImage *img, uint32_t uidx) {
+  if (uidx >= img->unit_count) return false;
+  const StigiDecl *d = img->units[uidx].ast->decl;
+  if (d->kind != STIGI_DECL_DEF || d->is_pub) return false;
+  const StigiDefHead *h = &d->u.def_decl.head;
+  if (h->type_param_count > 0) return false;
+  for (uint32_t g = 0; g < h->pre_group_count; g++) {
+    if (!h->pre_groups[g].is_fact && h->pre_groups[g].cap_count > 0) return false;
+  }
+  return true;
+}
+
+static bool ts_expr_uses_ident(const StigiExpr *e, StigiStr name) {
+  if (e == NULL) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_LOCAL:
+    case STIGI_EXPR_GLOBAL:
+      return e->u.ident.name.len == name.len &&
+             memcmp(e->u.ident.name.ptr, name.ptr, name.len) == 0;
+    case STIGI_EXPR_UNOP:
+      return ts_expr_uses_ident(e->u.unop.operand, name);
+    case STIGI_EXPR_BINOP:
+      return ts_expr_uses_ident(e->u.binop.lhs, name) ||
+             ts_expr_uses_ident(e->u.binop.rhs, name);
+    case STIGI_EXPR_IF:
+      return ts_expr_uses_ident(e->u.if_expr.cond, name) ||
+             ts_expr_uses_ident(e->u.if_expr.then_br, name) ||
+             ts_expr_uses_ident(e->u.if_expr.else_br, name);
+    case STIGI_EXPR_WHILE:
+      return ts_expr_uses_ident(e->u.while_expr.cond, name) ||
+             ts_expr_uses_ident(e->u.while_expr.body, name);
+    case STIGI_EXPR_CALL:
+      if (ts_expr_uses_ident(e->u.call.callee, name)) return true;
+      for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+        if (ts_expr_uses_ident(e->u.call.args[i], name)) return true;
+      }
+      return false;
+    case STIGI_EXPR_MATCH:
+      if (ts_expr_uses_ident(e->u.match_expr.scrutinee, name)) return true;
+      for (uint32_t i = 0; i < e->u.match_expr.scrutinee_count; i++) {
+        if (ts_expr_uses_ident(e->u.match_expr.scrutinees[i], name)) return true;
+      }
+      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
+        if (ts_expr_uses_ident(e->u.match_expr.arms[i].guard, name) ||
+            ts_expr_uses_ident(e->u.match_expr.arms[i].body, name)) {
+          return true;
+        }
+      }
+      return false;
+    case STIGI_EXPR_VAL:
+      if (ts_expr_uses_ident(e->u.val_stmt.init, name)) return true;
+      for (uint32_t i = 0; i < e->u.val_stmt.else_arm_count; i++) {
+        if (ts_expr_uses_ident(e->u.val_stmt.else_arms[i].body, name)) return true;
+      }
+      return false;
+    case STIGI_EXPR_VAR:
+      return ts_expr_uses_ident(e->u.var_stmt.init, name);
+    case STIGI_EXPR_ASSIGN:
+      return (e->u.assign_stmt.name.len == name.len &&
+              memcmp(e->u.assign_stmt.name.ptr, name.ptr, name.len) == 0) ||
+             ts_expr_uses_ident(e->u.assign_stmt.value, name);
+    case STIGI_EXPR_INDEX_READ:
+    case STIGI_EXPR_INDEX_WRITE:
+      return ts_expr_uses_ident(e->u.index_expr.target, name) ||
+             ts_expr_uses_ident(e->u.index_expr.index, name) ||
+             ts_expr_uses_ident(e->u.index_expr.value, name);
+    case STIGI_EXPR_HANDLE:
+      for (uint32_t i = 0; i < e->u.handle_stmt.arg_count; i++) {
+        if (ts_expr_uses_ident(e->u.handle_stmt.args[i], name)) return true;
+      }
+      return ts_expr_uses_ident(e->u.handle_stmt.body, name);
+    case STIGI_EXPR_ASSERT:
+      if (ts_expr_uses_ident(e->u.assert_expr.expr, name)) return true;
+      for (uint32_t i = 0; i < e->u.assert_expr.facts.count; i++) {
+        const StigiFactItem *it = &e->u.assert_expr.facts.items[i];
+        if (it->kind == STIGI_FACT_ATOM) {
+          for (uint32_t k = 0; k < it->arg_count; k++) {
+            if (ts_expr_uses_ident(it->args[k], name)) return true;
+          }
+        } else {
+          if (ts_expr_uses_ident(it->lhs, name) || ts_expr_uses_ident(it->rhs, name)) return true;
+        }
+      }
+      return false;
+    case STIGI_EXPR_BLOCK:
+      for (uint32_t i = 0; i < e->u.block.count; i++) {
+        if (ts_expr_uses_ident(e->u.block.stmts[i], name)) return true;
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+static bool ts_expr_is_pure_simple(const StigiImage *img, uint32_t uidx, const StigiExpr *e) {
+  if (e == NULL) return true;
+  switch (e->kind) {
+    case STIGI_EXPR_LIT_INT:
+    case STIGI_EXPR_LIT_BOOL:
+    case STIGI_EXPR_LIT_CHAR:
+    case STIGI_EXPR_LIT_STR:
+    case STIGI_EXPR_LIT_UNIT:
+    case STIGI_EXPR_LOCAL:
+      return true;
+    case STIGI_EXPR_UNOP:
+      return ts_expr_is_pure_simple(img, uidx, e->u.unop.operand);
+    case STIGI_EXPR_BINOP:
+      return ts_expr_is_pure_simple(img, uidx, e->u.binop.lhs) &&
+             ts_expr_is_pure_simple(img, uidx, e->u.binop.rhs);
+    case STIGI_EXPR_CALL:
+      if (e->u.call.callee->kind == STIGI_EXPR_LOCAL || e->u.call.callee->kind == STIGI_EXPR_GLOBAL) {
+        int32_t tgt = stigi_image_resolve_name(img, uidx, e->u.call.callee->u.ident.name.ptr,
+                                               e->u.call.callee->u.ident.name.len);
+        if (tgt >= 0 && ts_def_is_pure_computable(img, (uint32_t)tgt)) {
+          for (uint32_t i = 0; i < e->u.call.arg_count; i++) {
+            if (!ts_expr_is_pure_simple(img, uidx, e->u.call.args[i])) return false;
+          }
+          return true;
+        }
+      }
+      return false;
+    default:
+      return false;
+  }
+}
+
+static StigiExpr *ts_fold_expr(const StigiImage *img, uint32_t uidx, const StigiExpr *e,
+                               Arena *a, bool *changed) {
+  if (e == NULL) return NULL;
+  switch (e->kind) {
+    case STIGI_EXPR_UNOP: {
+      StigiExpr *op = ts_fold_expr(img, uidx, e->u.unop.operand, a, changed);
+      if (e->u.unop.op == STIGI_OP_NOT && op != NULL && op->kind == STIGI_EXPR_LIT_BOOL) {
+        *changed = true;
+        return ts_make_bool_lit(a, !op->u.lit_bool.value, e->span);
+      }
+      if (op != e->u.unop.operand) {
+        StigiExpr *ne = arena_alloc(a, sizeof *ne);
+        if (ne == NULL) return (StigiExpr *)e;
+        *ne = *e;
+        ne->u.unop.operand = op;
+        return ne;
+      }
+      return (StigiExpr *)e;
+    }
+    case STIGI_EXPR_BINOP: {
+      StigiExpr *l = ts_fold_expr(img, uidx, e->u.binop.lhs, a, changed);
+      StigiExpr *r = ts_fold_expr(img, uidx, e->u.binop.rhs, a, changed);
+      if (l != NULL && r != NULL &&
+          l->kind == STIGI_EXPR_LIT_INT && !l->u.lit_int.overflow &&
+          r->kind == STIGI_EXPR_LIT_INT && !r->u.lit_int.overflow) {
+        uint64_t a0 = l->u.lit_int.value;
+        uint64_t b0 = r->u.lit_int.value;
+        switch (e->u.binop.op) {
+          case STIGI_OP_ADD:
+            if (b0 <= UINT64_MAX - a0) { *changed = true; return ts_make_u64_lit(a, a0 + b0, e->span); }
+            break;
+          case STIGI_OP_SUB:
+            if (a0 >= b0) { *changed = true; return ts_make_u64_lit(a, a0 - b0, e->span); }
+            break;
+          case STIGI_OP_MUL:
+            if (a0 == 0 || b0 <= UINT64_MAX / a0) { *changed = true; return ts_make_u64_lit(a, a0 * b0, e->span); }
+            break;
+          case STIGI_OP_DIV:
+            if (b0 != 0) { *changed = true; return ts_make_u64_lit(a, a0 / b0, e->span); }
+            break;
+          case STIGI_OP_MOD:
+            if (b0 != 0) { *changed = true; return ts_make_u64_lit(a, a0 % b0, e->span); }
+            break;
+          case STIGI_OP_LT: *changed = true; return ts_make_bool_lit(a, a0 < b0, e->span);
+          case STIGI_OP_LE: *changed = true; return ts_make_bool_lit(a, a0 <= b0, e->span);
+          case STIGI_OP_GT: *changed = true; return ts_make_bool_lit(a, a0 > b0, e->span);
+          case STIGI_OP_GE: *changed = true; return ts_make_bool_lit(a, a0 >= b0, e->span);
+          case STIGI_OP_EQ: *changed = true; return ts_make_bool_lit(a, a0 == b0, e->span);
+          case STIGI_OP_NE: *changed = true; return ts_make_bool_lit(a, a0 != b0, e->span);
+          default: break;
+        }
+      }
+      if (l != NULL && r != NULL &&
+          l->kind == STIGI_EXPR_LIT_BOOL && r->kind == STIGI_EXPR_LIT_BOOL) {
+        bool a0 = l->u.lit_bool.value, b0 = r->u.lit_bool.value;
+        if (e->u.binop.op == STIGI_OP_AND) { *changed = true; return ts_make_bool_lit(a, a0 && b0, e->span); }
+        if (e->u.binop.op == STIGI_OP_OR) { *changed = true; return ts_make_bool_lit(a, a0 || b0, e->span); }
+        if (e->u.binop.op == STIGI_OP_EQ) { *changed = true; return ts_make_bool_lit(a, a0 == b0, e->span); }
+        if (e->u.binop.op == STIGI_OP_NE) { *changed = true; return ts_make_bool_lit(a, a0 != b0, e->span); }
+      }
+      if (l != e->u.binop.lhs || r != e->u.binop.rhs) {
+        StigiExpr *ne = arena_alloc(a, sizeof *ne);
+        if (ne == NULL) return (StigiExpr *)e;
+        *ne = *e;
+        ne->u.binop.lhs = l;
+        ne->u.binop.rhs = r;
+        return ne;
+      }
+      return (StigiExpr *)e;
+    }
+    case STIGI_EXPR_IF: {
+      StigiExpr *c = ts_fold_expr(img, uidx, e->u.if_expr.cond, a, changed);
+      if (c != NULL && c->kind == STIGI_EXPR_LIT_BOOL) {
+        *changed = true;
+        return ts_fold_expr(img, uidx, c->u.lit_bool.value ? e->u.if_expr.then_br : e->u.if_expr.else_br,
+                            a, changed);
+      }
+      StigiExpr *tb = ts_fold_expr(img, uidx, e->u.if_expr.then_br, a, changed);
+      StigiExpr *eb = ts_fold_expr(img, uidx, e->u.if_expr.else_br, a, changed);
+      if (c != e->u.if_expr.cond || tb != e->u.if_expr.then_br || eb != e->u.if_expr.else_br) {
+        StigiExpr *ne = arena_alloc(a, sizeof *ne);
+        if (ne == NULL) return (StigiExpr *)e;
+        *ne = *e;
+        ne->u.if_expr.cond = c;
+        ne->u.if_expr.then_br = tb;
+        ne->u.if_expr.else_br = eb;
+        return ne;
+      }
+      return (StigiExpr *)e;
+    }
+    case STIGI_EXPR_CALL: {
+      uint32_t argc = e->u.call.arg_count;
+      StigiExpr **fargs = argc > 0 ? arena_alloc(a, (size_t)argc * sizeof *fargs) : NULL;
+      bool any_arg_chg = false;
+      bool all_lit = true;
+      for (uint32_t i = 0; i < argc; i++) {
+        StigiExpr *fa = ts_fold_expr(img, uidx, e->u.call.args[i], a, changed);
+        if (fargs != NULL) fargs[i] = fa;
+        if (fa != e->u.call.args[i]) any_arg_chg = true;
+        if (fa == NULL || (fa->kind != STIGI_EXPR_LIT_INT && fa->kind != STIGI_EXPR_LIT_BOOL &&
+                           fa->kind != STIGI_EXPR_LIT_CHAR)) {
+          all_lit = false;
+        }
+      }
+      if (all_lit && (e->u.call.callee->kind == STIGI_EXPR_LOCAL ||
+                      e->u.call.callee->kind == STIGI_EXPR_GLOBAL)) {
+        int32_t tgt = stigi_image_resolve_name(img, uidx, e->u.call.callee->u.ident.name.ptr,
+                                               e->u.call.callee->u.ident.name.len);
+        if (tgt >= 0 && (uint32_t)tgt != uidx && ts_def_is_pure_computable(img, (uint32_t)tgt)) {
+          StigiVal *vargs = argc > 0 ? malloc((size_t)argc * sizeof *vargs) : NULL;
+          if (argc == 0 || vargs != NULL) {
+            for (uint32_t i = 0; i < argc; i++) {
+              memset(&vargs[i], 0, sizeof vargs[i]);
+              const StigiExpr *fa = fargs[i];
+              if (fa->kind == STIGI_EXPR_LIT_INT) {
+                vargs[i].kind = STIGI_VAL_INT;
+                vargs[i].is_unsigned = true;
+                vargs[i].int_width = STIGI_INT_UNTYPED;
+                vargs[i].u.u = fa->u.lit_int.value;
+              } else if (fa->kind == STIGI_EXPR_LIT_BOOL) {
+                vargs[i].kind = STIGI_VAL_BOOL;
+                vargs[i].u.b = fa->u.lit_bool.value;
+              } else if (fa->kind == STIGI_EXPR_LIT_CHAR) {
+                vargs[i].kind = STIGI_VAL_INT;
+                vargs[i].is_unsigned = true;
+                vargs[i].int_width = STIGI_INT_U8;
+                vargs[i].u.u = fa->u.lit_char.value;
+              }
+            }
+            Arena eva;
+            arena_init(&eva);
+            StigiEvalResult er = stigi_eval_const_call(img, (uint32_t)tgt, vargs, argc, 4096ULL, &eva);
+            free(vargs);
+            if (er.status == STIGI_OK) {
+              if (er.value.kind == STIGI_VAL_INT && er.value.is_unsigned) {
+                uint64_t val = er.value.u.u;
+                arena_free(&eva);
+                *changed = true;
+                return ts_make_u64_lit(a, val, e->span);
+              }
+              if (er.value.kind == STIGI_VAL_BOOL) {
+                bool bv = er.value.u.b;
+                arena_free(&eva);
+                *changed = true;
+                return ts_make_bool_lit(a, bv, e->span);
+              }
+            }
+            arena_free(&eva);
+          }
+        }
+      }
+      if (any_arg_chg) {
+        StigiExpr *ne = arena_alloc(a, sizeof *ne);
+        if (ne == NULL) return (StigiExpr *)e;
+        *ne = *e;
+        ne->u.call.args = fargs;
+        return ne;
+      }
+      return (StigiExpr *)e;
+    }
+    case STIGI_EXPR_VAL: {
+      StigiExpr *ni = ts_fold_expr(img, uidx, e->u.val_stmt.init, a, changed);
+      if (ni != e->u.val_stmt.init) {
+        StigiExpr *ne = arena_alloc(a, sizeof *ne);
+        if (ne == NULL) return (StigiExpr *)e;
+        *ne = *e;
+        ne->u.val_stmt.init = ni;
+        return ne;
+      }
+      return (StigiExpr *)e;
+    }
+    case STIGI_EXPR_BLOCK: {
+      uint32_t n = e->u.block.count;
+      StigiExpr **stmts = n > 0 ? arena_alloc(a, (size_t)n * sizeof *stmts) : NULL;
+      if (n > 0 && stmts == NULL) return (StigiExpr *)e;
+      bool blk_chg = false;
+      for (uint32_t i = 0; i < n; i++) {
+        stmts[i] = ts_fold_expr(img, uidx, e->u.block.stmts[i], a, changed);
+        if (stmts[i] != e->u.block.stmts[i]) blk_chg = true;
+      }
+      /* Eliminate unused pure local `val x = expr` statements */
+      uint32_t w = 0;
+      for (uint32_t i = 0; i < n; i++) {
+        const StigiExpr *s = stmts[i];
+        if (i + 1U < n && s != NULL && s->kind == STIGI_EXPR_VAL &&
+            s->u.val_stmt.else_arm_count == 0 && s->u.val_stmt.pat.kind == STIGI_PAT_VAR &&
+            ts_expr_is_pure_simple(img, uidx, s->u.val_stmt.init)) {
+          bool used = false;
+          for (uint32_t j = i + 1U; j < n; j++) {
+            if (ts_expr_uses_ident(stmts[j], s->u.val_stmt.pat.name)) {
+              used = true;
+              break;
+            }
+          }
+          if (!used) {
+            blk_chg = true;
+            *changed = true;
+            continue;
+          }
+        }
+        stmts[w++] = stmts[i];
+      }
+      if (!blk_chg) return (StigiExpr *)e;
+      if (w == 1U) return stmts[0];
+      StigiExpr *nb = arena_alloc(a, sizeof *nb);
+      if (nb == NULL) return (StigiExpr *)e;
+      *nb = *e;
+      nb->u.block.stmts = stmts;
+      nb->u.block.count = w;
+      return nb;
+    }
+    default:
+      return (StigiExpr *)e;
+  }
+}
+
+Status stigi_door_gc(StigiDoor *door, uint32_t *out_removed_units,
+                     StigiDoorResult *out, Diag *diag) {
+  if (door == NULL || out == NULL) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_door_gc: invalid arguments");
+  }
+  if (out_removed_units != NULL) *out_removed_units = 0U;
+  if (door->src_count == 0) {
+    out->accepted = true;
+    return STIGI_OK;
+  }
+
+  /* Phase 1 (S127): Comptime partial evaluation & constant folding on non-Test units */
+  uint32_t n = door->image.unit_count < door->src_count ? door->image.unit_count : door->src_count;
+  char **folded_srcs = calloc(n, sizeof *folded_srcs);
+  size_t *folded_lens = calloc(n, sizeof *folded_lens);
+  bool any_folded = false;
+  if (folded_srcs != NULL && folded_lens != NULL) {
+    Arena fa;
+    arena_init(&fa);
+    for (uint32_t i = 0; i < n; i++) {
+      const StigiUnit *u = door->image.units[i].ast;
+      const StigiDecl *d = u->decl;
+      bool chg = false;
+      StigiUnit mod_u = *u;
+      StigiDecl mod_d = *d;
+      if (d->kind == STIGI_DECL_DEF && d->u.def_decl.clause_count == 0 &&
+          d->u.def_decl.body != NULL) {
+        StigiExpr *fb = ts_fold_expr(&door->image, i, d->u.def_decl.body, &fa, &chg);
+        if (chg && fb != NULL) {
+          mod_d.u.def_decl.body = fb;
+          mod_u.decl = &mod_d;
+        }
+      } else if (d->kind == STIGI_DECL_VAL && d->u.val_decl.body != NULL) {
+        StigiExpr *fb = ts_fold_expr(&door->image, i, d->u.val_decl.body, &fa, &chg);
+        if (chg && fb != NULL) {
+          mod_d.u.val_decl.body = fb;
+          mod_u.decl = &mod_d;
+        }
+      }
+      if (chg) {
+        char *printed = NULL;
+        size_t plen = 0;
+        Diag pd;
+        diag_clear(&pd);
+        if (stigi_print_unit(&mod_u, &printed, &plen, &fa, &pd) == STIGI_OK && printed != NULL) {
+          char *dup = malloc(plen + 1U);
+          if (dup != NULL) {
+            memcpy(dup, printed, plen);
+            dup[plen] = '\0';
+            folded_srcs[i] = dup;
+            folded_lens[i] = plen;
+            any_folded = true;
+          }
+        }
+      }
+    }
+    arena_free(&fa);
+  }
+
+  /* Phase 2 (S126/S127): Recompute reachability after folding and prune unreachable units */
+  if (any_folded) {
+    StigiImage tmp_img;
+    StigiNameDiags tmp_nd;
+    stigi_image_init(&tmp_img);
+    stigi_name_diags_init(&tmp_nd);
+    Diag td;
+    diag_clear(&td);
+    bool tmp_ok = true;
+    for (uint32_t i = 0; i < n && tmp_ok; i++) {
+      const char *s = folded_srcs[i] != NULL ? folded_srcs[i] : door->unit_srcs[i];
+      size_t sl = folded_srcs[i] != NULL ? folded_lens[i] : door->unit_lens[i];
+      if (stigi_image_add_source(&tmp_img, s, sl, &tmp_nd, &td) != STIGI_OK) tmp_ok = false;
+    }
+    if (tmp_ok && stigi_image_resolve(&tmp_img, &tmp_nd, &td) == STIGI_OK) {
+      const char **kept_srcs = malloc((size_t)n * sizeof *kept_srcs);
+      size_t *kept_lens = malloc((size_t)n * sizeof *kept_lens);
+      if (kept_srcs != NULL && kept_lens != NULL) {
+        uint32_t w = 0;
+        for (uint32_t i = 0; i < n && i < tmp_img.unit_count; i++) {
+          if (tmp_img.units[i].reachable) {
+            kept_srcs[w] = folded_srcs[i] != NULL ? folded_srcs[i] : door->unit_srcs[i];
+            kept_lens[w] = folded_srcs[i] != NULL ? folded_lens[i] : door->unit_lens[i];
+            w++;
+          }
+        }
+        /* Soundness gate: commit folded+pruned image ONLY if full door accepts it! */
+        StigiDoorResult try_r;
+        stigi_door_result_init(&try_r);
+        Diag try_d;
+        diag_clear(&try_d);
+        if (run_transaction(door, kept_srcs, kept_lens, w, NULL, 0, true, true,
+                            &try_r, &try_d) == STIGI_OK &&
+            try_r.accepted) {
+          if (out_removed_units != NULL) *out_removed_units = n > w ? (n - w) : 0U;
+          out->accepted = true;
+          stigi_door_result_free(&try_r);
+          free(kept_srcs);
+          free(kept_lens);
+          stigi_name_diags_free(&tmp_nd);
+          stigi_image_free(&tmp_img);
+          for (uint32_t i = 0; i < n; i++) free(folded_srcs[i]);
+          free(folded_srcs);
+          free(folded_lens);
+          return STIGI_OK;
+        }
+        stigi_door_result_free(&try_r);
+      }
+      free(kept_srcs);
+      free(kept_lens);
+    }
+    stigi_name_diags_free(&tmp_nd);
+    stigi_image_free(&tmp_img);
+  }
+  if (folded_srcs != NULL) {
+    for (uint32_t i = 0; i < n; i++) free(folded_srcs[i]);
+  }
+  free(folded_srcs);
+  free(folded_lens);
+
+  /* Fallback / non-folded path: exact reachability GC from roots */
+  uint32_t keep_cnt = 0;
+  for (uint32_t i = 0; i < door->image.unit_count && i < door->src_count; i++) {
+    if (door->image.units[i].reachable) keep_cnt++;
+  }
+  uint32_t removed = door->src_count > keep_cnt ? (door->src_count - keep_cnt) : 0U;
+  if (out_removed_units != NULL) *out_removed_units = removed;
+  if (removed == 0U) {
+    out->accepted = true;
+    return STIGI_OK;
+  }
+
+  const char **kept_srcs = keep_cnt > 0 ? malloc((size_t)keep_cnt * sizeof *kept_srcs) : NULL;
+  size_t *kept_lens = keep_cnt > 0 ? malloc((size_t)keep_cnt * sizeof *kept_lens) : NULL;
+  if (keep_cnt > 0 && (kept_srcs == NULL || kept_lens == NULL)) {
+    free(kept_srcs);
+    free(kept_lens);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "stigi_door_gc OOM");
+  }
+  uint32_t w = 0;
+  for (uint32_t i = 0; i < door->image.unit_count && i < door->src_count; i++) {
+    if (door->image.units[i].reachable) {
+      kept_srcs[w] = door->unit_srcs[i];
+      kept_lens[w] = door->unit_lens[i];
+      w++;
+    }
+  }
+  Status st = run_transaction(door, kept_srcs, kept_lens, w, NULL, 0, true, true, out, diag);
+  free(kept_srcs);
+  free(kept_lens);
   return st;
 }
 

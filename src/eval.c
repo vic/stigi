@@ -1,4 +1,5 @@
 #include "eval.h"
+#include "kanren.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -422,7 +423,7 @@ static StigiVal eval_call_handler_op(EvalCtx *ctx, EvalHandlerFrame *hf,
     }
   }
   ctx->call_depth++;
-  StigiVal out = eval_expr(ctx, (uint32_t)hf->handler_unit_idx, op_def->u.def_decl.body, &frame);
+  StigiVal out = eval_expr(ctx, (uint32_t)hf->handler_unit_idx, stigi_def_body(op_def), &frame);
   ctx->call_depth--;
   env_free(&frame);
   if (!ctx->failed) {
@@ -456,7 +457,7 @@ static StigiVal eval_call_unit(EvalCtx *ctx, uint32_t tgt_idx,
   const StigiDefHead *h = (d->kind == STIGI_DECL_EXTERN) ? &d->u.extern_decl.head
                                                          : &d->u.def_decl.head;
   const StigiExpr *body = (d->kind == STIGI_DECL_EXTERN) ? d->u.extern_decl.body
-                                                         : d->u.def_decl.body;
+                                                         : stigi_def_body(d);
 
   /* Verify every runtime capability required by callee is either pure/Region/Mut or handled */
   for (uint32_t g = 0; g < h->pre_group_count; g++) {
@@ -465,6 +466,7 @@ static StigiVal eval_call_unit(EvalCtx *ctx, uint32_t tgt_idx,
       const StigiType *ct = h->pre_groups[g].caps[c].cap_type;
       if (is_eval_marker_or_region_cap(ctx->img, tgt_idx, ct)) continue;
       int32_t cidx = stigi_image_resolve_name(ctx->img, tgt_idx, ct->name.ptr, ct->name.len);
+      if (cidx >= 0 && ctx->img->units[cidx].ast->decl->kind == STIGI_DECL_TRAIT) continue;
       if (cidx < 0 || !eval_has_handler_for_cap(ctx, cidx)) {
         eval_fail(ctx, "not-compile-time",
                   "cannot evaluate '%s' requiring unhandled capability '%.*s'",
@@ -495,6 +497,129 @@ static StigiVal eval_call_unit(EvalCtx *ctx, uint32_t tgt_idx,
   env_free(&frame);
   if (!ctx->failed && d->kind != STIGI_DECL_LEMMA_DEF) {
     StigiIntWidth rw = width_from_ast_type(ctx->img, tgt_idx, h->ret_type, 0);
+    (void)coerce_int_to_width(ctx, &out, rw);
+  }
+  return out;
+}
+
+static StigiType *eval_val_to_ast_type(const StigiImage *img, const StigiVal *v, Arena *a) {
+  StigiType *t = arena_alloc(a, sizeof *t);
+  if (t == NULL) return NULL;
+  memset(t, 0, sizeof *t);
+  t->kind = STIGI_TYPE_NAMED;
+  if (v->kind == STIGI_VAL_BOOL) {
+    t->name = (StigiStr){ "Bool", 4 };
+    return t;
+  }
+  if (v->kind == STIGI_VAL_UNIT) {
+    t->name = (StigiStr){ "Unit", 4 };
+    return t;
+  }
+  if (v->kind == STIGI_VAL_INT) {
+    switch (v->int_width) {
+      case STIGI_INT_U8: t->name = (StigiStr){ "U8", 2 }; break;
+      case STIGI_INT_U32: t->name = (StigiStr){ "U32", 3 }; break;
+      case STIGI_INT_I32: t->name = (StigiStr){ "I32", 3 }; break;
+      case STIGI_INT_I64: t->name = (StigiStr){ "I64", 3 }; break;
+      default: t->name = (StigiStr){ "U64", 3 }; break;
+    }
+    return t;
+  }
+  if (v->kind == STIGI_VAL_ENUM && v->u.en.enum_unit_idx >= 0 &&
+      (uint32_t)v->u.en.enum_unit_idx < img->unit_count) {
+    uint32_t ei = (uint32_t)v->u.en.enum_unit_idx;
+    t->name = (StigiStr){ img->units[ei].name, (uint32_t)img->units[ei].name_len };
+    const StigiDecl *ed = img->units[ei].ast->decl;
+    if (ed->kind == STIGI_DECL_ENUM && ed->u.enum_decl.type_param_count > 0) {
+      /* Infer enum type args from runtime field values if present */
+      uint32_t tpc = ed->u.enum_decl.type_param_count;
+      t->type_args = arena_alloc(a, (size_t)tpc * sizeof *t->type_args);
+      t->type_arg_count = tpc;
+      const StigiEnumCase *ec = NULL;
+      for (uint32_t c = 0; c < ed->u.enum_decl.case_count; c++) {
+        if (str_eq_s(ed->u.enum_decl.cases[c].name, v->u.en.case_name)) {
+          ec = &ed->u.enum_decl.cases[c];
+          break;
+        }
+      }
+      for (uint32_t tp = 0; tp < tpc && t->type_args != NULL; tp++) {
+        t->type_args[tp] = NULL;
+        StigiStr tpn = ed->u.enum_decl.type_params[tp].name;
+        if (ec != NULL) {
+          for (uint32_t f = 0; f < ec->field_count && f < v->u.en.field_count; f++) {
+            if (ec->fields[f].type != NULL && ec->fields[f].type->kind == STIGI_TYPE_NAMED &&
+                str_eq_s(ec->fields[f].type->name, tpn)) {
+              t->type_args[tp] = eval_val_to_ast_type(img, &v->u.en.fields[f], a);
+              break;
+            }
+          }
+        }
+        if (t->type_args[tp] == NULL) {
+          StigiType *fb = arena_alloc(a, sizeof *fb);
+          if (fb != NULL) {
+            memset(fb, 0, sizeof *fb);
+            fb->kind = STIGI_TYPE_NAMED;
+            fb->name = (StigiStr){ "U64", 3 };
+          }
+          t->type_args[tp] = fb;
+        }
+      }
+    }
+    return t;
+  }
+  t->name = (StigiStr){ "U64", 3 };
+  return t;
+}
+
+static StigiVal eval_call_given_op(EvalCtx *ctx, uint32_t given_uidx, StigiStr op_name,
+                                   const StigiVal *args, uint32_t argc) {
+  StigiVal z;
+  memset(&z, 0, sizeof z);
+  if (!burn_fuel(ctx)) return z;
+  if (ctx->call_depth >= STIGI_EVAL_MAX_DEPTH) {
+    eval_fail(ctx, "evaluation-fuel", "maximum call depth exceeded");
+    return z;
+  }
+  const StigiDecl *gd = ctx->img->units[given_uidx].ast->decl;
+  if (gd->kind != STIGI_DECL_GIVEN) {
+    eval_fail(ctx, "eval-error", "target is not a given");
+    return z;
+  }
+  const StigiDecl *opd = NULL;
+  for (uint32_t i = 0; i < gd->u.given_decl.def_count; i++) {
+    if (gd->u.given_decl.defs[i]->kind == STIGI_DECL_DEF &&
+        str_eq_s(gd->u.given_decl.defs[i]->name, op_name)) {
+      opd = gd->u.given_decl.defs[i];
+      break;
+    }
+  }
+  if (opd == NULL) {
+    eval_fail(ctx, "eval-error", "given '%s' has no method '%.*s'",
+              ctx->img->units[given_uidx].name, (int)op_name.len, op_name.ptr);
+    return z;
+  }
+  const StigiDefHead *h = &opd->u.def_decl.head;
+  if (argc != h->param_count) {
+    eval_fail(ctx, "eval-error", "given method arity mismatch");
+    return z;
+  }
+  EvalEnv frame;
+  env_init(&frame);
+  for (uint32_t i = 0; i < h->param_count; i++) {
+    StigiVal av = args[i];
+    StigiIntWidth pw = width_from_ast_type(ctx->img, given_uidx, h->params[i].type, 0);
+    if (!coerce_int_to_width(ctx, &av, pw) ||
+        !env_push(ctx, &frame, h->params[i].name, av, NULL)) {
+      env_free(&frame);
+      return z;
+    }
+  }
+  ctx->call_depth++;
+  StigiVal out = eval_expr(ctx, given_uidx, stigi_def_body(opd), &frame);
+  ctx->call_depth--;
+  env_free(&frame);
+  if (!ctx->failed) {
+    StigiIntWidth rw = width_from_ast_type(ctx->img, given_uidx, h->ret_type, 0);
     (void)coerce_int_to_width(ctx, &out, rw);
   }
   return out;
@@ -580,7 +705,7 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
           EvalEnv sub;
           env_init(&sub);
           ctx->call_depth++;
-          StigiVal rv = eval_expr(ctx, (uint32_t)tgt, d->u.val_decl.body, &sub);
+          StigiVal rv = eval_expr(ctx, (uint32_t)tgt, stigi_val_body(d), &sub);
           ctx->call_depth--;
           env_free(&sub);
           if (!ctx->failed) {
@@ -932,8 +1057,11 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
             return out;
           }
         }
-        /* Capability operation call via active handler: binder.op(...) or Cap.op(...) */
-        const char *dot = memchr(cn.ptr, '.', cn.len);
+        /* Capability or Trait operation call: binder.op(...) / Cap.op(...) / Trait.op(...) */
+        const char *dot = NULL;
+        for (size_t i = 0; i < cn.len; i++) {
+          if (cn.ptr[i] == '.') dot = cn.ptr + i;
+        }
         if (dot != NULL) {
           StigiStr prefix = { cn.ptr, (size_t)(dot - cn.ptr) };
           StigiStr op_name = { dot + 1, cn.len - prefix.len - 1U };
@@ -947,7 +1075,7 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
           }
           /* Also check unnamed handler match by capability name */
           int32_t cidx = stigi_image_resolve_name(ctx->img, uidx, prefix.ptr, prefix.len);
-          if (cidx >= 0) {
+          if (cidx >= 0 && ctx->img->units[cidx].ast->decl->kind == STIGI_DECL_CAPABILITY) {
             for (uint32_t hi = ctx->handler_count; hi > 0; hi--) {
               if (ctx->handlers[hi - 1].cap_unit_idx == cidx) {
                 StigiVal out = eval_call_handler_op(ctx, &ctx->handlers[hi - 1], op_name, args, argc);
@@ -955,6 +1083,99 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
                 return out;
               }
             }
+          }
+          /* Trait method call via uKanren (S125): Trait.op(...) or named ev.op(...) */
+          int32_t tr_uidx = -1;
+          if (cidx >= 0 && ctx->img->units[cidx].ast->decl->kind == STIGI_DECL_TRAIT) {
+            tr_uidx = cidx;
+          } else {
+            const StigiDecl *ud = ctx->img->units[uidx].ast->decl;
+            if (ud->kind == STIGI_DECL_DEF) {
+              const StigiDefHead *uh = &ud->u.def_decl.head;
+              for (uint32_t g = 0; g < uh->pre_group_count && tr_uidx < 0; g++) {
+                if (uh->pre_groups[g].is_fact) continue;
+                for (uint32_t ci = 0; ci < uh->pre_groups[g].cap_count; ci++) {
+                  if (str_eq_s(uh->pre_groups[g].caps[ci].name, prefix) &&
+                      uh->pre_groups[g].caps[ci].cap_type != NULL) {
+                    int32_t rt = stigi_image_resolve_name(ctx->img, uidx,
+                                                          uh->pre_groups[g].caps[ci].cap_type->name.ptr,
+                                                          uh->pre_groups[g].caps[ci].cap_type->name.len);
+                    if (rt >= 0 && ctx->img->units[rt].ast->decl->kind == STIGI_DECL_TRAIT) {
+                      tr_uidx = rt;
+                      break;
+                    }
+                  }
+                }
+              }
+            } else if (ud->kind == STIGI_DECL_GIVEN) {
+              for (uint32_t ci = 0; ci < ud->u.given_decl.cap_param_count; ci++) {
+                if (str_eq_s(ud->u.given_decl.cap_params[ci].name, prefix) &&
+                    ud->u.given_decl.cap_params[ci].cap_type != NULL) {
+                  int32_t rt = stigi_image_resolve_name(ctx->img, uidx,
+                                                        ud->u.given_decl.cap_params[ci].cap_type->name.ptr,
+                                                        ud->u.given_decl.cap_params[ci].cap_type->name.len);
+                  if (rt >= 0 && ctx->img->units[rt].ast->decl->kind == STIGI_DECL_TRAIT) {
+                    tr_uidx = rt;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (tr_uidx >= 0) {
+            const StigiDecl *td = ctx->img->units[tr_uidx].ast->decl;
+            const StigiDecl *tr_op = NULL;
+            for (uint32_t m = 0; m < td->u.trait_decl.member_count; m++) {
+              if (td->u.trait_decl.members[m]->kind == STIGI_DECL_DEF &&
+                  str_eq_s(td->u.trait_decl.members[m]->name, op_name)) {
+                tr_op = td->u.trait_decl.members[m];
+                break;
+              }
+            }
+            Arena ka;
+            arena_init(&ka);
+            StigiType *goal = arena_alloc(&ka, sizeof *goal);
+            if (goal != NULL) {
+              memset(goal, 0, sizeof *goal);
+              goal->kind = STIGI_TYPE_NAMED;
+              goal->name = (StigiStr){ ctx->img->units[tr_uidx].name,
+                                       (uint32_t)ctx->img->units[tr_uidx].name_len };
+              uint32_t tpc = td->u.trait_decl.type_param_count;
+              goal->type_arg_count = tpc;
+              if (tpc > 0) {
+                goal->type_args = arena_alloc(&ka, (size_t)tpc * sizeof *goal->type_args);
+                for (uint32_t tp = 0; tp < tpc && goal->type_args != NULL; tp++) {
+                  goal->type_args[tp] = NULL;
+                  if (tp < e->u.call.type_arg_count) {
+                    goal->type_args[tp] = e->u.call.type_args[tp];
+                  } else if (tr_op != NULL) {
+                    StigiStr tpn = td->u.trait_decl.type_params[tp].name;
+                    const StigiDefHead *oh = &tr_op->u.def_decl.head;
+                    for (uint32_t p = 0; p < oh->param_count && p < argc; p++) {
+                      if (oh->params[p].type != NULL &&
+                          oh->params[p].type->kind == STIGI_TYPE_NAMED &&
+                          str_eq_s(oh->params[p].type->name, tpn)) {
+                        goal->type_args[tp] = eval_val_to_ast_type(ctx->img, &args[p], &ka);
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+              StigiKanrenProof pr = stigi_kanren_solve(ctx->img, uidx, goal, NULL, 0, NULL, 0, &ka);
+              if (pr.status == STIGI_KANREN_FOUND && pr.given_uidx >= 0) {
+                int32_t guidx = pr.given_uidx;
+                arena_free(&ka);
+                StigiVal out = eval_call_given_op(ctx, (uint32_t)guidx, op_name, args, argc);
+                free(args);
+                return out;
+              }
+            }
+            arena_free(&ka);
+            eval_fail(ctx, "no-given", "no unique given found for trait '%s'",
+                      ctx->img->units[tr_uidx].name);
+            free(args);
+            return z;
           }
         }
         /* Stigi.Test.expect(got, want, reason) */
@@ -1194,7 +1415,7 @@ static StigiVal eval_expr(EvalCtx *ctx, uint32_t uidx, const StigiExpr *e, EvalE
         }
 
         int32_t tgt = stigi_image_resolve_name(ctx->img, uidx, cn.ptr, cn.len);
-        if (tgt >= 0) {
+        if (tgt >= 0 && ctx->img->units[tgt].ast->decl->kind != STIGI_DECL_ENUM) {
           StigiVal out = eval_call_unit(ctx, (uint32_t)tgt, args, argc);
           free(args);
           return out;
@@ -1346,7 +1567,7 @@ StigiEvalResult stigi_eval_unit(const StigiImage *img, uint32_t unit_idx,
   env_init(&env);
 
   if (d->kind == STIGI_DECL_VAL || d->kind == STIGI_DECL_TEST) {
-    ctx.res.value = eval_expr(&ctx, unit_idx, d->u.val_decl.body, &env);
+    ctx.res.value = eval_expr(&ctx, unit_idx, stigi_val_body(d), &env);
     if (!ctx.failed && d->kind == STIGI_DECL_VAL) {
       StigiIntWidth w = width_from_ast_type(img, unit_idx, d->u.val_decl.type, 0);
       (void)coerce_int_to_width(&ctx, &ctx.res.value, w);
@@ -1376,4 +1597,24 @@ StigiEvalResult stigi_eval_test(const StigiImage *img, uint32_t unit_idx,
     (void)snprintf(r.msg, sizeof r.msg, "Test did not produce Stigi.Test.Result via Stigi.Test.expect");
   }
   return r;
+}
+
+StigiEvalResult stigi_eval_const_call(const StigiImage *img, uint32_t unit_idx,
+                                      const StigiVal *args, uint32_t argc,
+                                      uint64_t fuel_max, Arena *arena) {
+  EvalCtx ctx;
+  memset(&ctx, 0, sizeof ctx);
+  ctx.img = img;
+  ctx.arena = arena;
+  ctx.fuel_max = fuel_max > 0 ? fuel_max : 4096ULL;
+  ctx.fuel_left = ctx.fuel_max;
+  ctx.res.status = STIGI_OK;
+  if (img == NULL || arena == NULL || unit_idx >= img->unit_count) {
+    eval_fail(&ctx, "eval-error", "invalid arguments");
+    return ctx.res;
+  }
+  ctx.res.value = eval_call_unit(&ctx, unit_idx, args, argc);
+  free(ctx.handlers);
+  ctx.res.fuel_used = ctx.fuel_max - ctx.fuel_left;
+  return ctx.res;
 }

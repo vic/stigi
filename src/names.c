@@ -1,6 +1,7 @@
 #include "names.h"
 #include "blake3.h"
 #include "parse.h"
+#include "pattern.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -75,6 +76,9 @@ bool stigi_is_known_code_case(const char *s, size_t len) {
     "TypeFuel", "EvaluationFuel", "NotCompileTime",
     "NotExhaustive", "WildcardArm", "NestedPattern",
     "AssignVal", "HandlerSignature", "UnusedParameter", "ExternForgesFacts",
+    /* Traits & Givens (S125) */
+    "NoGiven", "AmbiguousGivens", "GivenFuel", "GivenRow",
+    "ConcreteProtocolInSignature",
     /* Facts & Lemma & Progress */
     "RelationArity", "PreconditionUnproved", "RefinementUnproved",
     "ExitUnproved", "AssertionUnproved", "InvariantUnproved", "DenialViolated",
@@ -772,10 +776,17 @@ static void hc_encode_pat(HashCtx *hc, const StigiPat *pat) {
   cb_u8(hc->out, (uint8_t)(0x20 + pat->kind));
   if (pat->kind == STIGI_PAT_INT) {
     cb_uleb(hc->out, pat->int_val);
+  } else if (pat->kind == STIGI_PAT_CHAR) {
+    cb_u8(hc->out, pat->char_val);
   } else if (pat->kind == STIGI_PAT_BOOL) {
     cb_u8(hc->out, pat->bool_val ? 1 : 0);
   } else if (pat->kind == STIGI_PAT_VAR) {
     hc_push_binder(hc, pat->name);
+  } else if (pat->kind == STIGI_PAT_TUPLE) {
+    cb_uleb(hc->out, pat->subpat_count);
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      hc_encode_pat(hc, &pat->subpats[i]);
+    }
   } else if (pat->kind == STIGI_PAT_CTOR) {
     if (!hc_encode_enum_case(hc, pat->name)) {
       cb_u8(hc->out, 0x07);
@@ -1176,7 +1187,7 @@ static void hc_encode_decl(HashCtx *hc, const StigiDecl *d) {
     case STIGI_DECL_DEF:
     case STIGI_DECL_LEMMA_DEF:
       hc_encode_def_head(hc, &d->u.def_decl.head);
-      hc_encode_expr(hc, d->u.def_decl.body);
+      hc_encode_expr(hc, stigi_def_body(d));
       break;
     case STIGI_DECL_VAL:
     case STIGI_DECL_TEST:
@@ -1207,7 +1218,7 @@ static void hc_encode_decl(HashCtx *hc, const StigiDecl *d) {
         }
       }
       hc_encode_type(hc, d->u.val_decl.type);
-      hc_encode_expr(hc, d->u.val_decl.body);
+      hc_encode_expr(hc, stigi_val_body(d));
       break;
     case STIGI_DECL_ENUM:
       cb_stigi_str(hc->out, d->name);
@@ -1356,6 +1367,38 @@ static void hc_encode_decl(HashCtx *hc, const StigiDecl *d) {
       }
       break;
     }
+    case STIGI_DECL_TRAIT:
+      cb_stigi_str(hc->out, d->name);
+      cb_uleb(hc->out, d->u.trait_decl.type_param_count);
+      for (uint32_t i = 0; i < d->u.trait_decl.type_param_count; i++) {
+        hc_push_binder(hc, d->u.trait_decl.type_params[i].name);
+      }
+      cb_uleb(hc->out, d->u.trait_decl.member_count);
+      for (uint32_t i = 0; i < d->u.trait_decl.member_count; i++) {
+        cb_stigi_str(hc->out, d->u.trait_decl.members[i]->name);
+        hc_encode_decl(hc, d->u.trait_decl.members[i]);
+      }
+      break;
+    case STIGI_DECL_GIVEN:
+      cb_stigi_str(hc->out, d->name);
+      cb_uleb(hc->out, d->u.given_decl.type_param_count);
+      for (uint32_t i = 0; i < d->u.given_decl.type_param_count; i++) {
+        hc_push_binder(hc, d->u.given_decl.type_params[i].name);
+      }
+      cb_uleb(hc->out, d->u.given_decl.cap_param_count);
+      for (uint32_t i = 0; i < d->u.given_decl.cap_param_count; i++) {
+        bool has_b = d->u.given_decl.cap_params[i].name.len > 0;
+        cb_u8(hc->out, has_b ? 1 : 0);
+        if (has_b) hc_push_binder(hc, d->u.given_decl.cap_params[i].name);
+        hc_encode_type(hc, d->u.given_decl.cap_params[i].cap_type);
+      }
+      hc_encode_type(hc, d->u.given_decl.trait_type);
+      cb_uleb(hc->out, d->u.given_decl.def_count);
+      for (uint32_t i = 0; i < d->u.given_decl.def_count; i++) {
+        cb_stigi_str(hc->out, d->u.given_decl.defs[i]->name);
+        hc_encode_decl(hc, d->u.given_decl.defs[i]);
+      }
+      break;
     case STIGI_DECL_EXTERN:
       cb_stigi_str(hc->out, d->u.extern_decl.abi);
       cb_stigi_str(hc->out, d->name);
@@ -1655,7 +1698,7 @@ static bool dec_pat(DecCtx *dc) {
   size_t off = dc->pos;
   uint8_t tag = 0;
   if (!dec_u8_raw(dc, &tag, true)) return false;
-  if (tag < 0x20 || tag > (uint8_t)(0x20 + STIGI_PAT_CTOR)) {
+  if (tag < 0x20 || tag > (uint8_t)(0x20 + STIGI_PAT_TUPLE)) {
     return dec_fail(dc, STIGI_DECODE_UNKNOWN_TAG, off, "unknown pattern tag");
   }
   StigiPatKind pk = (StigiPatKind)(tag - 0x20);
@@ -1665,9 +1708,21 @@ static bool dec_pat(DecCtx *dc) {
     uint64_t v = 0;
     return dec_uleb_raw(dc, &v, true);
   }
+  if (pk == STIGI_PAT_CHAR) {
+    uint8_t cv = 0;
+    return dec_u8_raw(dc, &cv, true);
+  }
   if (pk == STIGI_PAT_BOOL) {
     bool bv = false;
     return dec_bool_u8(dc, &bv);
+  }
+  if (pk == STIGI_PAT_TUPLE) {
+    uint64_t sc = 0;
+    if (!dec_uleb_raw(dc, &sc, true)) return false;
+    for (uint64_t i = 0; i < sc; i++) {
+      if (!dec_pat(dc)) return false;
+    }
+    return true;
   }
   if (pk == STIGI_PAT_CTOR) {
     if (!dec_ref(dc)) return false;
@@ -1734,7 +1789,7 @@ static bool dec_expr(DecCtx *dc) {
       size_t op_off = dc->pos;
       uint8_t op = 0;
       ok = dec_u8_raw(dc, &op, true);
-      if (ok && op > (uint8_t)STIGI_OP_NEG) {
+      if (ok && op > (uint8_t)STIGI_OP_PIPE) {
         ok = dec_fail(dc, STIGI_DECODE_UNKNOWN_TAG, op_off, "unknown binop");
       }
       if (ok) ok = dec_expr(dc) && dec_expr(dc);
@@ -2015,6 +2070,31 @@ static bool dec_decl(DecCtx *dc) {
       if (ok) ok = dec_uleb_raw(dc, &vc, true);
       for (uint64_t i = 0; ok && i < vc; i++) ok = dec_expr(dc);
       if (ok) ok = dec_uleb_raw(dc, &dcnt, true);
+      for (uint64_t i = 0; ok && i < dcnt; i++) {
+        ok = dec_str(dc, NULL, NULL) && dec_decl(dc);
+      }
+      break;
+    }
+    case STIGI_DECL_TRAIT: {
+      uint64_t tpc = 0, mc = 0;
+      ok = dec_str(dc, NULL, NULL) && dec_uleb_raw(dc, &tpc, true);
+      if (ok) { dc->binder_count += tpc; ok = dec_uleb_raw(dc, &mc, true); }
+      for (uint64_t i = 0; ok && i < mc; i++) {
+        ok = dec_str(dc, NULL, NULL) && dec_decl(dc);
+      }
+      break;
+    }
+    case STIGI_DECL_GIVEN: {
+      uint64_t tpc = 0, cpc = 0, dcnt = 0;
+      ok = dec_str(dc, NULL, NULL) && dec_uleb_raw(dc, &tpc, true);
+      if (ok) { dc->binder_count += tpc; ok = dec_uleb_raw(dc, &cpc, true); }
+      for (uint64_t i = 0; ok && i < cpc; i++) {
+        bool hb = false;
+        ok = dec_bool_u8(dc, &hb);
+        if (ok && hb) dc->binder_count++;
+        if (ok) ok = dec_type(dc);
+      }
+      if (ok) ok = dec_type(dc) && dec_uleb_raw(dc, &dcnt, true);
       for (uint64_t i = 0; ok && i < dcnt; i++) {
         ok = dec_str(dc, NULL, NULL) && dec_decl(dc);
       }
@@ -3026,7 +3106,8 @@ static int32_t resolve_cap_type_unit(const ResCtx *ctx, const StigiType *cap_ty)
   if (cap_ty == NULL) return -1;
   int32_t tgt = stigi_image_resolve_name(ctx->img, ctx->from_idx,
                                          cap_ty->name.ptr, cap_ty->name.len);
-  if (tgt >= 0 && ctx->img->units[tgt].ast->decl->kind == STIGI_DECL_CAPABILITY) {
+  if (tgt >= 0 && (ctx->img->units[tgt].ast->decl->kind == STIGI_DECL_CAPABILITY ||
+                   ctx->img->units[tgt].ast->decl->kind == STIGI_DECL_TRAIT)) {
     return tgt;
   }
   if (is_builtin_name(cap_ty->name.ptr, cap_ty->name.len)) return -2;
@@ -3036,13 +3117,25 @@ static int32_t resolve_cap_type_unit(const ResCtx *ctx, const StigiType *cap_ty)
 static bool cap_has_op(const StigiImage *img, uint32_t cidx, const char *op, size_t op_len) {
   if (cidx >= img->unit_count) return false;
   const StigiDecl *d = img->units[cidx].ast->decl;
-  if (d->kind != STIGI_DECL_CAPABILITY) return false;
-  for (uint32_t i = 0; i < d->u.cap_decl.member_count; i++) {
-    const StigiDecl *m = d->u.cap_decl.members[i];
-    if (m->kind == STIGI_DECL_DEF && m->name.len == op_len &&
-        memcmp(m->name.ptr, op, op_len) == 0) {
-      return true;
+  if (d->kind == STIGI_DECL_CAPABILITY) {
+    for (uint32_t i = 0; i < d->u.cap_decl.member_count; i++) {
+      const StigiDecl *m = d->u.cap_decl.members[i];
+      if (m->kind == STIGI_DECL_DEF && m->name.len == op_len &&
+          memcmp(m->name.ptr, op, op_len) == 0) {
+        return true;
+      }
     }
+    return false;
+  }
+  if (d->kind == STIGI_DECL_TRAIT) {
+    for (uint32_t i = 0; i < d->u.trait_decl.member_count; i++) {
+      const StigiDecl *m = d->u.trait_decl.members[i];
+      if (m->kind == STIGI_DECL_DEF && m->name.len == op_len &&
+          memcmp(m->name.ptr, op, op_len) == 0) {
+        return true;
+      }
+    }
+    return false;
   }
   return false;
 }
@@ -3050,16 +3143,19 @@ static bool cap_has_op(const StigiImage *img, uint32_t cidx, const char *op, siz
 static Status resolve_ref(ResCtx *ctx, StigiStr ref, StigiSpan sp, bool allow_case) {
   if (ref.len == 0 || is_local(ctx, ref)) return STIGI_OK;
 
-  /* Capability operation call `binder.op` (capabilities.md 1) */
-  const char *dot = memchr(ref.ptr, '.', ref.len);
+  /* Capability operation call `binder.op` or unnamed `Cap.op` (capabilities.md 1, S125) */
+  const char *dot = NULL;
+  for (size_t i = 0; i < ref.len; i++) {
+    if (ref.ptr[i] == '.') dot = ref.ptr + i;
+  }
   if (dot != NULL) {
     StigiStr prefix;
     prefix.ptr = ref.ptr;
     prefix.len = (size_t)(dot - ref.ptr);
+    const char *op = dot + 1;
+    size_t op_len = ref.len - prefix.len - 1U;
     const LocalEntry *le = find_local_entry(ctx, prefix);
     if (le != NULL && le->cap_unit != -1) {
-      const char *op = dot + 1;
-      size_t op_len = ref.len - prefix.len - 1U;
       if (le->cap_unit == -2) return STIGI_OK;
       uint32_t cidx = (uint32_t)le->cap_unit;
       if (cap_has_op(ctx->img, cidx, op, op_len)) {
@@ -3071,6 +3167,28 @@ static Status resolve_ref(ResCtx *ctx, StigiStr ref, StigiSpan sp, bool allow_ca
       return add_ndiag(ctx->diags, STIGI_NAME_UNRESOLVED, sp, ctx->diag,
                        "capability '%s' has no operation '%.*s'",
                        ctx->img->units[cidx].name, (int)op_len, op);
+    }
+    if (stigi_image_resolve_name(ctx->img, ctx->from_idx, ref.ptr, ref.len) < 0) {
+      int32_t cap_t = stigi_image_resolve_name(ctx->img, ctx->from_idx, prefix.ptr, prefix.len);
+      if (cap_t >= 0 && (ctx->img->units[cap_t].ast->decl->kind == STIGI_DECL_CAPABILITY ||
+                         ctx->img->units[cap_t].ast->decl->kind == STIGI_DECL_TRAIT)) {
+        uint32_t cidx = (uint32_t)cap_t;
+        if (cap_has_op(ctx->img, cidx, op, op_len)) {
+          if (!stigi_image_visible_from(ctx->img, cidx, ctx->from_idx)) {
+            Status st = add_ndiag(ctx->diags, STIGI_NAME_PRIVATE_REF, sp, ctx->diag,
+                                  "'%s' cannot access private capability '%s'",
+                                  ctx->img->units[ctx->from_idx].name, ctx->img->units[cidx].name);
+            if (st != STIGI_OK) return st;
+          }
+          if (!same_namespace_or_sub(&ctx->img->units[cidx], &ctx->img->units[ctx->from_idx])) {
+            ctx->img->units[cidx].used_outside_ns = true;
+          }
+          return add_edge(ctx->img, ctx->from_idx, cidx, ctx->diag);
+        }
+        return add_ndiag(ctx->diags, STIGI_NAME_UNRESOLVED, sp, ctx->diag,
+                         "capability '%s' has no operation '%.*s'",
+                         ctx->img->units[cidx].name, (int)op_len, op);
+      }
     }
   }
 
@@ -3167,6 +3285,52 @@ static Status walk_type(ResCtx *ctx, const StigiType *ty) {
   return STIGI_OK;
 }
 
+static Status walk_pat(ResCtx *ctx, const StigiPat *pat, bool check_dup) {
+  if (pat == NULL) return STIGI_OK;
+  if (pat->kind == STIGI_PAT_VAR) {
+    return push_local(ctx, pat->name, pat->span, check_dup);
+  }
+  if (pat->kind == STIGI_PAT_TUPLE) {
+    for (uint32_t i = 0; i < pat->subpat_count; i++) {
+      Status st = walk_pat(ctx, &pat->subpats[i], check_dup);
+      if (st != STIGI_OK) return st;
+    }
+    return STIGI_OK;
+  }
+  if (pat->kind == STIGI_PAT_CTOR) {
+    Status st = resolve_ref(ctx, pat->name, pat->span, true);
+    if (st != STIGI_OK) return st;
+    if (pat->subpat_count > 0) {
+      for (uint32_t i = 0; i < pat->subpat_count; i++) {
+        st = walk_pat(ctx, &pat->subpats[i], check_dup);
+        if (st != STIGI_OK) return st;
+      }
+    } else {
+      for (uint32_t f = 0; f < pat->field_count; f++) {
+        st = push_local(ctx, pat->fields[f], pat->span, check_dup);
+        if (st != STIGI_OK) return st;
+      }
+    }
+  }
+  return STIGI_OK;
+}
+
+static Status walk_match_arms(ResCtx *ctx, const StigiMatchArm *arms, uint32_t arm_count) {
+  for (uint32_t i = 0; i < arm_count; i++) {
+    uint32_t saved = ctx->local_count;
+    Status st = walk_pat(ctx, &arms[i].pat, false);
+    if (st == STIGI_OK && arms[i].guard != NULL) {
+      st = walk_expr(ctx, arms[i].guard);
+    }
+    if (st == STIGI_OK) {
+      st = walk_expr(ctx, arms[i].body);
+    }
+    ctx->local_count = saved;
+    if (st != STIGI_OK) return st;
+  }
+  return STIGI_OK;
+}
+
 static Status walk_expr(ResCtx *ctx, const StigiExpr *e) {
   if (e == NULL) return STIGI_OK;
   Status st = STIGI_OK;
@@ -3217,27 +3381,16 @@ static Status walk_expr(ResCtx *ctx, const StigiExpr *e) {
       }
       return walk_expr(ctx, e->u.while_expr.body);
     case STIGI_EXPR_MATCH:
-      st = walk_expr(ctx, e->u.match_expr.scrutinee);
-      if (st != STIGI_OK) return st;
-      for (uint32_t i = 0; i < e->u.match_expr.arm_count; i++) {
-        uint32_t saved = ctx->local_count;
-        const StigiPat *pat = &e->u.match_expr.arms[i].pat;
-        if (pat->kind == STIGI_PAT_CTOR) {
-          st = resolve_ref(ctx, pat->name, pat->span, true);
-          if (st != STIGI_OK) { ctx->local_count = saved; return st; }
-          for (uint32_t f = 0; f < pat->field_count; f++) {
-            st = push_local(ctx, pat->fields[f], pat->span, false);
-            if (st != STIGI_OK) { ctx->local_count = saved; return st; }
-          }
-        } else if (pat->kind == STIGI_PAT_VAR) {
-          st = push_local(ctx, pat->name, pat->span, false);
-          if (st != STIGI_OK) { ctx->local_count = saved; return st; }
+      if (e->u.match_expr.scrutinee_count >= 2 && e->u.match_expr.scrutinees != NULL) {
+        for (uint32_t i = 0; i < e->u.match_expr.scrutinee_count; i++) {
+          st = walk_expr(ctx, e->u.match_expr.scrutinees[i]);
+          if (st != STIGI_OK) return st;
         }
-        st = walk_expr(ctx, e->u.match_expr.arms[i].body);
-        ctx->local_count = saved;
+      } else {
+        st = walk_expr(ctx, e->u.match_expr.scrutinee);
         if (st != STIGI_OK) return st;
       }
-      return STIGI_OK;
+      return walk_match_arms(ctx, e->u.match_expr.arms, e->u.match_expr.arm_count);
     case STIGI_EXPR_VAL:
       if (e->u.val_stmt.type != NULL) {
         st = walk_type(ctx, e->u.val_stmt.type);
@@ -3245,17 +3398,11 @@ static Status walk_expr(ResCtx *ctx, const StigiExpr *e) {
       }
       st = walk_expr(ctx, e->u.val_stmt.init);
       if (st != STIGI_OK) return st;
-      if (e->u.val_stmt.pat.kind == STIGI_PAT_VAR) {
-        return push_local(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.pat.span, true);
-      } else if (e->u.val_stmt.pat.kind == STIGI_PAT_CTOR) {
-        st = resolve_ref(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.pat.span, true);
+      if (e->u.val_stmt.else_arm_count > 0) {
+        st = walk_match_arms(ctx, e->u.val_stmt.else_arms, e->u.val_stmt.else_arm_count);
         if (st != STIGI_OK) return st;
-        for (uint32_t f = 0; f < e->u.val_stmt.pat.field_count; f++) {
-          st = push_local(ctx, e->u.val_stmt.pat.fields[f], e->u.val_stmt.pat.span, true);
-          if (st != STIGI_OK) return st;
-        }
       }
-      return STIGI_OK;
+      return walk_pat(ctx, &e->u.val_stmt.pat, true);
     case STIGI_EXPR_VAR:
       if (e->u.var_stmt.type != NULL) {
         st = walk_type(ctx, e->u.var_stmt.type);
@@ -3407,7 +3554,11 @@ static Status walk_decl(ResCtx *ctx, const StigiDecl *d) {
     case STIGI_DECL_DEF:
     case STIGI_DECL_LEMMA_DEF:
       st = walk_def_head(ctx, &d->u.def_decl.head);
-      if (st == STIGI_OK) st = walk_expr(ctx, d->u.def_decl.body);
+      if (st == STIGI_OK && d->u.def_decl.clause_count > 0) {
+        st = walk_match_arms(ctx, d->u.def_decl.clauses, d->u.def_decl.clause_count);
+      } else if (st == STIGI_OK) {
+        st = walk_expr(ctx, d->u.def_decl.body);
+      }
       break;
     case STIGI_DECL_VAL:
     case STIGI_DECL_TEST:
@@ -3510,6 +3661,35 @@ static Status walk_decl(ResCtx *ctx, const StigiDecl *d) {
         st = walk_decl(ctx, d->u.handler_decl.defs[i]);
       }
       break;
+    case STIGI_DECL_TRAIT:
+      for (uint32_t i = 0; i < d->u.trait_decl.type_param_count; i++) {
+        st = push_local(ctx, d->u.trait_decl.type_params[i].name,
+                        d->u.trait_decl.type_params[i].span, true);
+        if (st != STIGI_OK) break;
+      }
+      for (uint32_t i = 0; st == STIGI_OK && i < d->u.trait_decl.member_count; i++) {
+        st = walk_decl(ctx, d->u.trait_decl.members[i]);
+      }
+      break;
+    case STIGI_DECL_GIVEN:
+      for (uint32_t i = 0; i < d->u.given_decl.type_param_count; i++) {
+        st = push_local(ctx, d->u.given_decl.type_params[i].name,
+                        d->u.given_decl.type_params[i].span, true);
+        if (st != STIGI_OK) break;
+      }
+      for (uint32_t i = 0; st == STIGI_OK && i < d->u.given_decl.cap_param_count; i++) {
+        int32_t cap_u = resolve_cap_type_unit(ctx, d->u.given_decl.cap_params[i].cap_type);
+        st = push_local_ex(ctx, d->u.given_decl.cap_params[i].name,
+                           d->u.given_decl.cap_params[i].span, true, cap_u);
+        if (st == STIGI_OK) st = walk_type(ctx, d->u.given_decl.cap_params[i].cap_type);
+      }
+      if (st == STIGI_OK && d->u.given_decl.trait_type != NULL) {
+        st = walk_type(ctx, d->u.given_decl.trait_type);
+      }
+      for (uint32_t i = 0; st == STIGI_OK && i < d->u.given_decl.def_count; i++) {
+        st = walk_decl(ctx, d->u.given_decl.defs[i]);
+      }
+      break;
     case STIGI_DECL_EXTERN:
       if (d->u.extern_decl.is_val) {
         st = walk_type(ctx, d->u.extern_decl.val_type);
@@ -3596,6 +3776,18 @@ Status stigi_image_resolve(StigiImage *img, StigiNameDiags *diags, Diag *diag) {
         if (st != STIGI_OK) return st;
       }
     }
+    if (d->kind == STIGI_DECL_GIVEN && d->u.given_decl.trait_name.len > 0) {
+      int32_t tr = stigi_image_resolve_name(img, i, d->u.given_decl.trait_name.ptr,
+                                            d->u.given_decl.trait_name.len);
+      if (tr >= 0) {
+        st = add_edge(img, (uint32_t)tr, i, diag);
+        if (st != STIGI_OK) return st;
+        if (u->is_pub) {
+          /* Implicitly resolved pub givens count as externally readable when their trait is used */
+          u->used_outside_ns = true;
+        }
+      }
+    }
   }
 
   /* Reachability BFS from roots */
@@ -3639,5 +3831,7 @@ Status stigi_image_resolve(StigiImage *img, StigiNameDiags *diags, Diag *diag) {
     }
   }
 
+  Status est = stigi_elaborate_image(img, NULL, diag);
+  if (est != STIGI_OK) return est;
   return compute_all_unit_ids(img, diags, diag);
 }

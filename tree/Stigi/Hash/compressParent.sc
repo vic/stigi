@@ -1,18 +1,20 @@
-// prompt: compress two eight-word child chaining values into one parent chaining value.
-def Stigi.Hash.compressParent {Stigi.Mut} (leftChain: Array[U32](8), rightChain: Array[U32](8), isRoot: Bool, initChain: Array[U32](8), message: Array[U32](16), scratch: Array[U32](16), state: Array[U32](16), destChain: Array[U32](8)) <lessOrEqual(0, 1)>: Unit =
+// prompt: compress one BLAKE3 parent node combining a stacked left chain and current right chain.
+def Stigi.Hash.compressParent {region: Stigi.Region, Stigi.Mut} (stackWords: Array[U32](512), parentDepth: U64, chain: Array[U32](8), blockWords: Array[U32](16), isRoot: Bool) <below(parentDepth, 56)>: Bool =
+  val baseSlot: U64 = parentDepth * 8
   var lane: U64 = 0
-  var upperSlot: U64 = 8
-  while lane < 8 && upperSlot < 16 do
-    @<lessOrEqual(lane, 8), lessOrEqual(upperSlot, 16), decreases(8 - lane)>
-    initChain(lane) := Stigi.Hash.initWord(lane)
-    message(lane) := leftChain(lane)
-    message(upperSlot) := rightChain(lane)
+  while lane < 8 do
+    @<lessOrEqual(lane, 8)>
+    if baseSlot < 504 then
+      val leftSlot: U64 = baseSlot + lane
+      if leftSlot < 512 then blockWords(lane) := stackWords(leftSlot) else ()
+    else ()
+    val rightLane: U64 = lane + 8
+    if rightLane < 16 then blockWords(rightLane) := chain(lane) else ()
     lane = lane + 1
-    upperSlot = upperSlot + 1
-  val flags: U32 = if isRoot then 12 else 4
-  Stigi.Hash.compressBlock(initChain, message, scratch, state, 0, 0, 64, flags)
-  var outLane: U64 = 0
-  while outLane < 8 do
-    @<lessOrEqual(outLane, 8), decreases(8 - outLane)>
-    destChain(outLane) := state(outLane)
-    outLane = outLane + 1
+  var resetIdx: U64 = 0
+  while resetIdx < 8 do
+    @<lessOrEqual(resetIdx, 8)>
+    chain(resetIdx) := Stigi.Hash.initWord(resetIdx)
+    resetIdx = resetIdx + 1
+  val parentFlags: U32 = if isRoot then U32.ofU64(12) else U32.ofU64(4)
+  Stigi.Hash.compressBlock{region}(chain, blockWords, 0, U32.ofU64(64), parentFlags)

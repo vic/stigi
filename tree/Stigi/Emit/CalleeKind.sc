@@ -1,0 +1,33 @@
+// prompt: closed classification of built-in, trait, POSIX ABI, and user call targets for C11 emission.
+enum Stigi.Emit.CalleeKind:
+  case CalleeCastWord
+  case CalleeCastWordShort
+  case CalleeCastByte
+  case CalleeCastSignedLong
+  case CalleeCastSignedWord
+  case CalleeWrapAddWord
+  case CalleeWrapSubWord
+  case CalleeWrapMulWord
+  case CalleeBitAndWord
+  case CalleeBitOrWord
+  case CalleeBitXorWord
+  case CalleeShiftLeftWord
+  case CalleeShiftRightWord
+  case CalleeWrapAddShort
+  case CalleeWrapSubShort
+  case CalleeWrapMulShort
+  case CalleeBitAndShort
+  case CalleeBitOrShort
+  case CalleeBitXorShort
+  case CalleeShiftLeftShort
+  case CalleeShiftRightShort
+  case CalleeMixWord
+  case CalleeRotateRightShort
+  case CalleeTraitEqual
+  case CalleeTraitLess
+  case CalleeAbiOpenat
+  case CalleeAbiUnlink
+  case CalleeAbiClock
+  case CalleeAbiUsage
+  case CalleeAbiDirect
+  case CalleeNormal

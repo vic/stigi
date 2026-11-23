@@ -82,6 +82,10 @@ Status stigi_door_tx(StigiDoor *door, const char *const *srcs, const size_t *len
 Status stigi_door_replace_all(StigiDoor *door, const char *const *srcs, const size_t *lens,
                               uint32_t count, StigiDoorResult *out, Diag *diag);
 
+/* S126: garbage-collect unreachable units from roots (main, pub, Test, NegTest) atomically */
+Status stigi_door_gc(StigiDoor *door, uint32_t *out_removed_units,
+                     StigiDoorResult *out, Diag *diag);
+
 /* Cache persistence helpers (for store.c) */
 Status stigi_door_cache_add_verdict(StigiDoor *door, const uint8_t key[32], Diag *diag);
 Status stigi_door_cache_add_test(StigiDoor *door, const uint8_t key[32], Diag *diag);

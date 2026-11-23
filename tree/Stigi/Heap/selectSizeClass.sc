@@ -1,3 +1,0 @@
-// prompt: select the fixed Heap size class and block size for an allocation request.
-pub def Stigi.Heap.selectSizeClass(requestBytes: U64) <lessOrEqual(0, requestBytes)>: Stigi.Heap.SizeClassOutcome =
-  if requestBytes <= 16 then ClassSlot(0, 16) else if requestBytes <= 32 then ClassSlot(1, 32) else if requestBytes <= 64 then ClassSlot(2, 64) else if requestBytes <= 128 then ClassSlot(3, 128) else if requestBytes <= 256 then ClassSlot(4, 256) else if requestBytes <= 512 then ClassSlot(5, 512) else if requestBytes <= 1024 then ClassSlot(6, 1024) else if requestBytes <= 4096 then ClassSlot(7, 4096) else ClassOversized

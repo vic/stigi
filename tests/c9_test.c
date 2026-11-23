@@ -645,6 +645,20 @@ static int test_3transport_parity_and_negatives(void) {
     free(rep);
   }
 
+  /* S126 / S127: explicit treeshake / gc frame verbs return accepted gc */
+  {
+    char *rep = NULL;
+    size_t rlen = 0;
+    CHECK(stigi_handle_frame(&srv_sock, "treeshake", 9, &rep, &rlen, &diag) == STIGI_OK, "treeshake frame");
+    CHECK(rep != NULL && strstr(rep, "accepted gc (removed=0") != NULL, "treeshake frame clean on live image");
+    free(rep);
+    rep = NULL;
+    rlen = 0;
+    CHECK(stigi_handle_frame(&srv_sock, "gc", 2, &rep, &rlen, &diag) == STIGI_OK, "gc frame");
+    CHECK(rep != NULL && strstr(rep, "accepted gc (removed=0") != NULL, "gc frame clean on live image");
+    free(rep);
+  }
+
   /* T18 lock-free parallel vs sequential parity on 9 units (8 helpers + main) */
   {
     const char *par_srcs[9] = {
@@ -657,7 +671,7 @@ static int test_3transport_parity_and_negatives(void) {
         "// prompt: pure math helper seven.\npub def Par.helperSeven(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 7\n",
         "// prompt: pure math helper eight.\npub def Par.helperEight(value: U64) <lessOrEqual(0, value), lessOrEqual(value, 100)>: U64 = value + 8\n",
         "// prompt: entry calling all eight parallel helpers.\n"
-        "pub def main() <lessOrEqual(0, 1)>: I32 =\n"
+        "pub def main(): I32 <lessOrEqual(0, result)> =\n"
         "  val first: U64 = Par.helperOne(1)\n"
         "  val second: U64 = Par.helperTwo(1)\n"
         "  val third: U64 = Par.helperThree(1)\n"
@@ -698,6 +712,50 @@ static int test_3transport_parity_and_negatives(void) {
     stigi_door_result_free(&r_par);
     stigi_door_free(&d_seq);
     stigi_door_free(&d_par);
+  }
+
+  /* Phase 2.4 (S127): comptime tree-shaking folds pure private calls, arithmetic, and prunes orphaned units */
+  {
+    StigiDoor ts_door;
+    CHECK(stigi_door_init(&ts_door, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &diag) == STIGI_OK,
+          "ts_door init");
+    const char *ts3_srcs[3] = {
+        ("// prompt: private pure helper.\n"
+         "def Shake.privateFold(input: U64) <below(input, 100)>: U64 <lessOrEqual(input, result)> =\n"
+         "  val doubled: U64 = input + input\n"
+         "  doubled + 2\n"),
+        ("// prompt: public wrapper calling privateFold with constant argument.\n"
+         "pub def Shake.wrapper(): U64 <lessOrEqual(0, result)> =\n"
+         "  Shake.privateFold(4)\n"),
+        ("// prompt: external entry calling Shake.wrapper.\n"
+         "pub def main(): I32 <lessOrEqual(0, result)> = if Shake.wrapper() == 10 then 0 else 1\n")
+    };
+    size_t ts3_lens[3] = {strlen(ts3_srcs[0]), strlen(ts3_srcs[1]), strlen(ts3_srcs[2])};
+    StigiDoorResult tsr;
+    stigi_door_result_init(&tsr);
+    Status tss = stigi_door_submit(&ts_door, ts3_srcs, ts3_lens, 3, &tsr, &diag);
+    if (!tsr.accepted) {
+      for (uint32_t i = 0; i < tsr.reject_count; i++) {
+        fprintf(stderr, "  ts3 reject: %s %s %s\n", tsr.rejects[i].subject, tsr.rejects[i].code, tsr.rejects[i].msg);
+      }
+    }
+    CHECK(tss == STIGI_OK && tsr.accepted, "S127 submit private helper before treeshake");
+    stigi_door_result_free(&tsr);
+    CHECK(ts_door.image.unit_count == 3, "S127 image has 3 units before treeshake");
+
+    uint32_t removed = 0;
+    stigi_door_result_init(&tsr);
+    CHECK(stigi_door_gc(&ts_door, &removed, &tsr, &diag) == STIGI_OK && tsr.accepted,
+          "S127 treeshake folds private helper and prunes orphaned unit");
+    stigi_door_result_free(&tsr);
+    int32_t widx = stigi_image_find(&ts_door.image, "Shake.wrapper", strlen("Shake.wrapper"));
+    CHECK(widx >= 0 && strstr(ts_door.unit_srcs[widx], "Shake.privateFold(") == NULL &&
+              strstr(ts_door.unit_srcs[widx], "= 10") != NULL,
+          "S127 treeshake folded pure private call Shake.privateFold(4) -> 10");
+    CHECK(removed == 1U && ts_door.image.unit_count == 2U &&
+              stigi_image_find(&ts_door.image, "Shake.privateFold", strlen("Shake.privateFold")) < 0,
+          "S127 treeshake pruned orphaned Shake.privateFold after comptime evaluation");
+    stigi_door_free(&ts_door);
   }
 
   stigi_server_free(&srv_sock);
