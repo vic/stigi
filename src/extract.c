@@ -1105,6 +1105,26 @@ static void ext_emit_owed_subst(ExtCtx *ctx, const char *op, const StigiFactGrou
                                 const StigiParam *sp, const char *const *sv, uint32_t scnt) {
   for (uint32_t i = 0; i < fg->count; i++) {
     const StigiFactItem *it = &fg->items[i];
+    /* S137: a fact stated on a relation unit under Stigi.* is owed at its point; no relation unit carries a
+     * scope yet, so no rule clears the row */
+    if (it->kind == STIGI_FACT_ATOM) {
+      int32_t ridx = stigi_image_resolve_name(ctx->img, ctx->uidx, it->atom_name.ptr, it->atom_name.len);
+      if (ridx >= 0 && ctx->img->units[ridx].ast->decl->kind == STIGI_DECL_RELATION &&
+          strncmp(ctx->img->units[ridx].name, "Stigi.", 6) == 0) {
+        ctx_emit4(ctx, "atomOwed", col_sym(op), col_sym(ctx->img->units[ridx].name), col_sym(sc),
+                  col_sym(code));
+        continue;
+      }
+      /* S137 addendum 2: in a body assertion every atom other than below and lessOrEqual is owed and
+       * nothing clears it (rejected until a family derives it); entry/exit facts keep their producers */
+      if (strcmp(code, "assertion-unproved") == 0 && !str_eq_c(it->atom_name, "below") &&
+          !str_eq_c(it->atom_name, "Stigi.Facts.below") && !str_eq_c(it->atom_name, "lessOrEqual") &&
+          !str_eq_c(it->atom_name, "Stigi.Facts.lessOrEqual")) {
+        ctx_emit4(ctx, "atomOwed", col_sym(op), col_sym(ctx_strdup(ctx, it->atom_name.ptr, it->atom_name.len)),
+                  col_sym(sc), col_sym(code));
+        continue;
+      }
+    }
     if (it->kind == STIGI_FACT_CMP) {
       const char *vx = ext_resolve_fact_val(ctx, it->lhs, res_sym, sp, sv, scnt);
       const char *vy = ext_resolve_fact_val(ctx, it->rhs, res_sym, sp, sv, scnt);

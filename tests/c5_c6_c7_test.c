@@ -838,6 +838,39 @@ int main(void) {
           "Phase 2.4: effectful given rejected with given-row");
     stigi_door_result_free(&r);
 
+    /* NEG S137: a fact stated on a relation unit under Stigi.* is owed at its point and nothing clears it:
+     * the assertion is rejected with assertion-unproved (the schema's atomOwed has no clearing rule) */
+    const char *owed_relation =
+        "// prompt: kernel relation with no rows for the owed-assertion probe.\n"
+        "pub relation Stigi.Probe.rows(value: Stigi.Id.Value, limit: Stigi.Id.Value)\n";
+    const char *owed_assert =
+        "// prompt: assert a row of the kernel relation that no rule derives.\n"
+        "pub def main(item: U64, limit: U64) <lessOrEqual(0, item)>: Bool =\n"
+        "  @<Stigi.Probe.rows(item, limit)>\n"
+        "  false\n";
+    const char *kn_owed[2] = {owed_relation, owed_assert};
+    size_t kn_owedl[2] = {strlen(kn_owed[0]), strlen(kn_owed[1])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn_owed, kn_owedl, 2, &r, &d) == STIGI_OK, "check owed relation assertion");
+    if (!has_reject_code(&r, "assertion-unproved")) dump_rejects("owed-relation", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "assertion-unproved"),
+          "S137: an assertion on a Stigi.* relation unit is rejected with assertion-unproved");
+    stigi_door_result_free(&r);
+
+    /* The same relation promised as an exit fact is owed too (exit-unproved), through the relation-unit producer */
+    const char *owed_exit =
+        "// prompt: promise a row of the kernel relation at exit that no rule derives.\n"
+        "pub def main(item: U64, limit: U64) <lessOrEqual(0, item)>: Bool <Stigi.Probe.rows(item, limit)> =\n"
+        "  false\n";
+    const char *kn_exit[2] = {owed_relation, owed_exit};
+    size_t kn_exitl[2] = {strlen(kn_exit[0]), strlen(kn_exit[1])};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&p2door, kn_exit, kn_exitl, 2, &r, &d) == STIGI_OK, "check owed relation exit fact");
+    if (!has_reject_code(&r, "exit-unproved")) dump_rejects("owed-exit", &r);
+    CHECK(!r.accepted && has_reject_code(&r, "exit-unproved"),
+          "S137: an exit fact on a Stigi.* relation unit is rejected with exit-unproved");
+    stigi_door_result_free(&r);
+
     /* NEG 5: concrete-protocol-in-signature for given */
     const char *eq_trait_priv =
         "// prompt: private equality trait protocol.\n"

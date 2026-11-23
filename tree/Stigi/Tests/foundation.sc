@@ -7,7 +7,7 @@ val Stigi.Tests.foundation {Stigi.Test}: Stigi.Test.Result =
   val diffLookup: Bool = !Stigi.sameValue(Found(9), Missing)
   val ordCheck: Bool = Stigi.Order.lessThan(3, 9)
   Stigi.Laws.clampInterval(99, 10, 50)
-  Stigi.Laws.withinLimitRule(4, 8, 16)
+  Stigi.Laws.belowThroughBound(4, 8, 16)
   val clamped: U64 = Stigi.clampWord(99, 10, 50)
   val mixLow: U64 = Stigi.Raw.mixSlot(0, 65536)
   val rotWord: U32 = Stigi.Raw.rotateRightWord(U32.ofU64(1), U32.ofU64(1))
