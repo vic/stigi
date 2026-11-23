@@ -513,7 +513,20 @@ static void mono_list_free(MonoList *ml) {
   ml->cap = 0;
 }
 
-static const StigiType *mono_subst_type(const StigiStr *tp_names,
+/* The stigi name of a scalar C type (U64 when it is not known) */
+static const char *scalar_type_name(EmitScalarTy ty) {
+  switch (ty) {
+    case ETY_U8: return "U8";
+    case ETY_U32: return "U32";
+    case ETY_I32: return "I32";
+    case ETY_I64: return "I64";
+    case ETY_BOOL: return "Bool";
+    case ETY_UNIT: return "Unit";
+    default: return "U64";
+  }
+}
+
+static const StigiType *mono_subst_type(Arena *arena, const StigiStr *tp_names,
                                         const StigiType *const *tp_vals,
                                         uint32_t tp_count, const StigiType *ty) {
   if (ty == NULL || tp_count == 0 || tp_names == NULL || tp_vals == NULL) return ty;
@@ -521,8 +534,22 @@ static const StigiType *mono_subst_type(const StigiStr *tp_names,
     for (uint32_t i = 0; i < tp_count; i++) {
       if (str_eq_ss(ty->name, tp_names[i]) && tp_vals[i] != NULL) return tp_vals[i];
     }
+    return ty;
   }
-  return ty;
+  if (ty->type_arg_count == 0 || arena == NULL) return ty;
+  /* a type parameter inside the type arguments (Array[A](n), Cell[A]): a copy with them substituted */
+  StigiType **args = arena_alloc(arena, (size_t)ty->type_arg_count * sizeof *args);
+  StigiType *copy = arena_alloc(arena, sizeof *copy);
+  if (args == NULL || copy == NULL) return ty;
+  bool changed = false;
+  for (uint32_t i = 0; i < ty->type_arg_count; i++) {
+    args[i] = (StigiType *)mono_subst_type(arena, tp_names, tp_vals, tp_count, ty->type_args[i]);
+    changed = changed || args[i] != ty->type_args[i];
+  }
+  if (!changed) return ty;
+  *copy = *ty;
+  copy->type_args = args;
+  return copy;
 }
 
 typedef struct {
@@ -1133,6 +1160,23 @@ static bool expr_is_complex_stmt(const StigiExpr *e) {
   }
 }
 
+/* Whether a statement ends in a C switch: a match, or a block or a branch whose last statement does. An arm of a tail
+   loop whose body ends so gets a dead `break;`: every inner arm returns or continues, but a C compiler cannot see that a
+   switch over an enum tag without a default covers every value, so it would report a fall-through. */
+static bool stmt_ends_in_switch(const StigiExpr *e) {
+  if (e == NULL) return false;
+  switch (e->kind) {
+    case STIGI_EXPR_MATCH:
+      return true;
+    case STIGI_EXPR_BLOCK:
+      return e->u.block.count > 0 && stmt_ends_in_switch(e->u.block.stmts[e->u.block.count - 1U]);
+    case STIGI_EXPR_IF:
+      return stmt_ends_in_switch(e->u.if_expr.then_br) || stmt_ends_in_switch(e->u.if_expr.else_br);
+    default:
+      return false;
+  }
+}
+
 static const StigiExpr *find_array_len_expr(const EmitCtx *ctx, const StigiExpr *target,
                                             EmitScalarTy *out_elem_ty) {
   if (out_elem_ty != NULL) *out_elem_ty = ETY_UNKNOWN;
@@ -1579,6 +1623,15 @@ static void emit_alloc_match(EmitCtx *ctx, const StigiExpr *e, int akind,
               }
             }
           }
+          /* the binder carries its element type like every array variable (a generic call infers A from it) */
+          if (v->elem_enum_uidx < 0) {
+            uint32_t sru = ctx->uidx;
+            const StigiType *sty = scr->u.call.type_arg_count > 0 && scr->u.call.type_args[0] != NULL
+                                       ? resolve_typedef_type(ctx->img, &sru, scr->u.call.type_args[0], 0)
+                                       : NULL;
+            v->elem_scalar_ty = sty != NULL ? ast_type_to_scalar(ctx->img, sru, sty, 0)
+                                            : infer_expr_scalar(ctx, scr->u.call.args[1]);
+          }
           eb_cstr(ctx->b, "    ");
           eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
           eb_cstr(ctx->b, " *");
@@ -1916,7 +1969,7 @@ static void emit_match_core(EmitCtx *ctx, const StigiExpr *e, const char *lhs_va
         eb_cstr(ctx->b, "      break;\n");
       } else {
         emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
-        if (is_void || !is_tail) eb_cstr(ctx->b, "      break;\n");
+        if (is_void || !is_tail || (ctx->is_tail_loop && stmt_ends_in_switch(e->u.match_expr.arms[a].body))) eb_cstr(ctx->b, "      break;\n");
       }
       emit_ctx_pop_vars(ctx, saved);
       eb_cstr(ctx->b, "    }\n");
@@ -1996,7 +2049,7 @@ static void emit_match_core(EmitCtx *ctx, const StigiExpr *e, const char *lhs_va
       eb_cstr(ctx->b, "      break;\n");
     } else {
       emit_stmt_or_ret(ctx, e->u.match_expr.arms[a].body, is_tail, is_void);
-      if (is_void || !is_tail) eb_cstr(ctx->b, "      break;\n");
+      if (is_void || !is_tail || (ctx->is_tail_loop && stmt_ends_in_switch(e->u.match_expr.arms[a].body))) eb_cstr(ctx->b, "      break;\n");
     }
     emit_ctx_pop_vars(ctx, saved);
     eb_cstr(ctx->b, "    }\n");
@@ -3282,8 +3335,13 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
                                        e->u.call.callee->u.ident.name.len);
         if (tgt >= 0) {
           callee_d = ctx->img->units[tgt].ast->decl;
-          if (callee_d->kind == STIGI_DECL_DEF) {
-            callee_h = &callee_d->u.def_decl.head;
+          /* a generic C-DSL unit is monomorphized per type argument like a generic def (emitter.md 3: C types come
+             from the call site, with A resolved) */
+          bool generic_dsl = callee_d->kind == STIGI_DECL_EXTERN && !callee_d->u.extern_decl.is_val &&
+                             callee_d->u.extern_decl.body != NULL &&
+                             callee_d->u.extern_decl.head.type_param_count > 0;
+          if (callee_d->kind == STIGI_DECL_DEF || generic_dsl) {
+            callee_h = generic_dsl ? &callee_d->u.extern_decl.head : &callee_d->u.def_decl.head;
             if (callee_h->type_param_count > 0 && ctx->mono_list != NULL && ctx->mono_arena != NULL) {
               uint32_t tpc = callee_h->type_param_count;
               StigiStr *tp_names = arena_alloc(ctx->mono_arena, (size_t)tpc * sizeof *tp_names);
@@ -3293,10 +3351,37 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
                   tp_names[tp] = callee_h->type_params[tp].name;
                   tp_vals[tp] = NULL;
                   if (tp < e->u.call.type_arg_count && e->u.call.type_args[tp] != NULL) {
-                    tp_vals[tp] = mono_subst_type(ctx->mono_tp_names, ctx->mono_tp_vals,
+                    tp_vals[tp] = mono_subst_type(ctx->mono_arena, ctx->mono_tp_names, ctx->mono_tp_vals,
                                                   ctx->mono_tp_count, e->u.call.type_args[tp]);
                   } else {
                     for (uint32_t p = 0; p < callee_h->param_count && p < e->u.call.arg_count; p++) {
+                      /* A as the element type of an Array[A](n) parameter: the element type of the argument */
+                      const StigiType *pt = callee_h->params[p].type;
+                      const StigiExpr *pa = e->u.call.args[p];
+                      if (pt != NULL && pt->kind == STIGI_TYPE_ARRAY && pt->type_arg_count == 1 &&
+                          pt->type_args[0]->kind == STIGI_TYPE_NAMED &&
+                          str_eq_ss(pt->type_args[0]->name, tp_names[tp]) && pa->kind == STIGI_EXPR_LOCAL) {
+                        const EmitVar *av = emit_find_var(ctx, pa->u.ident.name);
+                        if (av != NULL && av->ast_type != NULL && av->ast_type->kind == STIGI_TYPE_ARRAY &&
+                            av->ast_type->type_arg_count == 1) {
+                          tp_vals[tp] = mono_subst_type(ctx->mono_arena, ctx->mono_tp_names, ctx->mono_tp_vals,
+                                                        ctx->mono_tp_count, av->ast_type->type_args[0]);
+                          break;
+                        }
+                        /* an array bound by a pattern (`Filled(xs)`) carries its element type, not an Array type */
+                        StigiType *et = av != NULL && av->is_array ? arena_alloc(ctx->mono_arena, sizeof *et) : NULL;
+                        if (et != NULL) {
+                          memset(et, 0, sizeof *et);
+                          et->kind = STIGI_TYPE_NAMED;
+                          et->name = av->elem_enum_uidx >= 0
+                                         ? (StigiStr){ctx->img->units[av->elem_enum_uidx].name,
+                                                      (uint32_t)ctx->img->units[av->elem_enum_uidx].name_len}
+                                         : (StigiStr){scalar_type_name(av->elem_scalar_ty),
+                                                      (uint32_t)strlen(scalar_type_name(av->elem_scalar_ty))};
+                          tp_vals[tp] = et;
+                          break;
+                        }
+                      }
                       if (callee_h->params[p].type != NULL &&
                           callee_h->params[p].type->kind == STIGI_TYPE_NAMED &&
                           str_eq_ss(callee_h->params[p].type->name, tp_names[tp])) {
@@ -3304,7 +3389,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
                         if (ae->kind == STIGI_EXPR_LOCAL) {
                           const EmitVar *av = emit_find_var(ctx, ae->u.ident.name);
                           if (av != NULL && av->ast_type != NULL) {
-                            tp_vals[tp] = mono_subst_type(ctx->mono_tp_names, ctx->mono_tp_vals,
+                            tp_vals[tp] = mono_subst_type(ctx->mono_arena, ctx->mono_tp_names, ctx->mono_tp_vals,
                                                           ctx->mono_tp_count, av->ast_type);
                             break;
                           }
@@ -3425,7 +3510,7 @@ static void emit_expr_typed(EmitCtx *ctx, const StigiExpr *e, EmitScalarTy hint)
                                        ? callee_h->params[i].type
                                        : NULL;
             if (mono_call_tp_count > 0 && pty != NULL) {
-              pty = mono_subst_type(mono_call_tp_names, mono_call_tp_vals, mono_call_tp_count, pty);
+              pty = mono_subst_type(ctx->mono_arena, mono_call_tp_names, mono_call_tp_vals, mono_call_tp_count, pty);
             }
             uint32_t puidx = tgt >= 0 ? (uint32_t)tgt : ctx->uidx;
             EmitScalarTy ph = pty != NULL ? ast_type_to_scalar(ctx->img, puidx, pty, 0) : ETY_UNKNOWN;
@@ -3787,10 +3872,10 @@ static void emit_def_sig_head_mono(EmitBuf *b, const StigiImage *img, uint32_t u
                                    const StigiDefHead *h, const char *name, size_t name_len,
                                    bool is_static, bool is_inline, const char *extra_first_param,
                                    const char *mono_suffix, const StigiStr *tp_names,
-                                   const StigiType *const *tp_vals, uint32_t tp_count) {
+                                   const StigiType *const *tp_vals, uint32_t tp_count, Arena *arena) {
   if (is_static) eb_cstr(b, "static ");
   if (is_inline) eb_cstr(b, "inline ");
-  const StigiType *rty = mono_subst_type(tp_names, tp_vals, tp_count, h->ret_type);
+  const StigiType *rty = mono_subst_type(arena, tp_names, tp_vals, tp_count, h->ret_type);
   emit_c_type(b, img, uidx, rty, 0);
   eb_cstr(b, " ");
   eb_mangle_name(b, name, name_len);
@@ -3822,7 +3907,7 @@ static void emit_def_sig_head_mono(EmitBuf *b, const StigiImage *img, uint32_t u
     for (uint32_t i = 0; i < h->param_count; i++) {
       if (!first) eb_cstr(b, ", ");
       first = false;
-      const StigiType *pty = mono_subst_type(tp_names, tp_vals, tp_count, h->params[i].type);
+      const StigiType *pty = mono_subst_type(arena, tp_names, tp_vals, tp_count, h->params[i].type);
       emit_c_type(b, img, uidx, pty, 0);
       eb_cstr(b, " ");
       eb_c_ident(b, h->params[i].name);
@@ -3835,7 +3920,7 @@ static void emit_def_sig_head(EmitBuf *b, const StigiImage *img, uint32_t uidx,
                               const StigiDefHead *h, const char *name, size_t name_len,
                               bool is_static, bool is_inline, const char *extra_first_param) {
   emit_def_sig_head_mono(b, img, uidx, h, name, name_len, is_static, is_inline,
-                         extra_first_param, NULL, NULL, NULL, 0);
+                         extra_first_param, NULL, NULL, NULL, 0, NULL);
 }
 
 /* Emit enum in lockstep with stigi_enum_layout_info (memory.md 8):
@@ -5013,6 +5098,7 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       eb_cstr(&b, ";\n");
     } else if (d->kind == STIGI_DECL_EXTERN && !d->u.extern_decl.is_val &&
                d->u.extern_decl.body != NULL) {
+      if (d->u.extern_decl.head.type_param_count > 0) continue;
       emit_def_sig_head(&b, img, u->idx, &d->u.extern_decl.head, u->name, u->name_len,
                         true, true, NULL);
       eb_cstr(&b, ";\n");
@@ -5190,7 +5276,7 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
          d->u.extern_decl.body != NULL)) {
       bool is_extern_dsl = (d->kind == STIGI_DECL_EXTERN);
       const StigiDefHead *h = is_extern_dsl ? &d->u.extern_decl.head : &d->u.def_decl.head;
-      if (!is_extern_dsl && h->type_param_count > 0) continue;
+      if (h->type_param_count > 0) continue;
       const StigiExpr *body = is_extern_dsl ? d->u.extern_decl.body : stigi_def_body(d);
       if (!is_extern_dsl && strcmp(u->name, "main") == 0) {
         has_main = true;
@@ -5305,13 +5391,14 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
     }
   }
 
-  /* 4b. Emit monomorphized generic def specializations (fixed-point worklist, S125) */
+  /* 4b. Emit monomorphized generic def and C-DSL specializations (fixed-point worklist, S125; emitter.md 3) */
   for (uint32_t mi = 0; mi < mono_list.count; mi++) {
     uint32_t m_uidx = mono_list.items[mi].uidx;
     const StigiImageUnit *u = &img->units[m_uidx];
     const StigiDecl *d = u->ast->decl;
-    const StigiDefHead *h = &d->u.def_decl.head;
-    const StigiExpr *body = stigi_def_body(d);
+    bool is_extern_dsl = d->kind == STIGI_DECL_EXTERN;
+    const StigiDefHead *h = is_extern_dsl ? &d->u.extern_decl.head : &d->u.def_decl.head;
+    const StigiExpr *body = is_extern_dsl ? d->u.extern_decl.body : stigi_def_body(d);
     const StigiStr *tp_names = mono_list.items[mi].tp_names;
     const StigiType *const *tp_vals = mono_list.items[mi].tp_vals;
     uint32_t tp_count = mono_list.items[mi].tp_count;
@@ -5319,15 +5406,16 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
 
     /* Forward declaration in `b` before `bodies_b` */
     emit_def_sig_head_mono(&b, img, u->idx, h, u->name, u->name_len,
-                           true, false, NULL, mkey, tp_names, tp_vals, tp_count);
+                           true, is_extern_dsl, NULL, mkey, tp_names, tp_vals, tp_count, &mono_arena);
     eb_cstr(&b, ";\n");
 
-    const StigiType *rty = mono_subst_type(tp_names, tp_vals, tp_count, h->ret_type);
+    const StigiType *rty = mono_subst_type(&mono_arena, tp_names, tp_vals, tp_count, h->ret_type);
     EmitCtx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.img = img;
     ctx.uidx = u->idx;
-    ctx.cur_def = d;
+    ctx.cur_def = is_extern_dsl ? NULL : d;
+    ctx.in_extern_dsl = is_extern_dsl;
     ctx.cur_head = h;
     ctx.b = &bodies_b;
     ctx.stats = stats;
@@ -5364,13 +5452,13 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       }
     }
     for (uint32_t p = 0; p < h->param_count; p++) {
-      const StigiType *pty = mono_subst_type(tp_names, tp_vals, tp_count, h->params[p].type);
+      const StigiType *pty = mono_subst_type(&mono_arena, tp_names, tp_vals, tp_count, h->params[p].type);
       (void)emit_register_var(&ctx, h->params[p].name, pty, u->idx, true);
     }
 
     eb_line_dir(&bodies_b, d->span.line, u->name, u->name_len);
     emit_def_sig_head_mono(&bodies_b, img, u->idx, h, u->name, u->name_len,
-                           true, false, NULL, mkey, tp_names, tp_vals, tp_count);
+                           true, is_extern_dsl, NULL, mkey, tp_names, tp_vals, tp_count, &mono_arena);
     eb_cstr(&bodies_b, " {\n");
     for (uint32_t cp = 0; cp < cap_param_seq; cp++) {
       eb_fmt(&bodies_b, "  (void)_cap%u;\n", cp);

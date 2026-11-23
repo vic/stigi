@@ -283,6 +283,45 @@ int main(void) {
       "    @<lessOrEqual(idx, count)>\n"
       "    idx = idx + 1\n"
       "  idx\n";
+  /* emitter: in a tail loop, a match arm that ends in a nested match gets a dead `break;` so the C compilers report no
+   * fall-through (-Werror) */
+  const char *u_sugar_walk =
+      "// prompt: the sum of two tagged numbers, swapping the tags past mixed ones, zero for an empty tag.\n"
+      "pub def Demo.Sugar.tagWalk(tag: Demo.Tag, other: Demo.Tag, limit: U64) <decreases(limit)>: U64 =\n"
+      "  if limit < 1 then 0 else\n"
+      "    tag match\n"
+      "      case Number(value) =>\n"
+      "        other match\n"
+      "          case Number(more) => if value < 100 && more < 100 then value + more else 0\n"
+      "          case Mixed(_, _, _) => Demo.Sugar.tagWalk(other, tag, limit - 1)\n"
+      "          case Empty => 0\n"
+      "      case Mixed(_, _, _) => Demo.Sugar.tagWalk(other, tag, limit - 1)\n"
+      "      case Empty => 0\n";
+  /* emitter.md 3: a generic C-DSL unit is emitted once per used element type, with C types from the call site
+   * (one call on U8 arrays, one on U32 arrays: both C compilers must accept the emitted C with -Werror) */
+  const char *u_copy_run =
+      "// prompt: copy the first elements of one array into another until either ends, returning the copied count.\n"
+      "pub extern \"c\" def Stigi.Probe.copyRun [A: Type] {Stigi.Mut} (srcCap: U64, src: Array[A](srcCap), srcEnd: U64, "
+      "dstCap: U64, dst: Array[A](dstCap)) <lessOrEqual(srcEnd, srcCap)>: U64 <lessOrEqual(result, dstCap)> =\n"
+      "  var idx: U64 = 0\n"
+      "  while idx < srcEnd && idx < dstCap do\n"
+      "    @<lessOrEqual(idx, srcEnd), lessOrEqual(idx, dstCap)>\n"
+      "    dst(idx) := src(idx)\n"
+      "    idx = idx + 1\n"
+      "  idx\n";
+  const char *u_copy_both =
+      "// prompt: three when three bytes and three words copy into fresh arrays with their last elements intact, else zero.\n"
+      "pub def Demo.Sugar.copyBoth {region: Stigi.Region, Stigi.Mut} (): U64 <lessOrEqual(result, 4)> =\n"
+      "  val bytes: Array[U8](3) = \"abc\"\n"
+      "  val Filled(byteOut) = Array.tryFill[U8]{region}(4, 0) else\n"
+      "    case FillFailed => 0\n"
+      "  val Filled(words) = Array.tryFill[U32]{region}(3, U32.ofU64(7)) else\n"
+      "    case FillFailed => 0\n"
+      "  val Filled(wordOut) = Array.tryFill[U32]{region}(4, U32.ofU64(0)) else\n"
+      "    case FillFailed => 0\n"
+      "  val byteCount: U64 = Stigi.Probe.copyRun(3, bytes, 3, 4, byteOut)\n"
+      "  val wordCount: U64 = Stigi.Probe.copyRun(3, words, 3, 4, wordOut)\n"
+      "  if byteCount == 3 && byteOut(2) == 'c' && wordOut(2) == U32.ofU64(7) then wordCount else 0\n";
   const char *u_sugar_test =
       "// prompt: check the pattern sugar on fixed inputs in the evaluator.\n"
       "val Demo.Sugar.Tests.sugarSuite {Stigi.Test}: Stigi.Test.Result =\n"
@@ -295,7 +334,9 @@ int main(void) {
       "  val pairGood: Bool = Demo.Sugar.pairClass('q', 1) == 1 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.pairClass('7', 0) == 2\n"
       "  val bandGood: Bool = Demo.Sugar.bandClass(5, true, true) == 1 && Demo.Sugar.bandClass(5, false, true) == 0 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(12, false, false) == 0 && Demo.Sugar.bandClass(12, false, true) == 2 && Demo.Sugar.bandClass(40, true, true) == 0\n"
       "  val runGood: Bool = Demo.Sugar.wordRun(6, \"ab1D2c\") == 3 && Demo.Sugar.wordRun(2, \"q7\") == 2 && Demo.Sugar.wordRun(1, \"Q\") == 0\n"
-      "  Stigi.Test.expect(digitGood && smallGood && flatGood && lineGood && yesGood && guardGood && pairGood && bandGood && runGood, true, "
+      "  val walkGood: Bool = Demo.Sugar.tagWalk(Number(3), Number(4), 5) == 7 && Demo.Sugar.tagWalk(Mixed(1, 2, 3), Number(9), 5) == 0 && Demo.Sugar.tagWalk(Empty, Number(1), 5) == 0\n"
+      "  val copyGood: Bool = Demo.Sugar.copyBoth{Stigi.Region}() == 3\n"
+      "  Stigi.Test.expect(digitGood && smallGood && flatGood && lineGood && yesGood && guardGood && pairGood && bandGood && runGood && walkGood && copyGood, true, "
       "\"pattern sugar gives the written answers\")\n";
 
   const char *u_lemma =
@@ -359,29 +400,29 @@ int main(void) {
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
       "  val tailVal: U64 = Demo.extractTail(Wide(9, 1))\n"
       "  val foundAt: U64 = Demo.findByte(3, \"abc\", 0, 3, 'c')\n"
-      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.wordRun(6, \"ab1D2c\") == 3\n"
+      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.wordRun(6, \"ab1D2c\") == 3 && Demo.Sugar.tagWalk(Number(3), Number(4), 5) == 7 && Demo.Sugar.copyBoth() == 3\n"
       "  val negInput: I32 = -5\n"
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
       "  val signedCompareTrue: Bool = (-5 < 0)\n"
       "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && foundAt == 2 && sugarGood && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[38] = {
+  const char *all_srcs[41] = {
       u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
       u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
       u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
       u_tainted_write,   u_apply_wrap,  u_tailsum_ok,    u_void_tail,   u_lemma,
       u_add_one,         u_eq_trait,    u_eq_word,       u_multi_head,  u_test_ok,
       u_main_ok,         u_find_scan,   u_sugar_shape,   u_sugar_digit, u_sugar_small,
-      u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_guard, u_sugar_pair, u_sugar_band, u_sugar_run,
+      u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_guard, u_sugar_pair, u_sugar_band, u_sugar_run, u_sugar_walk, u_copy_run, u_copy_both,
       u_sugar_test
   };
-  size_t all_lens[38];
-  for (int i = 0; i < 38; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[41];
+  for (int i = 0; i < 41; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 38, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 41, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",
