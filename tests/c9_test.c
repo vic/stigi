@@ -571,6 +571,43 @@ static int test_3transport_parity_and_negatives(void) {
   CHECK(memcmp(c_vk_before, door_mcp.image.units[ci].verdict_key, 32) != 0,
         "S119: caller verdict_key invalidated after callee proof-fact-only edit");
 
+  /* 8b. S136: a type with facts is nominal: two such types with equal bodies are two units with two ids
+   *     (the qualified name is in both hashes); the defs that take them differ too */
+  const char *nominal =
+      "batch\n"
+      "new // prompt: first nominal capacity.\n"
+      "type Demo.Nominal.FirstCap = U64 <below(self, 100)>\n"
+      "new // prompt: second nominal capacity with the same body.\n"
+      "type Demo.Nominal.SecondCap = U64 <below(self, 100)>\n"
+      "new // prompt: accept the first capacity.\n"
+      "def Demo.Nominal.useFirst(cap: Demo.Nominal.FirstCap) <lessOrEqual(0, cap)>: Bool =\n"
+      "  cap >= 0\n"
+      "new // prompt: accept the second capacity.\n"
+      "def Demo.Nominal.useSecond(cap: Demo.Nominal.SecondCap) <lessOrEqual(0, cap)>: Bool =\n"
+      "  cap >= 0\n"
+      "new // prompt: test that reaches both capacities.\n"
+      "val Demo.Nominal.Tests.both {Stigi.Test}: Stigi.Test.Result =\n"
+      "  Stigi.Test.expect(Demo.Nominal.useFirst(1) && Demo.Nominal.useSecond(1), true, \"both\")\n";
+  CHECK(stigi_handle_frame(&srv_mcp, nominal, strlen(nominal), &rep, &rlen, &diag) == STIGI_OK, "nominal batch");
+  CHECK(strstr(rep, "admitted component") != NULL, "two nominal types with equal bodies admitted");
+  free(rep);
+  int32_t first_ti = stigi_image_find(&door_mcp.image, "Demo.Nominal.FirstCap", 21);
+  int32_t second_ti = stigi_image_find(&door_mcp.image, "Demo.Nominal.SecondCap", 22);
+  CHECK(first_ti >= 0 && second_ti >= 0, "both nominal types in image");
+  if (first_ti >= 0 && second_ti >= 0) {
+    CHECK(memcmp(door_mcp.image.units[first_ti].unit_id, door_mcp.image.units[second_ti].unit_id, 32) != 0,
+          "S136: two types with facts and equal bodies have different unit_id");
+    CHECK(memcmp(door_mcp.image.units[first_ti].verdict_key, door_mcp.image.units[second_ti].verdict_key, 32) != 0,
+          "S136: two types with facts and equal bodies have different verdict_key");
+  }
+  int32_t use_first_i = stigi_image_find(&door_mcp.image, "Demo.Nominal.useFirst", 21);
+  int32_t use_second_i = stigi_image_find(&door_mcp.image, "Demo.Nominal.useSecond", 22);
+  CHECK(use_first_i >= 0 && use_second_i >= 0, "both nominal users in image");
+  if (use_first_i >= 0 && use_second_i >= 0) {
+    CHECK(memcmp(door_mcp.image.units[use_first_i].unit_id, door_mcp.image.units[use_second_i].unit_id, 32) != 0,
+          "S136: defs that take the two nominal types have different unit_id");
+  }
+
   /* 9. Defect #25: 1,000-frame flat-RSS + zero-page-fault oracle with REAL `check` frames */
   const char *real_check =
       "check\n"

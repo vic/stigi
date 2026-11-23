@@ -1245,6 +1245,10 @@ static void hc_encode_decl(HashCtx *hc, const StigiDecl *d) {
       }
       break;
     case STIGI_DECL_TYPE: {
+      /* S136: a type with facts is nominal (types.md 2): its qualified name is in both hashes, so
+       * `Stigi.NodeCap` and `Stigi.TokenCap` are two units even though their bodies are equal */
+      cb_u8(hc->out, d->u.type_decl.has_facts ? 1 : 0);
+      if (d->u.type_decl.has_facts) cb_stigi_str(hc->out, d->name);
       cb_uleb(hc->out, d->u.type_decl.type_param_count);
       for (uint32_t i = 0; i < d->u.type_decl.type_param_count; i++) {
         hc_push_binder(hc, d->u.type_decl.type_params[i].name);
@@ -2015,7 +2019,10 @@ static bool dec_decl(DecCtx *dc) {
     }
     case STIGI_DECL_TYPE: {
       uint64_t tpc = 0, vpc = 0, cpc = 0;
-      ok = dec_uleb_raw(dc, &tpc, true);
+      bool nominal = false;
+      ok = dec_bool_u8(dc, &nominal);
+      if (ok && nominal) ok = dec_str(dc, NULL, NULL);
+      if (ok) ok = dec_uleb_raw(dc, &tpc, true);
       if (ok) { dc->binder_count += tpc; ok = dec_uleb_raw(dc, &vpc, true); }
       for (uint64_t i = 0; ok && i < vpc; i++) {
         dc->binder_count++;
