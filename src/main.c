@@ -20,7 +20,7 @@ static void print_usage(void) {
   printf("usage:\n"
          "  stigi-seed --version\n"
          "  stigi-seed --serve <sock> [--load <dir>] [--user] [--rules <all.dl>]\n"
-         "  stigi-seed --cc-socks <sock> [--peer <name>] [--load <dir>] [--user] [--rules <all.dl>]\n"
+         "  stigi-seed --cc-socks <sock> [--peer <name>] [--from-mode prompting|bypass] [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --mcp [--socket <sock>] [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --load <dir> --emit <out.c> [--user] [--rules <all.dl>]\n");
 }
@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
   const char *serve_sock = NULL;
   const char *cc_sock = NULL;
   const char *peer_name = NULL;
+  StigiCcFromMode from_mode = STIGI_CC_FROM_PROMPTING;
   const char *mcp_sock = NULL;
   const char *load_dir = NULL;
   const char *emit_path = NULL;
@@ -57,6 +58,20 @@ int main(int argc, char **argv) {
       cc_sock = argv[++i];
     } else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
       peer_name = argv[++i];
+      if (!stigi_cc_peer_name_valid(peer_name)) {
+        fprintf(stderr, "stigi-seed: --peer name must be non-empty with no <>\"\\ or control byte\n");
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--from-mode") == 0 && i + 1 < argc) {
+      const char *m = argv[++i];
+      if (strcmp(m, "prompting") == 0) {
+        from_mode = STIGI_CC_FROM_PROMPTING;
+      } else if (strcmp(m, "bypass") == 0) {
+        from_mode = STIGI_CC_FROM_BYPASS;
+      } else {
+        fprintf(stderr, "stigi-seed: --from-mode must be prompting or bypass, found '%s'\n", m);
+        return 1;
+      }
     } else if (strcmp(argv[i], "--mcp") == 0) {
       mcp_mode = true;
     } else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
@@ -163,6 +178,8 @@ int main(int argc, char **argv) {
 
   StigiServerCtx srv;
   stigi_server_init(&srv, &door);
+  if (peer_name != NULL) srv.peer_name = peer_name;
+  srv.from_mode = from_mode;
   char reg_path[512];
   reg_path[0] = '\0';
   if (serve_sock != NULL) {

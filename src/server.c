@@ -9,9 +9,12 @@
 #include "print.h"
 #include "store.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -109,6 +112,8 @@ void stigi_server_init(StigiServerCtx *ctx, StigiDoor *door) {
   if (ctx == NULL) return;
   memset(ctx, 0, sizeof *ctx);
   ctx->door = door;
+  ctx->peer_name = "stigi";
+  ctx->from_mode = STIGI_CC_FROM_PROMPTING;
   arena_init(&ctx->scratch);
 }
 
@@ -1698,8 +1703,7 @@ static bool decode_uds_peer_addr(const char *uds, size_t ulen, char *out, size_t
   return true;
 }
 
-static Status send_cc_peer_reply(const char *peer_sock, const char *my_sock,
-                                 const char *reply, size_t rlen, Diag *diag) {
+static void uuid_v4(char out[37]) {
   uint8_t u[16];
   memset(u, 0, sizeof u);
   FILE *ur = fopen("/dev/urandom", "rb");
@@ -1710,15 +1714,24 @@ static Status send_cc_peer_reply(const char *peer_sock, const char *my_sock,
   }
   u[6] = (uint8_t)((u[6] & 0x0fU) | 0x40U);
   u[8] = (uint8_t)((u[8] & 0x3fU) | 0x80U);
-  char uuid[40];
-  (void)snprintf(uuid, sizeof uuid,
+  (void)snprintf(out, 37,
                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
                  u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
                  u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+}
+
+static const char *const CC_FROM_MODE_TEXT[] = {[STIGI_CC_FROM_PROMPTING] = "prompting",
+                                                 [STIGI_CC_FROM_BYPASS] = "bypass"};
+
+/* The msgV:1 user frame of a reply: the wrapper names this peer and its permission class. */
+Status stigi_cc_peer_reply_frame(const StigiServerCtx *ctx, const char *my_sock, const char *reply,
+                                 size_t rlen, char **out, size_t *out_len, Diag *diag) {
+  char uuid[37];
+  uuid_v4(uuid);
 
   ReplyBuf wrap = {NULL, 0, 0, false};
-  rb_fmt(&wrap, "<cross-session-message from=\"uds:%s\" from-name=\"stigi\" from-mode=\"bypass\">\n",
-         my_sock);
+  rb_fmt(&wrap, "<cross-session-message from=\"uds:%s\" from-name=\"%s\" from-mode=\"%s\">\n",
+         my_sock, ctx->peer_name, CC_FROM_MODE_TEXT[ctx->from_mode]);
   rb_mem(&wrap, reply, rlen);
   if (rlen == 0 || reply[rlen - 1U] != '\n') rb_cstr(&wrap, "\n");
   rb_cstr(&wrap, "</cross-session-message>");
@@ -1742,6 +1755,16 @@ static Status send_cc_peer_reply(const char *peer_sock, const char *my_sock,
     free(frame.buf);
     return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
   }
+  *out = frame.buf;
+  *out_len = frame.len;
+  return STIGI_OK;
+}
+
+static Status send_cc_peer_reply(const StigiServerCtx *ctx, const char *peer_sock,
+                                 const char *my_sock, const char *reply, size_t rlen, Diag *diag) {
+  ReplyBuf frame = {NULL, 0, 0, false};
+  Status fst = stigi_cc_peer_reply_frame(ctx, my_sock, reply, rlen, &frame.buf, &frame.len, diag);
+  if (fst != STIGI_OK) return fst;
 
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -1828,6 +1851,53 @@ Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_
   return st;
 }
 
+bool stigi_cc_peer_name_valid(const char *name) {
+  if (name == NULL || name[0] == '\0') return false;
+  for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; p++) {
+    if (*p < 0x20U || *p == 0x7fU || *p == '<' || *p == '>' || *p == '"' || *p == '\\') return false;
+  }
+  return true;
+}
+
+/* pidDomain and version are those of the live sessions on this host: copy them from the first
+   live <pid>.json that states each (a file whose pid no longer runs is stale). */
+static void live_peer_meta(const char *dir, pid_t self, char *domain, size_t domain_cap,
+                           char *version, size_t version_cap) {
+  DIR *d = opendir(dir);
+  if (d == NULL) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL && (domain[0] == '\0' || version[0] == '\0')) {
+    char *end = NULL;
+    long epid = strtol(e->d_name, &end, 10);
+    if (end == e->d_name || strcmp(end, ".json") != 0 || epid <= 0 || epid == (long)self) continue;
+    if (kill((pid_t)epid, 0) != 0 && errno != EPERM) continue;
+    char path[1024];
+    int pn = snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+    if (pn < 0 || (size_t)pn >= sizeof path) continue;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) continue;
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    (void)fclose(f);
+    struct {
+      const char *key;
+      char *out;
+      size_t cap;
+    } wants[2] = {{"pidDomain", domain, domain_cap}, {"version", version, version_cap}};
+    for (size_t w = 0; w < 2; w++) {
+      char *val = NULL;
+      size_t vlen = 0;
+      if (wants[w].out[0] == '\0' &&
+          stigi_json_obj_get_string(buf, n, wants[w].key, &val, &vlen) == JSON_OK &&
+          vlen > 0 && vlen < wants[w].cap) {
+        memcpy(wants[w].out, val, vlen + 1U);
+      }
+      free(val);
+    }
+  }
+  (void)closedir(d);
+}
+
 /* Register this cc-socks server in ~/.claude/sessions/<pid>.json (opencc registry/register.go) */
 Status stigi_cc_peer_register(const char *peer_name, const char *sock_path,
                               char *out_reg_path, size_t reg_cap, Diag *diag) {
@@ -1881,13 +1951,37 @@ Status stigi_cc_peer_register(const char *peer_name, const char *sock_path,
   int tn = snprintf(tmp_path, sizeof tmp_path, "%s/.%ld.json.tmp", dir, (long)pid);
   if (tn < 0 || (size_t)tn >= sizeof tmp_path) return diag_set(diag, STIGI_ERR_INVALID, -1, "path too long");
 
+  char domain[256] = "";
+  char version[64] = "";
+  live_peer_meta(dir, pid, domain, sizeof domain, version, sizeof version);
+  char cwd[4096];
+  if (getcwd(cwd, sizeof cwd) == NULL) cwd[0] = '\0';
+  char session_id[37];
+  uuid_v4(session_id);
+  struct timespec now;
+  (void)clock_gettime(CLOCK_REALTIME, &now);
+  long long now_ms = (long long)now.tv_sec * 1000LL + (long long)(now.tv_nsec / 1000000L);
+
   ReplyBuf jb = {NULL, 0, 0, false};
-  rb_fmt(&jb, "{\"pid\":%ld,\"sessionId\":\"\",\"cwd\":\"\",\"name\":", (long)pid);
+  rb_fmt(&jb, "{\"pid\":%ld,\"sessionId\":\"%s\",\"cwd\":", (long)pid, session_id);
+  rb_json_escaped(&jb, cwd, strlen(cwd));
+  rb_fmt(&jb, ",\"startedAt\":%lld,\"updatedAt\":%lld,\"statusUpdatedAt\":%lld,\"name\":",
+         now_ms, now_ms, now_ms);
   rb_json_escaped(&jb, peer_name, strlen(peer_name));
-  rb_cstr(&jb, ",\"kind\":\"bg\",\"status\":\"idle\",\"messagingSocketPath\":");
+  rb_fmt(&jb, ",\"nameSource\":\"user\",\"nameSince\":%lld,\"kind\":\"bg\",\"entrypoint\":\"cli\","
+              "\"status\":\"idle\",\"messagingSocketPath\":",
+         now_ms);
   rb_json_escaped(&jb, sock_path, strlen(sock_path));
-  rb_fmt(&jb, ",\"peerProtocol\":1,\"peerFeatures\":[],\"procStart\":\"%s\",\"pidDomain\":\"\"}",
-         proc_start);
+  rb_fmt(&jb, ",\"peerProtocol\":1,\"peerFeatures\":[],\"procStart\":\"%s\"", proc_start);
+  if (version[0] != '\0') {
+    rb_cstr(&jb, ",\"version\":");
+    rb_json_escaped(&jb, version, strlen(version));
+  }
+  if (domain[0] != '\0') {
+    rb_cstr(&jb, ",\"pidDomain\":");
+    rb_json_escaped(&jb, domain, strlen(domain));
+  }
+  rb_cstr(&jb, "}");
   if (jb.oom || jb.buf == NULL) {
     free(jb.buf);
     return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
@@ -2090,7 +2184,7 @@ static Status serve_unix_loop(StigiServerCtx *ctx, const char *sock_path,
               stigi_json_obj_get_string(req, rlen, "from", &from_s, &from_l) == JSON_OK) {
             char peer_sock[256];
             if (decode_uds_peer_addr(from_s, from_l, peer_sock, sizeof peer_sock)) {
-              (void)send_cc_peer_reply(peer_sock, sock_path, rep, rep_len, diag);
+              (void)send_cc_peer_reply(ctx, peer_sock, sock_path, rep, rep_len, diag);
               sent_async = true;
             }
           }

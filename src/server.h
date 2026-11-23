@@ -19,8 +19,13 @@ typedef struct {
   size_t fixed_len;
 } StigiCheckedFix;
 
+/* Permission class a --cc-socks reply states in from-mode (frames.md 7.2). */
+typedef enum { STIGI_CC_FROM_PROMPTING = 0, STIGI_CC_FROM_BYPASS = 1 } StigiCcFromMode;
+
 typedef struct {
   StigiDoor *door;
+  const char *peer_name;     /* from-name of --cc-socks replies; "stigi" unless --peer */
+  StigiCcFromMode from_mode; /* prompting unless --from-mode bypass */
   Arena scratch;
   bool json_mode;
   size_t budget_tokens; /* 0 = unlimited */
@@ -50,6 +55,10 @@ Status stigi_cc_socks_handle_envelope(StigiServerCtx *ctx, const char *envelope_
                                       char **out_reply, size_t *out_len, Diag *diag);
 Status stigi_serve_cc_socks(StigiServerCtx *ctx, const char *sock_path,
                             uint32_t max_requests, Diag *diag);
+Status stigi_cc_peer_reply_frame(const StigiServerCtx *ctx, const char *my_sock, const char *reply,
+                                 size_t rlen, char **out, size_t *out_len, Diag *diag);
+/* A peer name that fits the cross-session wrapper attribute: no <>"\ and no control byte. */
+bool stigi_cc_peer_name_valid(const char *name);
 Status stigi_cc_peer_register(const char *peer_name, const char *sock_path,
                               char *out_reg_path, size_t reg_cap, Diag *diag);
 

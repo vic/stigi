@@ -335,6 +335,69 @@ static int test_store_load_roundtrip(void) {
   return 0;
 }
 
+/* frames.md 7.2: a --cc-socks reply names this peer and its permission class; the registry
+   entry carries the fields a Claude Code session lists peers by. */
+static int test_cc_peer_identity(void) {
+  Diag diag = {0};
+  StigiServerCtx ctx;
+  stigi_server_init(&ctx, NULL);
+  char *frame = NULL;
+  size_t flen = 0;
+  CHECK(stigi_cc_peer_reply_frame(&ctx, "/tmp/me.sock", "ok\n", 3, &frame, &flen, &diag) == STIGI_OK,
+        "default reply frame");
+  CHECK(strstr(frame, "from-name=\\\"stigi\\\" from-mode=\\\"prompting\\\"") != NULL,
+        "default reply is from stigi, prompting");
+  free(frame);
+  ctx.peer_name = "tree-peer";
+  ctx.from_mode = STIGI_CC_FROM_BYPASS;
+  CHECK(stigi_cc_peer_reply_frame(&ctx, "/tmp/me.sock", "ok\n", 3, &frame, &flen, &diag) == STIGI_OK,
+        "configured reply frame");
+  CHECK(strstr(frame, "from-name=\\\"tree-peer\\\" from-mode=\\\"bypass\\\"") != NULL,
+        "reply carries the --peer name and --from-mode");
+  free(frame);
+  stigi_server_free(&ctx);
+  CHECK(stigi_cc_peer_name_valid("stigi-tree") && !stigi_cc_peer_name_valid("a\"b") &&
+            !stigi_cc_peer_name_valid("a<b") && !stigi_cc_peer_name_valid(""),
+        "peer names that break the wrapper are refused");
+
+  /* Registry: pidDomain and version come from a live peer entry (the parent process). */
+  const char *home = "/tmp/stigi-c9-home";
+  rm_rf(home);
+  CHECK(mkdir(home, 0700) == 0 && mkdir("/tmp/stigi-c9-home/.claude", 0700) == 0 &&
+            mkdir("/tmp/stigi-c9-home/.claude/sessions", 0700) == 0,
+        "fake HOME");
+  char live[256];
+  (void)snprintf(live, sizeof live, "%s/.claude/sessions/%ld.json", home, (long)getppid());
+  FILE *lf = fopen(live, "wb");
+  CHECK(lf != NULL, "fake live peer entry");
+  fprintf(lf, "{\"pid\":%ld,\"version\":\"9.9.9\",\"pidDomain\":\"test-domain\"}", (long)getppid());
+  (void)fclose(lf);
+  char *old_home = getenv("HOME") != NULL ? strdup(getenv("HOME")) : NULL;
+  CHECK(setenv("HOME", home, 1) == 0, "set HOME");
+  char reg[512];
+  Status rs = stigi_cc_peer_register("tree-peer", "/tmp/tree.sock", reg, sizeof reg, &diag);
+  if (old_home != NULL) (void)setenv("HOME", old_home, 1);
+  free(old_home);
+  CHECK(rs == STIGI_OK, "register");
+  char body[4096];
+  FILE *rf = fopen(reg, "rb");
+  CHECK(rf != NULL, "read registration");
+  size_t bn = fread(body, 1, sizeof body - 1U, rf);
+  body[bn] = '\0';
+  (void)fclose(rf);
+  char *sid = strstr(body, "\"sessionId\":\"");
+  CHECK(sid != NULL && strlen(sid) > 49 && sid[13 + 36] == '"' && sid[13 + 8] == '-',
+        "sessionId is a UUID");
+  CHECK(strstr(body, "\"pidDomain\":\"test-domain\"") != NULL && strstr(body, "\"version\":\"9.9.9\"") != NULL,
+        "pidDomain and version copied from the live peer");
+  CHECK(strstr(body, "\"startedAt\":") != NULL && strstr(body, "\"cwd\":\"/") != NULL &&
+            strstr(body, "\"name\":\"tree-peer\"") != NULL,
+        "startedAt, cwd and name present");
+  rm_rf(home);
+  printf("c9 cc-socks peer identity: PASS\n");
+  return 0;
+}
+
 static int test_3transport_parity_and_negatives(void) {
   const char *core_sock = "/tmp/stigi-c9-core.sock";
   const char *cc_sock = "/tmp/stigi-c9-cc.sock";
@@ -830,6 +893,7 @@ static int test_3transport_parity_and_negatives(void) {
 int main(void) {
   if (test_store_load_roundtrip() != 0) return 1;
   if (test_3transport_parity_and_negatives() != 0) return 1;
+  if (test_cc_peer_identity() != 0) return 1;
   printf("c9_test: ALL PASS\n");
   return 0;
 }
