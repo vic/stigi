@@ -687,6 +687,33 @@ static int test_3transport_parity_and_negatives(void) {
           "S136: defs that take the two nominal types have different unit_id");
   }
 
+  /* 8c. frames.md 4 (Q0h): the components are closed over the edges the OLD image holds too: an edit that
+   *     removes a reference and the drop of the referent are one component, admitted in one frame */
+  const char *gone_new =
+      "batch\n"
+      "new // prompt: helper that its only user stops needing.\n"
+      "def Demo.Gone.helper(value: U64) <lessOrEqual(0, value)>: U64 =\n"
+      "  value\n"
+      "new // prompt: test that calls the helper.\n"
+      "val Demo.Gone.Tests.user {Stigi.Test}: Stigi.Test.Result =\n"
+      "  Stigi.Test.expect(Demo.Gone.helper(1), 1, \"helper\")\n";
+  CHECK(stigi_handle_frame(&srv_mcp, gone_new, strlen(gone_new), &rep, &rlen, &diag) == STIGI_OK, "gone batch");
+  CHECK(strstr(rep, "admitted component") != NULL, "helper and its user admitted");
+  free(rep);
+  const char *gone_edit =
+      "batch\n"
+      "edit Demo.Gone.Tests.user :=\n"
+      "// prompt: test that stands alone now.\n"
+      "val Demo.Gone.Tests.user {Stigi.Test}: Stigi.Test.Result =\n"
+      "  Stigi.Test.expect(1, 1, \"plain\")\n"
+      "drop Demo.Gone.helper\n";
+  CHECK(stigi_handle_frame(&srv_mcp, gone_edit, strlen(gone_edit), &rep, &rlen, &diag) == STIGI_OK, "gone edit batch");
+  if (strstr(rep, "rejected") != NULL) fprintf(stderr, "gone edit reply: %.300s\n", rep);
+  CHECK(strstr(rep, "rejected") == NULL && strstr(rep, "admitted component 1") != NULL,
+        "Q0h: an edit that drops a reference and the drop of the referent are admitted in one frame");
+  free(rep);
+  CHECK(stigi_image_find(&door_mcp.image, "Demo.Gone.helper", 16) < 0, "the dropped helper is gone from the image");
+
   /* 9. Defect #25: 1,000-frame flat-RSS + zero-page-fault oracle with REAL `check` frames */
   const char *real_check =
       "check\n"

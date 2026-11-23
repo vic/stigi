@@ -703,6 +703,23 @@ static void dsu_union(uint32_t *parent, uint32_t a, uint32_t b) {
   }
 }
 
+/* True when the image holds a dependency edge between the two named units in either direction */
+static bool image_has_edge_between(const StigiImage *img, const char *a, const char *b) {
+  int32_t ia = stigi_image_find(img, a, strlen(a));
+  int32_t ib = stigi_image_find(img, b, strlen(b));
+  if (ia < 0 || ib < 0 || img->adj_head == NULL || (uint32_t)ia >= img->adj_cap ||
+      (uint32_t)ib >= img->adj_cap) {
+    return false;
+  }
+  for (uint32_t e = img->adj_head[ia]; e != UINT32_MAX; e = img->edge_next[e]) {
+    if (img->edges[e].to == (uint32_t)ib) return true;
+  }
+  for (uint32_t e = img->adj_head[ib]; e != UINT32_MAX; e = img->edge_next[e]) {
+    if (img->edges[e].to == (uint32_t)ia) return true;
+  }
+  return false;
+}
+
 static bool is_ident_char(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9') || c == '_' || c == '.';
@@ -1412,6 +1429,13 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
         if (i == j) continue;
         if (ops[i].unit_name != NULL && ops[j].unit_name != NULL &&
             strcmp(ops[i].unit_name, ops[j].unit_name) == 0) {
+          dsu_union(parent, i, j);
+          continue;
+        }
+        /* frames.md 4: the components are closed over the edges the OLD image holds too, so an edit that
+         * removes a reference and the drop of that referent are one component */
+        if (ops[i].unit_name != NULL && ops[j].unit_name != NULL &&
+            image_has_edge_between(&ctx->door->image, ops[i].unit_name, ops[j].unit_name)) {
           dsu_union(parent, i, j);
           continue;
         }
