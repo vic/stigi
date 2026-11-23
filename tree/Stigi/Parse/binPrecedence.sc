@@ -42,6 +42,7 @@ def Stigi.Parse.binPrecedence(kind: Stigi.Lex.TokenKind): U64 <lessOrEqual(resul
   case TokStop => 0
   case TokTrue => 0
   case TokFalse => 0
+  case TokIs => 0
   case TokIdent => 0
   case TokUpper => 0
   case TokInt => 0
@@ -49,10 +50,12 @@ def Stigi.Parse.binPrecedence(kind: Stigi.Lex.TokenKind): U64 <lessOrEqual(resul
   case TokChar => 0
   case TokArrow => 0
   case TokColonAssign => 0
+  case TokBar => 0
   case TokAssign => 0
   case TokColon => 0
   case TokComma => 0
   case TokDot => 0
+  case TokDotDot => 0
   case TokLeftParen => 0
   case TokRightParen => 0
   case TokLeftBrack => 0

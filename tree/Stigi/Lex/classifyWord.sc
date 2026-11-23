@@ -1,22 +1,13 @@
 // prompt: classify an identifier slice into its exact L0 keyword, upper, or lower token kind.
 def Stigi.Lex.classifyWord(srcCap: Stigi.ByteCap, src: Array[U8](srcCap), startPos: U64, endPos: U64) <below(startPos, endPos), lessOrEqual(endPos, srcCap)>: Stigi.Lex.TokenKind =
-  val firstByte: U8 = src(startPos)
-  if Stigi.Lex.isUpperByte(firstByte) then TokUpper else
-    val wordLen: U64 = endPos - startPos
-    if wordLen == 2 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 2, "if") then TokIf else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 2, "do") then TokLoopBody else TokIdent
-    else if wordLen == 3 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "def") then TokDef else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "val") then TokVal else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "var") then TokVar else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "pub") then TokPub else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "for") then TokFor else TokIdent
-    else if wordLen == 4 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "enum") then TokEnum else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "case") then TokCase else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "then") then TokThen else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "else") then TokElse else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "type") then TokType else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "rule") then TokRule else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "stop") then TokStop else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "true") then TokTrue else TokIdent
-    else if wordLen == 5 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "match") then TokMatch else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "while") then TokWhile else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "trait") then TokTrait else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "given") then TokGiven else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "lemma") then TokLemma else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "state") then TokState else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "start") then TokStart else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "false") then TokFalse else TokIdent
-    else if wordLen == 6 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 6, "handle") then TokHandle else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 6, "extern") then TokExtern else TokIdent
-    else if wordLen == 7 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 7, "handler") then TokHandler else TokIdent
-    else if wordLen == 8 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 8, "relation") then TokRelation else TokIdent
-    else if wordLen == 10 then
-      if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 10, "capability") then TokCapability else TokIdent
-    else TokIdent
+  if src(startPos) is 'A'..'Z' then TokUpper else
+    endPos - startPos match
+      case 2 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 2, "if") then TokIf else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 2, "do") then TokLoopBody else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 2, "is") then TokIs else TokIdent
+      case 3 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "def") then TokDef else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "val") then TokVal else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "var") then TokVar else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "pub") then TokPub else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 3, "for") then TokFor else TokIdent
+      case 4 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "enum") then TokEnum else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "case") then TokCase else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "then") then TokThen else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "else") then TokElse else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "type") then TokType else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "rule") then TokRule else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "stop") then TokStop else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 4, "true") then TokTrue else TokIdent
+      case 5 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "match") then TokMatch else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "while") then TokWhile else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "trait") then TokTrait else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "given") then TokGiven else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "lemma") then TokLemma else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "state") then TokState else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "start") then TokStart else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 5, "false") then TokFalse else TokIdent
+      case 6 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 6, "handle") then TokHandle else if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 6, "extern") then TokExtern else TokIdent
+      case 7 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 7, "handler") then TokHandler else TokIdent
+      case 8 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 8, "relation") then TokRelation else TokIdent
+      case 10 => if Stigi.Lex.sliceEquals(srcCap, src, startPos, endPos, 10, "capability") then TokCapability else TokIdent
+      case _ => TokIdent

@@ -28,6 +28,7 @@ pub enum Stigi.Lex.TokenKind:
   case TokStop
   case TokTrue
   case TokFalse
+  case TokIs
   case TokIdent
   case TokUpper
   case TokInt
@@ -42,6 +43,7 @@ pub enum Stigi.Lex.TokenKind:
   case TokGreatEqual
   case TokLogicAnd
   case TokLogicOr
+  case TokBar
   case TokLess
   case TokGreat
   case TokPlus
@@ -53,6 +55,7 @@ pub enum Stigi.Lex.TokenKind:
   case TokColon
   case TokComma
   case TokDot
+  case TokDotDot
   case TokLeftParen
   case TokRightParen
   case TokLeftBrack
