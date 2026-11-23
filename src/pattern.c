@@ -342,10 +342,13 @@ static StigiExpr *make_bool_expr(ElabCtx *ctx, bool v, StigiSpan sp) {
 
 /* Signed value of an int literal pattern, or the byte of a char pattern */
 static int cmp_lit(const StigiPat *a, const StigiPat *b) {
-  if (a->kind == STIGI_PAT_CHAR) return a->char_val < b->char_val ? -1 : a->char_val > b->char_val;
-  if (a->int_neg != b->int_neg) return a->int_neg ? -1 : 1;
-  int mag = a->int_val < b->int_val ? -1 : a->int_val > b->int_val;
-  return a->int_neg ? -mag : mag;
+  bool an = a->kind == STIGI_PAT_INT && a->int_neg;
+  bool bn = b->kind == STIGI_PAT_INT && b->int_neg;
+  uint64_t av = a->kind == STIGI_PAT_CHAR ? a->char_val : a->int_val;
+  uint64_t bv = b->kind == STIGI_PAT_CHAR ? b->char_val : b->int_val;
+  if (an != bn) return an ? -1 : 1;
+  int mag = av < bv ? -1 : av > bv;
+  return an ? -mag : mag;
 }
 
 static bool lit_is_zero(const StigiPat *p) {
@@ -440,22 +443,112 @@ static uint64_t unsigned_type_max(const StigiType *t) {
   return 0;
 }
 
-/* `lo..hi` on x: `x >= lo && x <= hi` (literal on the right, as the type check reads it), without a half the type
-   of x already decides (ruling on S129 ranges): a byte or a declared unsigned x never needs `x >= 0`, nor
-   `x <= max` at its type's maximum; lo == hi is `x == lo`. NULL when the range covers the whole type. */
+/* Which ends of `lo..hi` on x need a test (ruling on S129 ranges): a byte or a declared unsigned x never needs
+   `x >= 0`, nor `x <= max` at its type's maximum, and a `_` end is a half that an enclosing test already decided
+   (specialize_in). */
+static void range_needs(ElabCtx *ctx, const StigiPat *r, StigiExpr *x, bool *need_lo, bool *need_hi) {
+  const StigiPat *lo = &r->subpats[0];
+  const StigiPat *hi = &r->subpats[1];
+  bool lo_open = lo->kind == STIGI_PAT_WILD;
+  bool hi_open = hi->kind == STIGI_PAT_WILD;
+  uint64_t umax = (lo_open ? hi : lo)->kind == STIGI_PAT_CHAR ? 255U : unsigned_type_max(declared_type_of(ctx, x));
+  bool is_unsigned = umax != 0;
+  uint64_t hi_val = hi->kind == STIGI_PAT_CHAR ? hi->char_val : hi->int_val;
+  *need_lo = !lo_open && !(is_unsigned && lit_is_zero(lo));
+  *need_hi = !hi_open && !(is_unsigned && !hi->int_neg && hi_val == umax);
+}
+
+/* `lo..hi` on x: `x >= lo && x <= hi` (literal on the right, as the type check reads it) with only the ends that
+   range_needs keeps; lo == hi is `x == lo`. NULL when the range covers the whole type. */
 static StigiExpr *make_range_test(ElabCtx *ctx, const StigiPat *r, StigiExpr *x) {
   const StigiPat *lo = &r->subpats[0];
   const StigiPat *hi = &r->subpats[1];
-  if (cmp_lit(lo, hi) == 0) return make_eq_lit(ctx, x, lo, r->span);
-  uint64_t umax = lo->kind == STIGI_PAT_CHAR ? 255U : unsigned_type_max(declared_type_of(ctx, x));
-  bool is_unsigned = umax != 0;
-  uint64_t hi_val = hi->kind == STIGI_PAT_CHAR ? hi->char_val : hi->int_val;
-  bool need_lo = !(is_unsigned && lit_is_zero(lo));
-  bool need_hi = !(is_unsigned && !hi->int_neg && hi_val == umax);
+  if (lo->kind != STIGI_PAT_WILD && hi->kind != STIGI_PAT_WILD && cmp_lit(lo, hi) == 0) {
+    return make_eq_lit(ctx, x, lo, r->span);
+  }
+  bool need_lo = false, need_hi = false;
+  range_needs(ctx, r, x, &need_lo, &need_hi);
   StigiExpr *lo_t = need_lo ? make_binop_expr(ctx, STIGI_OP_GE, x, make_lit_expr(ctx, lo), r->span) : NULL;
   StigiExpr *hi_t = need_hi ? make_binop_expr(ctx, STIGI_OP_LE, x, make_lit_expr(ctx, hi), r->span) : NULL;
   if (lo_t != NULL && hi_t != NULL) return make_binop_expr(ctx, STIGI_OP_AND, lo_t, hi_t, r->span);
   return lo_t != NULL ? lo_t : hi_t;
+}
+
+static const StigiPat open_end = {.kind = STIGI_PAT_WILD, .name = {"_", 1}};
+
+/* The int or byte literal one above (up) or one below (!up) p, of p's kind; open_end past the end of its type */
+static const StigiPat *lit_step(ElabCtx *ctx, const StigiPat *p, bool up) {
+  bool neg = p->kind == STIGI_PAT_INT && p->int_neg;
+  uint64_t mag = p->kind == STIGI_PAT_CHAR ? p->char_val : p->int_val;
+  bool away = up != neg; /* the step moves the magnitude away from zero */
+  if ((p->kind == STIGI_PAT_CHAR && (up ? mag == 255U : mag == 0)) || (away && mag == UINT64_MAX)) return &open_end;
+  StigiPat *s = ea_alloc(ctx, sizeof *s);
+  if (s == NULL) return &open_end;
+  *s = *p;
+  if (p->kind == STIGI_PAT_CHAR) {
+    s->char_val = (uint8_t)(up ? mag + 1U : mag - 1U);
+  } else if (mag == 0) {
+    s->int_val = 1;
+    s->int_neg = !up;
+  } else {
+    s->int_val = away ? mag + 1U : mag - 1U;
+    s->int_neg = neg && s->int_val != 0;
+  }
+  return s;
+}
+
+/* Maranget 2008 sec. 4: once the scrutinee is known to lie in a0..b0 (an open_end-like `_` end is unbounded on
+   its side, within what the enclosing tests decided), a later row's int, byte or range pattern q in that column
+   is specialized: false when q can no longer match (the row drops), q becomes `_` when the knowledge decides it,
+   and a range keeps only its undecided ends, so no test under a decided branch is compiled (branch-decided,
+   never-reached). */
+static bool specialize_in(ElabCtx *ctx, const StigiPat *a0, const StigiPat *b0, StigiPat *q) {
+  if (pat_is_wild_or_var(q)) return true;
+  bool q_range = q->kind == STIGI_PAT_RANGE;
+  const StigiPat *lo = q_range ? &q->subpats[0] : q;
+  const StigiPat *hi = q_range ? &q->subpats[1] : q;
+  bool a0_inf = a0->kind == STIGI_PAT_WILD, b0_inf = b0->kind == STIGI_PAT_WILD;
+  bool lo_inf = lo->kind == STIGI_PAT_WILD, hi_inf = hi->kind == STIGI_PAT_WILD;
+  if ((!hi_inf && !a0_inf && cmp_lit(hi, a0) < 0) || (!lo_inf && !b0_inf && cmp_lit(lo, b0) > 0)) return false;
+  bool lo_decided = lo_inf || (!a0_inf && cmp_lit(lo, a0) <= 0);
+  bool hi_decided = hi_inf || (!b0_inf && cmp_lit(hi, b0) >= 0);
+  if (lo_decided && hi_decided) {
+    *q = (StigiPat){.kind = STIGI_PAT_WILD, .name = {"_", 1}, .span = q->span};
+  } else if (q_range && (lo_decided || hi_decided)) {
+    StigiPat *ends = ea_alloc(ctx, 2U * sizeof *ends);
+    if (ends == NULL) return true;
+    ends[0] = lo_decided ? (StigiPat){.kind = STIGI_PAT_WILD, .name = {"_", 1}, .span = lo->span} : *lo;
+    ends[1] = hi_decided ? (StigiPat){.kind = STIGI_PAT_WILD, .name = {"_", 1}, .span = hi->span} : *hi;
+    q->subpats = ends;
+  }
+  return true;
+}
+
+/* Row 0's pattern p0 in the column, specialized to the knowledge of one side of its test (inside: it matched).
+   A literal or a range tested at both ends leaves a union outside it: there only the patterns inside p0 drop.
+   A range tested at one end (the other at its type's bound or decided) leaves an interval outside it. Text
+   patterns: the same text is `_` inside and drops outside, another text drops inside. */
+static bool specialize_col(ElabCtx *ctx, const StigiPat *p0, StigiExpr *x, bool inside, StigiPat *q) {
+  if (pat_is_wild_or_var(q)) return true;
+  if (p0->kind == STIGI_PAT_STR || q->kind == STIGI_PAT_STR) {
+    if (p0->kind != q->kind) return true;
+    bool same = p0->int_val == q->int_val &&
+                (p0->int_val == 0 || memcmp(p0->str_bytes, q->str_bytes, (size_t)p0->int_val) == 0);
+    if (same && inside) *q = (StigiPat){.kind = STIGI_PAT_WILD, .name = {"_", 1}, .span = q->span};
+    return same == inside;
+  }
+  const StigiPat *a0 = p0->kind == STIGI_PAT_RANGE ? &p0->subpats[0] : p0;
+  const StigiPat *b0 = p0->kind == STIGI_PAT_RANGE ? &p0->subpats[1] : p0;
+  if (inside) return specialize_in(ctx, a0, b0, q);
+  bool need_lo = true, need_hi = true;
+  if (p0->kind == STIGI_PAT_RANGE) range_needs(ctx, p0, x, &need_lo, &need_hi);
+  if (!need_lo && !need_hi) return false; /* p0 covers the type: no side outside it */
+  if (need_lo && !need_hi) return specialize_in(ctx, &open_end, lit_step(ctx, a0, false), q);
+  if (need_hi && !need_lo) return specialize_in(ctx, lit_step(ctx, b0, true), &open_end, q);
+  const StigiPat *lo = q->kind == STIGI_PAT_RANGE ? &q->subpats[0] : q;
+  const StigiPat *hi = q->kind == STIGI_PAT_RANGE ? &q->subpats[1] : q;
+  bool lo_inf = lo->kind == STIGI_PAT_WILD, hi_inf = hi->kind == STIGI_PAT_WILD;
+  return !(!lo_inf && !hi_inf && cmp_lit(lo, a0) >= 0 && cmp_lit(hi, b0) <= 0);
 }
 
 /* How a text pattern meets its scrutinee (ruling on S129 text): the scrutinee must be a local declared
@@ -1105,8 +1198,8 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
   }
 
   /* Case R (S129): a column with a range or a text pattern is compiled by backtracking on row 0 (Maranget 2008,
-     sec. 4): test row 0's pattern; the true side keeps row 0 with that column matched and every later row with
-     its own test, the false side drops row 0. */
+     sec. 4): test row 0's pattern; the true side keeps row 0 with that column matched, the false side drops row 0,
+     and each side keeps the later rows specialized to what it knows of the column (specialize_col). */
   bool backtrack = false;
   for (uint32_t r = 0; r < nrows && !backtrack; r++) {
     backtrack = rows[r].pats[col].kind == STIGI_PAT_RANGE || rows[r].pats[col].kind == STIGI_PAT_STR;
@@ -1114,20 +1207,38 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
   if (backtrack && (head_kind == STIGI_PAT_INT || head_kind == STIGI_PAT_CHAR ||
                     head_kind == STIGI_PAT_RANGE || head_kind == STIGI_PAT_STR)) {
     const StigiPat *p0 = &rows[0].pats[col];
+    bool p0_tested = !pat_is_wild_or_var(p0);
     PatRow *then_rows = malloc((size_t)nrows * sizeof *then_rows);
+    PatRow *else_rows = malloc((size_t)nrows * sizeof *else_rows);
     StigiPat *row0_pats = malloc((size_t)ncols * sizeof *row0_pats);
-    if (then_rows == NULL || row0_pats == NULL) {
+    if (then_rows == NULL || else_rows == NULL || row0_pats == NULL) {
       free(then_rows);
+      free(else_rows);
       free(row0_pats);
       ctx->err = diag_set(ctx->diag, STIGI_ERR_OOM, -1, "pattern OOM");
       return make_unit_expr(ctx, match_span);
     }
-    memcpy(then_rows, rows, (size_t)nrows * sizeof *then_rows);
+    then_rows[0] = rows[0];
     memcpy(row0_pats, rows[0].pats, (size_t)ncols * sizeof *row0_pats);
     memset(&row0_pats[col], 0, sizeof row0_pats[col]);
     row0_pats[col].kind = STIGI_PAT_WILD;
     row0_pats[col].name = (StigiStr){"_", 1};
     then_rows[0].pats = row0_pats;
+    /* Later rows on each side, specialized to what the side knows of the column (specialize_col) */
+    uint32_t then_n = 1, else_n = 0;
+    for (uint32_t r = 1; r < nrows && ctx->err == STIGI_OK; r++) {
+      for (int side = 0; side < 2; side++) {
+        StigiPat q = rows[r].pats[col];
+        if (p0_tested && !specialize_col(ctx, p0, scruts[col], side == 0, &q)) continue;
+        StigiPat *pats = ea_alloc(ctx, (size_t)ncols * sizeof *pats);
+        if (pats == NULL) break;
+        memcpy(pats, rows[r].pats, (size_t)ncols * sizeof *pats);
+        pats[col] = q;
+        PatRow *out = side == 0 ? &then_rows[then_n++] : &else_rows[else_n++];
+        *out = rows[r];
+        out->pats = pats;
+      }
+    }
     /* Which sides exist: a range over the whole type has no false side; a text whose declared length differs from
        the scrutinee's literal length has no true side. Only existing sides are compiled (never-reached and
        not-exhaustive stay exact). */
@@ -1137,14 +1248,15 @@ static StigiExpr *compile_matrix(ElabCtx *ctx, StigiExpr *const *scruts, uint32_
     if (p0->kind == STIGI_PAT_INT || p0->kind == STIGI_PAT_CHAR) cond = make_eq_lit(ctx, scruts[col], p0, p0->span);
     bool has_yes = tplan != TEXT_NEVER && tplan != TEXT_BAD_SCRUTINEE;
     bool has_no = p0->kind == STIGI_PAT_STR || cond != NULL;
-    StigiExpr *yes = has_yes ? compile_matrix(ctx, scruts, ncols, then_rows, nrows, fallback, arm_reached,
+    StigiExpr *yes = has_yes ? compile_matrix(ctx, scruts, ncols, then_rows, then_n, fallback, arm_reached,
                                               match_span, witness_ctx, depth + 1)
                              : NULL;
-    StigiExpr *no = has_no ? compile_matrix(ctx, scruts, ncols, rows + 1, nrows - 1U, fallback, arm_reached,
+    StigiExpr *no = has_no ? compile_matrix(ctx, scruts, ncols, else_rows, else_n, fallback, arm_reached,
                                             match_span, "_", depth + 1)
                            : NULL;
     free(row0_pats);
     free(then_rows);
+    free(else_rows);
     if (p0->kind == STIGI_PAT_STR) {
       return has_yes ? make_text_test(ctx, p0, scruts[col], tplan == TEXT_TEST_LENGTH, yes, no) : no;
     }
