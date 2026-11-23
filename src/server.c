@@ -720,38 +720,55 @@ static bool image_has_edge_between(const StigiImage *img, const char *a, const c
   return false;
 }
 
+/* Q0h-b: a reference is an edge, never a text match (T1). The candidate image holds the old units that the
+ * batch neither edits nor drops, plus the batch's new text, resolved; two ops are one component when an
+ * edge of that candidate joins their units. (Edges of the old image are joined by the caller.) */
+static void join_ops_by_candidate_edges(const StigiImage *old, const BatchOp *ops, uint32_t ocnt,
+                                        uint32_t *parent) {
+  StigiImage cand;
+  stigi_image_init(&cand);
+  StigiNameDiags nd;
+  stigi_name_diags_init(&nd);
+  Diag d;
+  diag_clear(&d);
+  Status st = STIGI_OK;
+  for (uint32_t u = 0; u < old->unit_count && st == STIGI_OK; u++) {
+    bool touched = false;
+    for (uint32_t k = 0; k < ocnt && !touched; k++) {
+      touched = ops[k].unit_name != NULL && strlen(ops[k].unit_name) == old->units[u].name_len &&
+                memcmp(ops[k].unit_name, old->units[u].name, old->units[u].name_len) == 0;
+    }
+    if (touched) continue;
+    Arena ta;
+    arena_init(&ta);
+    char *printed = NULL;
+    size_t plen = 0;
+    st = stigi_print_unit(old->units[u].ast, &printed, &plen, &ta, &d);
+    if (st == STIGI_OK) st = stigi_image_add_source(&cand, printed, plen, &nd, &d);
+    arena_free(&ta);
+  }
+  for (uint32_t k = 0; k < ocnt && st == STIGI_OK; k++) {
+    if (ops[k].is_drop) continue;
+    (void)stigi_image_add_source(&cand, ops[k].text, ops[k].len, &nd, &d);
+  }
+  if (st == STIGI_OK) (void)stigi_image_resolve(&cand, &nd, &d);
+  if (st == STIGI_OK) {
+    for (uint32_t i = 0; i < ocnt; i++) {
+      for (uint32_t j = i + 1; j < ocnt; j++) {
+        if (ops[i].unit_name != NULL && ops[j].unit_name != NULL &&
+            image_has_edge_between(&cand, ops[i].unit_name, ops[j].unit_name)) {
+          dsu_union(parent, i, j);
+        }
+      }
+    }
+  }
+  stigi_name_diags_free(&nd);
+  stigi_image_free(&cand);
+}
+
 static bool is_ident_char(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9') || c == '_' || c == '.';
-}
-
-static bool text_mentions_name(const char *text, size_t tlen, const char *name) {
-  if (name == NULL || name[0] == '\0') return false;
-  size_t nlen = strlen(name);
-  const char *p = text;
-  const char *end = text + tlen;
-  while (p < end) {
-    const char *hit = memmem_bounded(p, (size_t)(end - p), name, nlen);
-    if (hit == NULL) break;
-    bool left_ok = (hit == text || !is_ident_char(hit[-1]));
-    bool right_ok = (hit + nlen == end || !is_ident_char(hit[nlen]));
-    if (left_ok && right_ok) return true;
-    p = hit + 1;
-  }
-  return false;
-}
-
-static bool same_or_ancestor_namespace(const char *child, const char *cand) {
-  if (child == NULL || cand == NULL) return false;
-  const char *dc = strrchr(child, '.');
-  const char *da = strrchr(cand, '.');
-  if (da == NULL) return true; /* top-level cand is visible in all namespaces */
-  if (dc == NULL) return false;
-  size_t lc = (size_t)(dc - child);
-  size_t la = (size_t)(da - cand);
-  if (la == lc && memcmp(child, cand, la) == 0) return true;
-  if (la < lc && memcmp(child, cand, la) == 0 && child[la] == '.') return true;
-  return false;
 }
 
 static Status finalize_reply(const StigiServerCtx *ctx, ReplyBuf *rb, const char *status_tag,
@@ -1439,26 +1456,9 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
           dsu_union(parent, i, j);
           continue;
         }
-        if (!ops[i].is_drop && ops[j].unit_name != NULL) {
-          if (text_mentions_name(ops[i].text, ops[i].len, ops[j].unit_name)) {
-            dsu_union(parent, i, j);
-            continue;
-          }
-          const char *dot = strrchr(ops[j].unit_name, '.');
-          if (dot != NULL && same_or_ancestor_namespace(ops[i].unit_name, ops[j].unit_name) &&
-              text_mentions_name(ops[i].text, ops[i].len, dot + 1)) {
-            dsu_union(parent, i, j);
-            continue;
-          }
-          /* Rules and relations affect all units in the batch */
-          if (memmem_bounded(ops[i].text, ops[i].len, "rule ", 5U) != NULL ||
-              memmem_bounded(ops[i].text, ops[i].len, "relation ", 9U) != NULL) {
-            dsu_union(parent, i, j);
-            continue;
-          }
-        }
       }
     }
+    join_ops_by_candidate_edges(&ctx->door->image, ops, ocnt, parent);
 
     /* Process each component in deterministic order of its minimum op index */
     bool *visited = calloc(ocnt, sizeof *visited);
