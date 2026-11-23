@@ -132,6 +132,91 @@ static Status keyset_insert(StigiKeySet *ks, const uint8_t key[32], Diag *diag) 
   return STIGI_OK;
 }
 
+/* ---- Decision store: records sorted by key, binary search (S134 e) ---- */
+
+const StigiUnitDecision *stigi_decisions_find(const StigiDecisionStore *ds, const uint8_t key[32]) {
+  uint32_t lo = 0, hi = ds->count;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2U;
+    int c = memcmp(ds->recs[mid].key, key, 32);
+    if (c == 0) return &ds->recs[mid].dec;
+    if (c < 0) lo = mid + 1U;
+    else hi = mid;
+  }
+  return NULL;
+}
+
+Status stigi_decisions_insert(StigiDecisionStore *ds, const uint8_t key[32], StigiUnitDecision *dec,
+                              Diag *diag) {
+  uint32_t lo = 0, hi = ds->count;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2U;
+    int c = memcmp(ds->recs[mid].key, key, 32);
+    if (c == 0) {
+      free(dec->masked); /* the key is already stored: same key, same rows */
+      dec->masked = NULL;
+      return STIGI_OK;
+    }
+    if (c < 0) lo = mid + 1U;
+    else hi = mid;
+  }
+  if (ds->count == ds->cap) {
+    uint32_t ncap = ds->cap == 0 ? 64U : ds->cap * 2U;
+    StigiDecisionRec *nr = realloc(ds->recs, (size_t)ncap * sizeof *nr);
+    if (nr == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "decision store OOM");
+    ds->recs = nr;
+    ds->cap = ncap;
+  }
+  memmove(&ds->recs[lo + 1U], &ds->recs[lo], (size_t)(ds->count - lo) * sizeof *ds->recs);
+  memcpy(ds->recs[lo].key, key, 32);
+  ds->recs[lo].dec = *dec;
+  dec->masked = NULL;
+  ds->count++;
+  return STIGI_OK;
+}
+
+Status stigi_decisions_copy(const StigiDecisionStore *src, StigiDecisionStore *dst, Diag *diag) {
+  memset(dst, 0, sizeof *dst);
+  if (src->count == 0) return STIGI_OK;
+  dst->recs = calloc(src->count, sizeof *dst->recs);
+  if (dst->recs == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "decision snapshot OOM");
+  dst->cap = src->count;
+  for (uint32_t i = 0; i < src->count; i++) {
+    dst->recs[i] = src->recs[i];
+    dst->recs[i].dec.masked = NULL;
+    if (src->recs[i].dec.access_count > 0) {
+      dst->recs[i].dec.masked = malloc(src->recs[i].dec.access_count);
+      if (dst->recs[i].dec.masked == NULL) {
+        dst->count = i;
+        stigi_decisions_free(dst);
+        return diag_set(diag, STIGI_ERR_OOM, -1, "decision snapshot OOM");
+      }
+      memcpy(dst->recs[i].dec.masked, src->recs[i].dec.masked, src->recs[i].dec.access_count);
+    }
+    dst->count = i + 1U;
+  }
+  return STIGI_OK;
+}
+
+void stigi_decisions_free(StigiDecisionStore *ds) {
+  if (ds == NULL) return;
+  for (uint32_t i = 0; i < ds->count; i++) free(ds->recs[i].dec.masked);
+  free(ds->recs);
+  memset(ds, 0, sizeof *ds);
+}
+
+static Status decisions_reserve(StigiDecisionStore *ds, uint32_t extra, Diag *diag) {
+  uint64_t need = (uint64_t)ds->count + extra;
+  if (need <= ds->cap) return STIGI_OK;
+  uint32_t ncap = ds->cap == 0 ? 64U : ds->cap;
+  while (ncap < need) ncap *= 2U;
+  StigiDecisionRec *nr = realloc(ds->recs, (size_t)ncap * sizeof *nr);
+  if (nr == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "decision store OOM");
+  ds->recs = nr;
+  ds->cap = ncap;
+  return STIGI_OK;
+}
+
 /* Order-independent hash of base rules + sorted in-image Rule & Relation verdict_keys */
 static int cmp_key32(const void *a, const void *b) {
   return memcmp(a, b, 32);
@@ -607,11 +692,26 @@ Status stigi_door_prune_caches(StigiDoor *door, Diag *diag) {
   if (st != STIGI_OK) return st;
   StigiKeySet kept_verdicts = {NULL, 0, 0};
   StigiKeySet kept_tests = {NULL, 0, 0};
+  StigiDecisionStore kept_decs = {NULL, 0, 0};
   for (uint32_t i = 0; i < door->image.unit_count && st == STIGI_OK; i++) {
     uint8_t key[32];
     effective_verdict_key(door->image.units[i].verdict_key, rules_hash, door->seed_id,
                           door->row_budget, door->kernel_mode, key);
     if (keyset_contains(&door->verdict_cache, key)) st = keyset_insert(&kept_verdicts, key, diag);
+    if (st == STIGI_OK && keyset_contains(&door->verdict_cache, key)) {
+      const StigiUnitDecision *old_dec = stigi_decisions_find(&door->decisions, key);
+      if (old_dec != NULL) {
+        StigiUnitDecision copy = *old_dec;
+        copy.masked = NULL;
+        if (old_dec->access_count > 0) {
+          copy.masked = malloc(old_dec->access_count);
+          if (copy.masked == NULL) st = diag_set(diag, STIGI_ERR_OOM, -1, "decision copy OOM");
+          else memcpy(copy.masked, old_dec->masked, old_dec->access_count);
+        }
+        if (st == STIGI_OK) st = stigi_decisions_insert(&kept_decs, key, &copy, diag);
+        if (st != STIGI_OK) free(copy.masked);
+      }
+    }
     if (st == STIGI_OK && keyset_contains(&door->test_cache, key)) {
       st = keyset_insert(&kept_tests, key, diag);
     }
@@ -619,12 +719,15 @@ Status stigi_door_prune_caches(StigiDoor *door, Diag *diag) {
   if (st != STIGI_OK) {
     keyset_free(&kept_verdicts);
     keyset_free(&kept_tests);
+    stigi_decisions_free(&kept_decs);
     return st;
   }
   keyset_free(&door->verdict_cache);
   keyset_free(&door->test_cache);
   door->verdict_cache = kept_verdicts;
   door->test_cache = kept_tests;
+  stigi_decisions_free(&door->decisions);
+  door->decisions = kept_decs;
   return STIGI_OK;
 }
 
@@ -641,6 +744,7 @@ void stigi_door_free(StigiDoor *door) {
   free(door->rules_dl);
   keyset_free(&door->verdict_cache);
   keyset_free(&door->test_cache);
+  stigi_decisions_free(&door->decisions);
   memset(door, 0, sizeof *door);
 }
 
@@ -936,8 +1040,71 @@ static Status unit_fact_set(const StigiImage *img, uint32_t uidx, bool kernel_mo
   return st;
 }
 
+/* S134 e: from the evaluated session, the decision rows of one unit: a masked flag per element access row of the
+ * unit's fact set (membership of the row's operation in `maskIndex`) and the counts of the other decision
+ * relations. A unit with no element access and no allocation has none (has_dec stays false). */
+static Status unit_decision(StigiDl *dl, const StigiFactSet *fs, StigiUnitDecision *dec, bool *has_dec,
+                            Diag *diag) {
+  *has_dec = false;
+  bool has_alloc = false;
+  uint32_t accesses = 0;
+  for (uint32_t r = 0; r < fs->count; r++) {
+    const char *rn = fs->rows[r].rel;
+    if (strcmp(rn, "indexRead") == 0 || strcmp(rn, "indexWrite") == 0) accesses++;
+    else if (strcmp(rn, "alloc") == 0) has_alloc = true;
+  }
+  dec->tracked = (accesses > 0 || has_alloc) ? 1U : 0U;
+  if (!dec->tracked) { /* a record anyway: a missing record is an error in the emitter, never "no masks" */
+    *has_dec = true;
+    return STIGI_OK;
+  }
+
+  int rel_mask = stigi_dl_rel_id(dl, "maskIndex");
+  uint32_t mask_count = rel_mask >= 0 ? stigi_dl_count(dl, rel_mask) : 0U;
+  const char **mask_ops = mask_count > 0 ? malloc((size_t)mask_count * sizeof *mask_ops) : NULL;
+  uint32_t nmask = 0;
+  if (mask_count > 0 && mask_ops == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "mask ops OOM");
+  for (uint32_t r = 0; r < mask_count; r++) {
+    int64_t row[1] = {0};
+    Status st = stigi_dl_read(dl, rel_mask, r, row, 1, diag);
+    if (st != STIGI_OK) { free(mask_ops); return st; }
+    size_t slen = 0;
+    const char *s = stigi_dl_sym_str(dl, (uint32_t)row[0], &slen);
+    if (s != NULL) mask_ops[nmask++] = s;
+  }
+  dec->access_count = accesses;
+  dec->masked = accesses > 0 ? calloc(accesses, 1U) : NULL;
+  if (accesses > 0 && dec->masked == NULL) {
+    free(mask_ops);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "masked flags OOM");
+  }
+  uint32_t ai = 0;
+  for (uint32_t r = 0; r < fs->count; r++) {
+    const StigiFactRow *fr = &fs->rows[r];
+    if (strcmp(fr->rel, "indexRead") != 0 && strcmp(fr->rel, "indexWrite") != 0) continue;
+    bool masked = false;
+    if (fr->ncols >= 1 && !fr->cols[0].is_num && fr->cols[0].sym != NULL) {
+      for (uint32_t m = 0; m < nmask && !masked; m++) masked = strcmp(mask_ops[m], fr->cols[0].sym) == 0;
+    }
+    dec->masked[ai++] = masked ? 1U : 0U;
+  }
+  free(mask_ops);
+  int rel_fe = stigi_dl_rel_id(dl, "freeEdge");
+  int rel_fae = stigi_dl_rel_id(dl, "freeAtExit");
+  int rel_ru = stigi_dl_rel_id(dl, "reuseAt");
+  int rel_so = stigi_dl_rel_id(dl, "stackObject");
+  dec->free_edges = rel_fe >= 0 ? stigi_dl_count(dl, rel_fe) : 0U;
+  dec->free_at_exit = rel_fae >= 0 ? stigi_dl_count(dl, rel_fae) : 0U;
+  dec->reuses = rel_ru >= 0 ? stigi_dl_count(dl, rel_ru) : 0U;
+  dec->stack_objects = rel_so >= 0 ? stigi_dl_count(dl, rel_so) : 0U;
+  *has_dec = true;
+  return STIGI_OK;
+}
+
 static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage *img,
-                                uint32_t uidx, StigiDoorResult *out, Diag *diag) {
+                                uint32_t uidx, StigiDoorResult *out, StigiUnitDecision *dec,
+                                bool *has_dec, Diag *diag) {
+  if (has_dec != NULL) *has_dec = false;
   Status st = stigi_dl_reset(dl, diag);
   if (st != STIGI_OK) return st;
 
@@ -952,8 +1119,8 @@ static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage 
   Diag ld;
   diag_clear(&ld);
   st = stigi_facts_load_into_dl(&fs, dl, &ld);
-  stigi_facts_free(&fs);
   if (st != STIGI_OK) {
+    stigi_facts_free(&fs);
     if (st == STIGI_ERR_DATALOG) {
       return add_reject(out, img->units[uidx].name, tupu_code_to_stigi(ld.dl_code), ld.msg, diag);
     }
@@ -965,8 +1132,18 @@ static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage 
   diag_clear(&ed);
   st = stigi_dl_eval(dl, &ed);
   if (st != STIGI_OK) {
+    stigi_facts_free(&fs);
     return add_reject(out, img->units[uidx].name, tupu_code_to_stigi(ed.dl_code), ed.msg, diag);
   }
+
+  if (dec != NULL && has_dec != NULL) {
+    st = unit_decision(dl, &fs, dec, has_dec, diag);
+    if (st != STIGI_OK) {
+      stigi_facts_free(&fs);
+      return st;
+    }
+  }
+  stigi_facts_free(&fs);
 
   int rel_reject = stigi_dl_rel_id(dl, "reject");
   if (rel_reject >= 0) {
@@ -982,7 +1159,10 @@ static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage 
       (void)snprintf(sbuf, sizeof sbuf, "%.*s", (int)slen, subj != NULL ? subj : "");
       (void)snprintf(cbuf, sizeof cbuf, "%.*s", (int)clen, code != NULL ? code : "");
       st = add_reject(out, sbuf, cbuf, img->units[uidx].name, diag);
-      if (st != STIGI_OK) return st;
+      if (st != STIGI_OK) {
+        if (has_dec != NULL && *has_dec) { free(dec->masked); dec->masked = NULL; *has_dec = false; }
+        return st;
+      }
     }
   }
   return STIGI_OK;
@@ -1237,7 +1417,7 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
                                 local_start, nt_u->unit_id, diag);
     } else {
       for (uint32_t i = local_start; i < priv.unit_count && st == STIGI_OK; i++) {
-        st = eval_unit_datalog(priv_dl, door->kernel_mode, &priv, i, &priv_res, diag);
+        st = eval_unit_datalog(priv_dl, door->kernel_mode, &priv, i, &priv_res, NULL, NULL, diag);
       }
     }
   } else if (st == STIGI_OK && ex != NULL) {
@@ -1313,6 +1493,8 @@ typedef struct {
   StigiDoorResult res;
   Status st;
   Diag diag;
+  StigiUnitDecision dec; /* S134 e: the unit's decision rows when it has element accesses or allocations */
+  bool has_dec;
 } ParallelUnitTask;
 
 typedef struct {
@@ -1350,7 +1532,7 @@ static void *parallel_verdict_worker(void *arg_p) {
   for (uint32_t k = w->worker_id; k < w->task_count; k += w->worker_count) {
     ParallelUnitTask *t = &w->tasks[k];
     diag_clear(&t->diag);
-    t->st = eval_unit_datalog(dl, w->kernel_mode, w->cand, t->unit_idx, &t->res, &t->diag);
+    t->st = eval_unit_datalog(dl, w->kernel_mode, w->cand, t->unit_idx, &t->res, &t->dec, &t->has_dec, &t->diag);
   }
   if (w->shared_dl == NULL) {
     stigi_dl_close(&local_dl);
@@ -1540,6 +1722,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
   /* Stage cache updates locally; merge ONLY on commit */
   StigiKeySet staged_vkeys = {NULL, 0, 0};
   StigiKeySet staged_tkeys = {NULL, 0, 0};
+  StigiDecisionStore staged_decs = {NULL, 0, 0};
 
   /* Step 2: Names + unit_id / verdict_key (C3, S119) + boundary checks */
   StigiImage cand;
@@ -1720,6 +1903,9 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         if (tx_st == STIGI_OK) {
           if (tasks[k].res.reject_count == 0) {
             tx_st = keyset_insert(&staged_vkeys, tasks[k].vkey, diag);
+            if (tx_st == STIGI_OK && tasks[k].has_dec) {
+              tx_st = stigi_decisions_insert(&staged_decs, tasks[k].vkey, &tasks[k].dec, diag);
+            }
           } else {
             for (uint32_t r = 0; r < tasks[k].res.reject_count && tx_st == STIGI_OK; r++) {
               tx_st = add_reject(out, tasks[k].res.rejects[r].subject,
@@ -1730,6 +1916,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         }
         stigi_door_result_free(&tasks[k].res);
       }
+      for (uint32_t k = 0; k < todo_cnt; k++) free(tasks[k].dec.masked);
       free(tasks);
     }
   }
@@ -1797,6 +1984,9 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         tx_st = keyset_reserve(&door->test_cache, staged_tkeys.count, diag);
       }
     }
+    if (commit && tx_st == STIGI_OK) {
+      tx_st = decisions_reserve(&door->decisions, staged_decs.count, diag);
+    }
     if (tx_st == STIGI_OK) {
       if (commit) {
         for (uint32_t i = 0; i < staged_vkeys.cap; i++) {
@@ -1808,6 +1998,9 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
           if (staged_tkeys.slots[i].used) {
             (void)keyset_insert(&door->test_cache, staged_tkeys.slots[i].key, diag);
           }
+        }
+        for (uint32_t i = 0; i < staged_decs.count; i++) {
+          (void)stigi_decisions_insert(&door->decisions, staged_decs.recs[i].key, &staged_decs.recs[i].dec, diag);
         }
         if (need_dl_swap) {
           stigi_dl_close(&door->dl);
@@ -1829,11 +2022,13 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
         door->src_cap = max_srcs;
         out->accepted = true;
         keyset_free(&staged_vkeys);
+        stigi_decisions_free(&staged_decs);
         keyset_free(&staged_tkeys);
         return STIGI_OK;
       }
       out->accepted = true;
       keyset_free(&staged_vkeys);
+        stigi_decisions_free(&staged_decs);
       keyset_free(&staged_tkeys);
       stigi_dl_close(&cand_dl);
       free(cand_rules_dl);
@@ -1847,6 +2042,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
 
   /* Rollback: live door->image, door->dl, and door caches are 100% untouched */
   keyset_free(&staged_vkeys);
+        stigi_decisions_free(&staged_decs);
   keyset_free(&staged_tkeys);
   stigi_dl_close(&cand_dl);
   free(cand_rules_dl);
@@ -1921,7 +2117,7 @@ Status stigi_door_set_budget(StigiDoor *door, uint64_t new_budget,
     if (k == STIGI_DECL_NEG_TEST) {
       st = check_negtest_unit(door, &tmp_dl, door->rules_dl, &door->image, i, out, NULL, diag);
     } else {
-      st = eval_unit_datalog(&tmp_dl, door->kernel_mode, &door->image, i, out, diag);
+      st = eval_unit_datalog(&tmp_dl, door->kernel_mode, &door->image, i, out, NULL, NULL, diag);
     }
   }
 
@@ -2555,4 +2751,16 @@ Status stigi_door_export(StigiDoor *door, const char *dir, StigiExportStats *sta
   stats->negtests_without_datalog = ex.negtests_without_datalog;
   stats->rows = ex.rows;
   return st;
+}
+
+Status stigi_door_unit_key(const StigiDoor *door, uint32_t uidx, uint8_t out[32], Diag *diag) {
+  if (door == NULL || uidx >= door->image.unit_count) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_door_unit_key: invalid arguments");
+  }
+  uint8_t rules_hash[32];
+  Status st = compute_active_rules_hash(door, &door->image, rules_hash, diag);
+  if (st != STIGI_OK) return st;
+  effective_verdict_key(door->image.units[uidx].verdict_key, rules_hash, door->seed_id, door->row_budget,
+                        door->kernel_mode, out);
+  return STIGI_OK;
 }

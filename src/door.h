@@ -41,6 +41,31 @@ typedef struct {
   uint32_t cap;
 } StigiKeySet;
 
+/* S134 e: what the emitter reads from the door's one evaluation of a unit with an element access or an
+ * allocation (fact-schema.md 4): one masked flag per indexRead/indexWrite row in fact order (membership of the
+ * row's operation in `maskIndex`), and the row counts of the other decision relations (stats line only). */
+typedef struct {
+  uint32_t access_count;
+  uint32_t tracked; /* 1 when the unit has an element access or an allocation: the emitter stats count it */
+  uint8_t *masked; /* access_count bytes, 0 or 1 */
+  uint32_t free_edges;
+  uint32_t free_at_exit;
+  uint32_t reuses;
+  uint32_t stack_objects;
+} StigiUnitDecision;
+
+/* Decision rows under the verdict key (one record per cached verdict key that has decisions) */
+typedef struct {
+  uint8_t key[32];
+  StigiUnitDecision dec;
+} StigiDecisionRec;
+
+typedef struct {
+  StigiDecisionRec *recs; /* sorted by key */
+  uint32_t count;
+  uint32_t cap;
+} StigiDecisionStore;
+
 typedef struct {
   StigiImage image;
   char **unit_srcs;
@@ -60,7 +85,18 @@ typedef struct {
 
   StigiKeySet verdict_cache;
   StigiKeySet test_cache;
+  StigiDecisionStore decisions; /* S134 e: decision rows of the cached verdict keys */
 } StigiDoor;
+
+/* Decision store helpers (door.c): find, insert (takes the record's `masked` array), deep copy, free */
+const StigiUnitDecision *stigi_decisions_find(const StigiDecisionStore *ds, const uint8_t key[32]);
+Status stigi_decisions_insert(StigiDecisionStore *ds, const uint8_t key[32], StigiUnitDecision *dec,
+                              Diag *diag);
+Status stigi_decisions_copy(const StigiDecisionStore *src, StigiDecisionStore *dst, Diag *diag);
+void stigi_decisions_free(StigiDecisionStore *ds);
+
+/* The verdict-cache key of one unit of the image under the active rules and this binary */
+Status stigi_door_unit_key(const StigiDoor *door, uint32_t uidx, uint8_t out[32], Diag *diag);
 
 void stigi_door_result_init(StigiDoorResult *r);
 void stigi_door_result_free(StigiDoorResult *r);

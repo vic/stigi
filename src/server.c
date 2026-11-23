@@ -720,9 +720,10 @@ static bool image_has_edge_between(const StigiImage *img, const char *a, const c
   return false;
 }
 
-/* Q0h-b: a reference is an edge, never a text match (T1). The candidate image holds the old units that the
- * batch neither edits nor drops, plus the batch's new text, resolved; two ops are one component when an
- * edge of that candidate joins their units. (Edges of the old image are joined by the caller.) */
+/* Q0h-b: a reference is an edge, never a text match (T1). The candidate image holds only the units this batch
+ * touches (its new text, and the old text of the units it drops), resolved; two ops are one component when an
+ * edge of that candidate joins their units, so the cost is that of the batch, not of the image. (Edges of the
+ * old image between op units are joined by the caller.) */
 static void join_ops_by_candidate_edges(const StigiImage *old, const BatchOp *ops, uint32_t ocnt,
                                         uint32_t *parent) {
   StigiImage cand;
@@ -732,24 +733,20 @@ static void join_ops_by_candidate_edges(const StigiImage *old, const BatchOp *op
   Diag d;
   diag_clear(&d);
   Status st = STIGI_OK;
-  for (uint32_t u = 0; u < old->unit_count && st == STIGI_OK; u++) {
-    bool touched = false;
-    for (uint32_t k = 0; k < ocnt && !touched; k++) {
-      touched = ops[k].unit_name != NULL && strlen(ops[k].unit_name) == old->units[u].name_len &&
-                memcmp(ops[k].unit_name, old->units[u].name, old->units[u].name_len) == 0;
+  for (uint32_t k = 0; k < ocnt && st == STIGI_OK; k++) {
+    if (!ops[k].is_drop) {
+      (void)stigi_image_add_source(&cand, ops[k].text, ops[k].len, &nd, &d);
+      continue;
     }
-    if (touched) continue;
+    int32_t oi = ops[k].unit_name != NULL ? stigi_image_find(old, ops[k].unit_name, strlen(ops[k].unit_name)) : -1;
+    if (oi < 0) continue;
     Arena ta;
     arena_init(&ta);
     char *printed = NULL;
     size_t plen = 0;
-    st = stigi_print_unit(old->units[u].ast, &printed, &plen, &ta, &d);
+    st = stigi_print_unit(old->units[oi].ast, &printed, &plen, &ta, &d);
     if (st == STIGI_OK) st = stigi_image_add_source(&cand, printed, plen, &nd, &d);
     arena_free(&ta);
-  }
-  for (uint32_t k = 0; k < ocnt && st == STIGI_OK; k++) {
-    if (ops[k].is_drop) continue;
-    (void)stigi_image_add_source(&cand, ops[k].text, ops[k].len, &nd, &d);
   }
   if (st == STIGI_OK) (void)stigi_image_resolve(&cand, &nd, &d);
   if (st == STIGI_OK) {

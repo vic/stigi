@@ -385,28 +385,6 @@ typedef struct {
   bool is_pure_def;
 } UnitMaskInfo;
 
-static int cmp_cstr_ptr(const void *pa, const void *pb) {
-  const char *a = *(const char *const *)pa;
-  const char *b = *(const char *const *)pb;
-  return strcmp(a, b);
-}
-
-static bool sorted_cstr_contains(const char *const *arr, uint32_t n, const char *key) {
-  uint32_t lo = 0, hi = n;
-  while (lo < hi) {
-    uint32_t mid = lo + (hi - lo) / 2U;
-    int c = strcmp(arr[mid], key);
-    if (c == 0) return true;
-    if (c < 0) lo = mid + 1U;
-    else hi = mid;
-  }
-  return false;
-}
-
-static bool is_taint_cap_name(StigiStr cn) {
-  return str_eq_c(cn, "Stigi.File") || str_eq_c(cn, "Stigi.Socket") || str_eq_c(cn, "Stigi.Clock");
-}
-
 static void free_unit_masks(UnitMaskInfo *info, uint32_t count) {
   if (info == NULL) return;
   for (uint32_t i = 0; i < count; i++) {
@@ -415,6 +393,8 @@ static void free_unit_masks(UnitMaskInfo *info, uint32_t count) {
   free(info);
 }
 
+/* S134 e: the emitter evaluates no Datalog. It reads the decision rows that the door's one evaluation of each
+ * unit cached under the verdict key: a masked flag per element access row and the four relation counts. */
 static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_info,
                                     uint32_t *out_total_masks, StigiEmitStats *stats,
                                     Diag *diag) {
@@ -426,30 +406,6 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
   UnitMaskInfo *info = calloc(img->unit_count, sizeof *info);
   if (info == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "compute_datalog_masks: OOM");
 
-  if (door->rules_dl == NULL || door->rules_dl_len == 0) {
-    *out_info = info;
-    return STIGI_OK;
-  }
-
-  /* Open ONE Datalog instance and reset per reachable def unit -> O(N_units) linear scaling */
-  StigiDl dl;
-  memset(&dl, 0, sizeof dl);
-  Status st = stigi_dl_open(&dl, door->rules_dl, door->rules_dl_len, "emit_mask.dl",
-                            door->row_budget, 1, diag);
-  if (st != STIGI_OK) {
-    free_unit_masks(info, img->unit_count);
-    return st;
-  }
-
-  int rel_opcall = stigi_dl_rel_id(&dl, "operationCall");
-  int rel_result = stigi_dl_rel_id(&dl, "result");
-  int rel_tobj = stigi_dl_rel_id(&dl, "taintedObject");
-  int rel_mask = stigi_dl_rel_id(&dl, "maskIndex");
-  int rel_fe = stigi_dl_rel_id(&dl, "freeEdge");
-  int rel_fae = stigi_dl_rel_id(&dl, "freeAtExit");
-  int rel_ru = stigi_dl_rel_id(&dl, "reuseAt");
-  int rel_so = stigi_dl_rel_id(&dl, "stackObject");
-
   uint32_t total_masked = 0;
   for (uint32_t i = 0; i < img->unit_count; i++) {
     if (!img->units[i].reachable) continue;
@@ -459,188 +415,51 @@ static Status compute_datalog_masks(const StigiDoor *door, UnitMaskInfo **out_in
 
     const StigiDefHead *h = &d->u.def_decl.head;
     bool has_cap = false;
-    int32_t taint_cap_idx = -1;
-    uint32_t cap_ord = 0;
     for (uint32_t g = 0; g < h->pre_group_count; g++) {
-      if (h->pre_groups[g].is_fact) continue;
-      if (h->pre_groups[g].cap_count > 0) has_cap = true;
-      for (uint32_t c = 0; c < h->pre_groups[g].cap_count; c++) {
-        if (is_taint_cap_name(h->pre_groups[g].caps[c].cap_type->name) && taint_cap_idx < 0) {
-          taint_cap_idx = (int32_t)cap_ord;
-        }
-        cap_ord++;
-      }
+      if (!h->pre_groups[g].is_fact && h->pre_groups[g].cap_count > 0) has_cap = true;
     }
     if (!has_cap) {
       info[i].is_pure_def = true;
       if (stats != NULL) stats->pure_defs++;
     }
 
-    StigiFactSet fs;
-    stigi_facts_init(&fs);
-    st = stigi_extract_unit_closed(img, i, door->kernel_mode, &fs, diag);
+    uint8_t key[32];
+    Status st = stigi_door_unit_key(door, i, key, diag);
     if (st != STIGI_OK) {
-      stigi_facts_free(&fs);
-      stigi_dl_close(&dl);
       free_unit_masks(info, img->unit_count);
       return st;
     }
-
-    bool has_access_or_alloc = false;
-    for (uint32_t r = 0; r < fs.count; r++) {
-      const char *rn = fs.rows[r].rel;
-      if (strcmp(rn, "indexRead") == 0 || strcmp(rn, "indexWrite") == 0 ||
-          strcmp(rn, "alloc") == 0) {
-        has_access_or_alloc = true;
-        break;
-      }
-    }
-    if (!has_access_or_alloc) {
-      stigi_facts_free(&fs);
-      continue;
-    }
-
-    st = stigi_dl_reset(&dl, diag);
-    if (st != STIGI_OK) {
-      stigi_facts_free(&fs);
-      stigi_dl_close(&dl);
+    const StigiUnitDecision *dec = stigi_decisions_find(&door->decisions, key);
+    if (dec == NULL) {
       free_unit_masks(info, img->unit_count);
-      return st;
+      return diag_set(diag, STIGI_ERR_INVALID, -1,
+                      "no decision rows for unit '%s': the door has not evaluated it under this rule program",
+                      u->name);
     }
-    st = stigi_facts_load_into_dl(&fs, &dl, diag);
-    if (st != STIGI_OK) {
-      stigi_facts_free(&fs);
-      stigi_dl_close(&dl);
-      free_unit_masks(info, img->unit_count);
-      return st;
-    }
-
-    if (taint_cap_idx >= 0 && rel_opcall >= 0 && rel_result >= 0) {
-      char cap_sym[256], pt_sym[256];
-      (void)snprintf(cap_sym, sizeof cap_sym, "%s#0:cap%d", u->name, taint_cap_idx);
-      (void)snprintf(pt_sym, sizeof pt_sym, "%s#0:p0", u->name);
-      uint32_t cap_id = 0, opname_id = 0, pt_id = 0;
-      if (stigi_dl_intern(&dl, cap_sym, strlen(cap_sym), &cap_id, diag) != STIGI_OK ||
-          stigi_dl_intern(&dl, "read", 4, &opname_id, diag) != STIGI_OK ||
-          stigi_dl_intern(&dl, pt_sym, strlen(pt_sym), &pt_id, diag) != STIGI_OK) {
-        stigi_facts_free(&fs);
-        stigi_dl_close(&dl);
-        free_unit_masks(info, img->unit_count);
-        return STIGI_ERR_OOM;
-      }
-      for (uint32_t p = 0; p < h->param_count; p++) {
-        uint32_t from_tmp = i;
-        const StigiType *pty = resolve_typedef_type(img, &from_tmp, h->params[p].type, 0);
-        char op_sym[256], val_sym[256];
-        (void)snprintf(op_sym, sizeof op_sym, "%s#0:taint_seed_%u", u->name, p);
-        (void)snprintf(val_sym, sizeof val_sym, "%s#0:p:%.*s", u->name,
-                       (int)h->params[p].name.len, h->params[p].name.ptr);
-        uint32_t op_id = 0, val_id = 0;
-        if (stigi_dl_intern(&dl, op_sym, strlen(op_sym), &op_id, diag) != STIGI_OK ||
-            stigi_dl_intern(&dl, val_sym, strlen(val_sym), &val_id, diag) != STIGI_OK) {
-          stigi_facts_free(&fs);
-          stigi_dl_close(&dl);
-          free_unit_masks(info, img->unit_count);
-          return STIGI_ERR_OOM;
-        }
-        if (pty != NULL && pty->kind == STIGI_TYPE_ARRAY) {
-          if (rel_tobj >= 0) {
-            int64_t to_row[1] = {(int64_t)val_id};
-            (void)stigi_dl_add(&dl, rel_tobj, to_row, 1, diag);
-          }
-          continue;
-        }
-        int64_t oc_row[4] = {(int64_t)op_id, (int64_t)cap_id, (int64_t)opname_id, (int64_t)pt_id};
-        int64_t res_row[2] = {(int64_t)op_id, (int64_t)val_id};
-        (void)stigi_dl_add(&dl, rel_opcall, oc_row, 4, diag);
-        (void)stigi_dl_add(&dl, rel_result, res_row, 2, diag);
-      }
-    }
-
-    st = stigi_dl_eval(&dl, diag);
-    if (st != STIGI_OK) {
-      stigi_facts_free(&fs);
-      stigi_dl_close(&dl);
-      free_unit_masks(info, img->unit_count);
-      return st;
-    }
-
-    char **mask_ops = NULL;
-    uint32_t mask_op_count = 0;
-    if (rel_mask >= 0) {
-      uint32_t cnt = stigi_dl_count(&dl, rel_mask);
-      if (cnt > 0) {
-        mask_ops = calloc(cnt, sizeof *mask_ops);
-        if (mask_ops == NULL) {
-          stigi_facts_free(&fs);
-          stigi_dl_close(&dl);
-          free_unit_masks(info, img->unit_count);
-          return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops OOM");
-        }
-        for (uint32_t r = 0; r < cnt; r++) {
-          int64_t row[1] = {0};
-          if (stigi_dl_read(&dl, rel_mask, r, row, 1, diag) == STIGI_OK) {
-            size_t slen = 0;
-            const char *s = stigi_dl_sym_str(&dl, (uint32_t)row[0], &slen);
-            if (s != NULL) {
-              char *cp = malloc(slen + 1U);
-              if (cp == NULL) {
-                for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-                free(mask_ops);
-                stigi_facts_free(&fs);
-                stigi_dl_close(&dl);
-                free_unit_masks(info, img->unit_count);
-                return diag_set(diag, STIGI_ERR_OOM, -1, "mask_ops strdup OOM");
-              }
-              memcpy(cp, s, slen);
-              cp[slen] = '\0';
-              mask_ops[mask_op_count++] = cp;
-            }
-          }
-        }
-        qsort(mask_ops, mask_op_count, sizeof *mask_ops, cmp_cstr_ptr);
-      }
-    }
+    if (!dec->tracked) continue;
 
     UnitMaskInfo *ui = &info[i];
-    for (uint32_t r = 0; r < fs.count; r++) {
-      const StigiFactRow *fr = &fs.rows[r];
-      if (strcmp(fr->rel, "indexRead") != 0 && strcmp(fr->rel, "indexWrite") != 0) continue;
-      if (fr->ncols < 1 || fr->cols[0].is_num || fr->cols[0].sym == NULL) continue;
-      const char *op_sym = fr->cols[0].sym;
-      if (ui->access_count == ui->access_cap) {
-        uint32_t ncap = ui->access_cap == 0 ? 8U : ui->access_cap * 2U;
-        bool *nb = realloc(ui->access_masked, (size_t)ncap * sizeof *nb);
-        if (nb == NULL) {
-          for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-          free(mask_ops);
-          stigi_facts_free(&fs);
-          stigi_dl_close(&dl);
-          free_unit_masks(info, img->unit_count);
-          return diag_set(diag, STIGI_ERR_OOM, -1, "access_masked OOM");
-        }
-        ui->access_masked = nb;
-        ui->access_cap = ncap;
+    if (dec->access_count > 0) {
+      ui->access_masked = malloc((size_t)dec->access_count * sizeof *ui->access_masked);
+      if (ui->access_masked == NULL) {
+        free_unit_masks(info, img->unit_count);
+        return diag_set(diag, STIGI_ERR_OOM, -1, "access_masked OOM");
       }
-      bool is_m = (mask_op_count > 0) &&
-                  sorted_cstr_contains((const char *const *)mask_ops, mask_op_count, op_sym);
-      ui->access_masked[ui->access_count++] = is_m;
-      if (is_m) total_masked++;
+      ui->access_cap = dec->access_count;
+      for (uint32_t a = 0; a < dec->access_count; a++) {
+        ui->access_masked[a] = dec->masked[a] != 0;
+        if (ui->access_masked[a]) total_masked++;
+      }
+      ui->access_count = dec->access_count;
     }
-
     if (stats != NULL) {
-      if (rel_fe >= 0) stats->free_edges += stigi_dl_count(&dl, rel_fe);
-      if (rel_fae >= 0) stats->free_at_exit += stigi_dl_count(&dl, rel_fae);
-      if (rel_ru >= 0) stats->reuses += stigi_dl_count(&dl, rel_ru);
-      if (rel_so >= 0) stats->stack_objects += stigi_dl_count(&dl, rel_so);
+      stats->free_edges += dec->free_edges;
+      stats->free_at_exit += dec->free_at_exit;
+      stats->reuses += dec->reuses;
+      stats->stack_objects += dec->stack_objects;
     }
-
-    for (uint32_t k = 0; k < mask_op_count; k++) free(mask_ops[k]);
-    free(mask_ops);
-    stigi_facts_free(&fs);
   }
 
-  stigi_dl_close(&dl);
   *out_info = info;
   *out_total_masks = total_masked;
   return STIGI_OK;

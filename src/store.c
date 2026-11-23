@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #define STIGI_CACHE_MAGIC "STGCACHE"
-#define STIGI_CACHE_VERSION 1U
+#define STIGI_CACHE_VERSION 2U
 
 static void hex64(const uint8_t id[32], char out[65]) {
   static const char H[] = "0123456789abcdef";
@@ -298,13 +298,23 @@ static Status read_whole_file(const char *path, char **out_buf, size_t *out_len,
   return STIGI_OK;
 }
 
+/* Cache file v2: magic, version, verdict key count, test key count, decision record count, the sorted verdict
+ * keys, the sorted test keys, the decision records (key, access count, four relation counts, one masked byte per
+ * access row; sorted by key), BLAKE3 of all that (S132, S134 e). */
+#define STIGI_CACHE_DECISION_FIXED (32U + 6U * 4U)
+
 static Status write_cache_file(const StigiDoor *door, const char *dir,
                                char *err_buf, size_t err_cap) {
   uint32_t vcnt = door->verdict_cache.count;
   uint32_t tcnt = door->test_cache.count;
+  uint32_t dcnt = door->decisions.count;
 
   size_t total_keys = (size_t)vcnt + (size_t)tcnt;
-  size_t payload_len = 8U + 4U + 4U + 4U + total_keys * 32U;
+  size_t dec_len = 0;
+  for (uint32_t i = 0; i < dcnt; i++) {
+    dec_len += STIGI_CACHE_DECISION_FIXED + door->decisions.recs[i].dec.access_count;
+  }
+  size_t payload_len = 8U + 4U + 4U + 4U + 4U + total_keys * 32U + dec_len;
   size_t total_len = payload_len + 32U;
   uint8_t *buf = malloc(total_len);
   if (buf == NULL) return STIGI_ERR_OOM;
@@ -313,8 +323,9 @@ static Status write_cache_file(const StigiDoor *door, const char *dir,
   put_u32_le(buf + 8U, STIGI_CACHE_VERSION);
   put_u32_le(buf + 12U, vcnt);
   put_u32_le(buf + 16U, tcnt);
+  put_u32_le(buf + 20U, dcnt);
 
-  uint8_t *vptr = buf + 20U;
+  uint8_t *vptr = buf + 24U;
   uint32_t vi = 0;
   for (uint32_t i = 0; i < door->verdict_cache.cap && vi < vcnt; i++) {
     if (door->verdict_cache.slots[i].used) {
@@ -333,6 +344,20 @@ static Status write_cache_file(const StigiDoor *door, const char *dir,
     }
   }
   if (tcnt > 1U) qsort(tptr, tcnt, 32U, cmp_key32);
+
+  uint8_t *dptr = tptr + (size_t)tcnt * 32U;
+  for (uint32_t i = 0; i < dcnt; i++) {
+    const StigiDecisionRec *r = &door->decisions.recs[i];
+    memcpy(dptr, r->key, 32U);
+    put_u32_le(dptr + 32U, r->dec.access_count);
+    put_u32_le(dptr + 36U, r->dec.tracked);
+    put_u32_le(dptr + 40U, r->dec.free_edges);
+    put_u32_le(dptr + 44U, r->dec.free_at_exit);
+    put_u32_le(dptr + 48U, r->dec.reuses);
+    put_u32_le(dptr + 52U, r->dec.stack_objects);
+    if (r->dec.access_count > 0) memcpy(dptr + STIGI_CACHE_DECISION_FIXED, r->dec.masked, r->dec.access_count);
+    dptr += STIGI_CACHE_DECISION_FIXED + r->dec.access_count;
+  }
 
   blake3_hash(buf, payload_len, buf + payload_len);
 
@@ -632,7 +657,7 @@ static Status load_and_verify_cache(StigiDoor *door, const char *dir, Diag *diag
   Status rs = read_whole_file(cache_path, &buf, &len, diag);
   if (rs != STIGI_OK) return rs;
 
-  if (len < 20U + 32U) {
+  if (len < 24U + 32U) {
     free(buf);
     return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: file too short");
   }
@@ -642,37 +667,82 @@ static Status load_and_verify_cache(StigiDoor *door, const char *dir, Diag *diag
     return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: invalid magic");
   }
   uint32_t ver = get_u32_le(u + 8U);
+  if (ver < STIGI_CACHE_VERSION) { /* an older derived format is no cache: everything is computed again */
+    free(buf);
+    return STIGI_OK;
+  }
   if (ver != STIGI_CACHE_VERSION) {
     free(buf);
     return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: unsupported version %u", ver);
   }
   uint32_t vcnt = get_u32_le(u + 12U);
   uint32_t tcnt = get_u32_le(u + 16U);
+  uint32_t dcnt = get_u32_le(u + 20U);
   uint64_t total_keys = (uint64_t)vcnt + (uint64_t)tcnt;
-  if (total_keys > (SIZE_MAX - 52U) / 32U) {
+  if (total_keys > (SIZE_MAX - 52U) / 32U || (uint64_t)dcnt > (len - 56U) / STIGI_CACHE_DECISION_FIXED) {
     free(buf);
-    return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: key count overflow");
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: count overflow");
   }
-  size_t expected_len = 20U + (size_t)total_keys * 32U + 32U;
-  if (len != expected_len) {
+  size_t keys_end = 24U + (size_t)total_keys * 32U;
+  if (keys_end + 32U > len) {
     free(buf);
     return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: length mismatch");
   }
   uint8_t digest[32];
-  blake3_hash(u, expected_len - 32U, digest);
-  if (memcmp(digest, u + (expected_len - 32U), 32U) != 0) {
+  blake3_hash(u, len - 32U, digest);
+  if (memcmp(digest, u + (len - 32U), 32U) != 0) {
     free(buf);
     return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: BLAKE3 checksum mismatch");
   }
+  /* the decision records fill exactly the bytes between the keys and the checksum */
+  size_t pos = keys_end;
+  for (uint32_t i = 0; i < dcnt; i++) {
+    if (pos + STIGI_CACHE_DECISION_FIXED > len - 32U) {
+      free(buf);
+      return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: decision record truncated");
+    }
+    uint32_t ac = get_u32_le(u + pos + 32U);
+    if ((uint64_t)pos + STIGI_CACHE_DECISION_FIXED + ac > len - 32U) {
+      free(buf);
+      return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: decision record truncated");
+    }
+    pos += STIGI_CACHE_DECISION_FIXED + ac;
+  }
+  if (pos != len - 32U) {
+    free(buf);
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "corrupt cache: length mismatch");
+  }
 
   Status is = STIGI_OK;
-  const uint8_t *vptr = u + 20U;
+  const uint8_t *vptr = u + 24U;
   for (uint32_t i = 0; i < vcnt && is == STIGI_OK; i++) {
     is = stigi_door_cache_add_verdict(door, vptr + (size_t)i * 32U, diag);
   }
   const uint8_t *tptr = vptr + (size_t)vcnt * 32U;
   for (uint32_t i = 0; i < tcnt && is == STIGI_OK; i++) {
     is = stigi_door_cache_add_test(door, tptr + (size_t)i * 32U, diag);
+  }
+  pos = keys_end;
+  for (uint32_t i = 0; i < dcnt && is == STIGI_OK; i++) {
+    StigiUnitDecision dec;
+    memset(&dec, 0, sizeof dec);
+    dec.access_count = get_u32_le(u + pos + 32U);
+    dec.tracked = get_u32_le(u + pos + 36U);
+    dec.free_edges = get_u32_le(u + pos + 40U);
+    dec.free_at_exit = get_u32_le(u + pos + 44U);
+    dec.reuses = get_u32_le(u + pos + 48U);
+    dec.stack_objects = get_u32_le(u + pos + 52U);
+    if (dec.access_count > 0) {
+      dec.masked = malloc(dec.access_count);
+      if (dec.masked == NULL) {
+        is = diag_set(diag, STIGI_ERR_OOM, -1, "cache decision OOM");
+        break;
+      }
+      memcpy(dec.masked, u + pos + STIGI_CACHE_DECISION_FIXED, dec.access_count);
+    }
+    is = stigi_decisions_insert(&door->decisions, u + pos, &dec, diag);
+    free(dec.masked);
+    pos += STIGI_CACHE_DECISION_FIXED + get_u32_le(u + pos + 32U);
   }
   free(buf);
   return is;
@@ -722,10 +792,12 @@ Status stigi_load_dir(StigiDoor *door, const char *dir,
   /* T0 atomicity: snapshot caches before loading disk cache; restore verbatim on any error/reject */
   StigiKeySet saved_vc = {NULL, 0, 0};
   StigiKeySet saved_tc = {NULL, 0, 0};
+  StigiDecisionStore saved_ds = {NULL, 0, 0};
   bool snapped = false;
   if (st == STIGI_OK) {
     st = snapshot_keyset(&door->verdict_cache, &saved_vc, diag);
     if (st == STIGI_OK) st = snapshot_keyset(&door->test_cache, &saved_tc, diag);
+    if (st == STIGI_OK) st = stigi_decisions_copy(&door->decisions, &saved_ds, diag);
     if (st == STIGI_OK) {
       snapped = true;
       st = load_and_verify_cache(door, dir, diag);
@@ -741,14 +813,18 @@ Status stigi_load_dir(StigiDoor *door, const char *dir,
       free(door->verdict_cache.slots);
       free(door->test_cache.slots);
       door->verdict_cache = saved_vc;
+      stigi_decisions_free(&door->decisions);
+      door->decisions = saved_ds;
       door->test_cache = saved_tc;
     } else {
       free(saved_vc.slots);
       free(saved_tc.slots);
+      stigi_decisions_free(&saved_ds);
     }
   } else {
     free(saved_vc.slots);
     free(saved_tc.slots);
+    stigi_decisions_free(&saved_ds);
   }
 
   for (uint32_t i = 0; i < pl.count; i++) {
