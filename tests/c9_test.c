@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "blake3.h"
 #include "common.h"
 #include "door.h"
 #include "json_util.h"
@@ -180,6 +181,21 @@ static int test_store_load_roundtrip(void) {
   CHECK(stigi_door_init(&door, "vic/spec/datalog/all.dl",
                         STIGI_DEFAULT_ROW_BUDGET, true, &diag) == STIGI_OK,
         "door init");
+
+  /* S132: the seed id is the BLAKE3 of this exact binary (independent path: one full read). */
+  {
+    FILE *exe = fopen("/proc/self/exe", "rb");
+    struct stat exe_stat;
+    CHECK(exe != NULL && fstat(fileno(exe), &exe_stat) == 0 && exe_stat.st_size > 0, "stat /proc/self/exe");
+    size_t exe_len = (size_t)exe_stat.st_size;
+    uint8_t *exe_bytes = malloc(exe_len);
+    CHECK(exe_bytes != NULL && fread(exe_bytes, 1, exe_len, exe) == exe_len, "read /proc/self/exe");
+    (void)fclose(exe);
+    uint8_t want[32];
+    blake3_hash(exe_bytes, exe_len, want);
+    free(exe_bytes);
+    CHECK(memcmp(door.seed_id, want, 32) == 0, "S132: seed_id == BLAKE3 of the running binary");
+  }
 
   const char *u1 =
       "// prompt: prove zero is non-negative\n"
@@ -644,8 +660,13 @@ static int test_3transport_parity_and_negatives(void) {
   long majflt_delta = ru1000.ru_majflt - ru10.ru_majflt;
   printf("c9 3-transport parity: PASS (6 mutating+read frames byte-identical + identical unit_ids across 3 servers)\n");
   printf("c9 negative controls + S119: PASS (all 8 controls verified)\n");
-  printf("c9 1000-frame real-check RSS: wall=%.2f ms, rss10=%ld KB, rss1000=%ld KB, delta=%ld KB, minflt=%ld, majflt=%ld\n",
-         ms, rss_10, rss_1000, rss_delta, minflt_delta, majflt_delta);
+#if defined(__SANITIZE_ADDRESS__) || defined(__FILC__)
+  const char *rss_note = " (unchecked under ASan/Fil-C)";
+#else
+  const char *rss_note = "";
+#endif
+  printf("c9 1000-frame real-check RSS: wall=%.2f ms, rss10=%ld KB, rss1000=%ld KB, delta=%ld KB, minflt=%ld, majflt=%ld%s\n",
+         ms, rss_10, rss_1000, rss_delta, minflt_delta, majflt_delta, rss_note);
 
 #if !defined(__SANITIZE_ADDRESS__) && !defined(__FILC__)
   CHECK(rss_delta <= 64, "RSS delta <= 64 KB over 1000 real check frames");

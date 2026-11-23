@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static int g_fails = 0;
@@ -108,6 +109,74 @@ static void test_blake3(void) {
   blake3_hash(NULL, 16, h_null);
   blake3_hash(zeros, 16, h_zero);
   check(memcmp(h_null, h_zero, 32) != 0, "blake3(NULL, 16) does not hash fake zeros");
+}
+
+/* Official BLAKE3 test-vector input (byte i = i % 251), digests from b3sum 1.8.7. */
+static void test_blake3_streaming(void) {
+  static const struct {
+    size_t len;
+    const char *hex;
+  } vectors[] = {
+      {0, "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"},
+      {1, "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"},
+      {64, "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98"},
+      {1024, "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7"},
+      {1025, "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444"},
+      {2048, "e776b6028c7cd22a4d0ba182a8bf62205d2ef576467e838ed6f2529b85fba24a"},
+      {2049, "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030"},
+      {10000, "5f81f9e4ab67627b6b036d5d4e3bc40d9d3daa6fcc2b6dd07ab2bbf0a877da54"},
+  };
+  static const size_t steps[] = {1, 63, 64, 1024, 1025, 4096, 16384};
+  static uint8_t input[10000];
+  for (size_t i = 0; i < sizeof input; i++) input[i] = (uint8_t)(i % 251U);
+
+  uint8_t h[32];
+  char hex[65];
+  char msg[96];
+  for (size_t v = 0; v < sizeof vectors / sizeof vectors[0]; v++) {
+    blake3_hash(input, vectors[v].len, h);
+    to_hex(h, hex);
+    (void)snprintf(msg, sizeof msg, "blake3 one-shot len %zu matches b3sum", vectors[v].len);
+    check(strcmp(hex, vectors[v].hex) == 0, msg);
+    for (size_t s = 0; s < sizeof steps / sizeof steps[0]; s++) {
+      StigiBlake3 st;
+      blake3_init(&st);
+      for (size_t off = 0; off < vectors[v].len; off += steps[s]) {
+        size_t n = vectors[v].len - off < steps[s] ? vectors[v].len - off : steps[s];
+        blake3_update(&st, input + off, n);
+      }
+      blake3_finalize(&st, h);
+      to_hex(h, hex);
+      (void)snprintf(msg, sizeof msg, "blake3 streamed len %zu step %zu matches b3sum",
+                     vectors[v].len, steps[s]);
+      check(strcmp(hex, vectors[v].hex) == 0, msg);
+    }
+  }
+
+  /* The seed id path: /proc/self/exe streamed in 16 KiB reads == one-shot hash of a full read. */
+  FILE *f = fopen("/proc/self/exe", "rb");
+  check(f != NULL, "open /proc/self/exe");
+  if (f == NULL) return;
+  struct stat exe_stat;
+  check(fstat(fileno(f), &exe_stat) == 0 && exe_stat.st_size > 0, "stat /proc/self/exe");
+  size_t cap = exe_stat.st_size > 0 ? (size_t)exe_stat.st_size : 0U, len = 0, got;
+  uint8_t *whole = cap > 0 ? malloc(cap) : NULL;
+  static uint8_t buf[16384];
+  StigiBlake3 st;
+  blake3_init(&st);
+  while (whole != NULL && (got = fread(buf, 1, sizeof buf, f)) > 0 && len + got <= cap) {
+    memcpy(whole + len, buf, got);
+    len += got;
+    blake3_update(&st, buf, got);
+  }
+  check(whole != NULL && ferror(f) == 0 && feof(f) != 0 && len > 1024, "read /proc/self/exe whole");
+  (void)fclose(f);
+  if (whole == NULL) return;
+  uint8_t one[32];
+  blake3_hash(whole, len, one);
+  blake3_finalize(&st, h);
+  check(memcmp(one, h, 32) == 0, "blake3 streamed /proc/self/exe == one-shot");
+  free(whole);
 }
 
 static void test_arena_and_intern(void) {
@@ -384,6 +453,7 @@ static void test_dl_budget_refusal(void) {
 
 int main(void) {
   test_blake3();
+  test_blake3_streaming();
   test_arena_and_intern();
   test_dl_u64_bounds();
   test_dl_refusals_and_parallel();

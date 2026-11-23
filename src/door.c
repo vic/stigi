@@ -179,38 +179,38 @@ static void effective_verdict_key(const uint8_t base_key[32], const uint8_t rule
   blake3_hash(buf, sizeof buf, out);
 }
 
-/* BLAKE3 of the running seed binary: any change of the C logic changes every verdict key */
-static Status compute_seed_id(uint8_t out[32], Diag *diag) {
+/* BLAKE3 of the running seed binary: any change of the C logic changes every verdict key.
+   The binary does not change while the process runs: hash it once, streamed, no heap. */
+static pthread_once_t seed_id_once = PTHREAD_ONCE_INIT;
+static bool seed_id_ok = false;
+static int seed_id_errno = 0;
+static uint8_t seed_id_cached[32];
+
+static void seed_id_compute_once(void) {
   FILE *f = fopen("/proc/self/exe", "rb");
-  if (f == NULL) return diag_set(diag, STIGI_ERR_IO, errno, "cannot open /proc/self/exe for the seed id");
-  size_t cap = 1U << 20, len = 0;
-  uint8_t *buf = malloc(cap);
-  if (buf == NULL) {
-    (void)fclose(f);
-    return diag_set(diag, STIGI_ERR_OOM, -1, "seed id OOM");
+  if (f == NULL) {
+    seed_id_errno = errno;
+    return;
   }
+  StigiBlake3 h;
+  blake3_init(&h);
+  uint8_t buf[16384];
   size_t got;
-  while ((got = fread(buf + len, 1, cap - len, f)) > 0) {
-    len += got;
-    if (len == cap) {
-      uint8_t *grown = realloc(buf, cap * 2U);
-      if (grown == NULL) {
-        free(buf);
-        (void)fclose(f);
-        return diag_set(diag, STIGI_ERR_OOM, -1, "seed id OOM");
-      }
-      buf = grown;
-      cap *= 2U;
-    }
-  }
+  while ((got = fread(buf, 1, sizeof buf, f)) > 0) blake3_update(&h, buf, got);
   bool failed = ferror(f) != 0;
+  seed_id_errno = errno;
   (void)fclose(f);
-  if (failed) {
-    free(buf);
-    return diag_set(diag, STIGI_ERR_IO, errno, "cannot read /proc/self/exe for the seed id");
+  if (failed) return;
+  blake3_finalize(&h, seed_id_cached);
+  seed_id_ok = true;
+}
+
+static Status compute_seed_id(uint8_t out[32], Diag *diag) {
+  (void)pthread_once(&seed_id_once, seed_id_compute_once);
+  if (!seed_id_ok) {
+    return diag_set(diag, STIGI_ERR_IO, seed_id_errno, "cannot read /proc/self/exe for the seed id");
   }
-  blake3_hash(buf, len, out);
-  free(buf);
+  memcpy(out, seed_id_cached, 32);
   return STIGI_OK;
 }
 

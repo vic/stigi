@@ -102,75 +102,112 @@ static void blake3_compress(const uint32_t cv[8], const uint8_t block[64],
   memcpy(out, state, sizeof state);
 }
 
+/* Chaining value of one chunk (0..1024 bytes); root only when it is the whole input. */
+static inline void chunk_cv(const uint8_t *chunk, size_t chunk_len, uint64_t counter, uint8_t root,
+                     uint32_t cv[8]) {
+  for (size_t i = 0; i < 8; i++) cv[i] = BLAKE3_IV[i];
+  size_t nblocks = chunk_len == 0 ? 1 : ((chunk_len - 1) / BLAKE3_BLOCK_LEN + 1);
+  for (size_t b = 0; b < nblocks; b++) {
+    size_t boff = b * BLAKE3_BLOCK_LEN;
+    size_t blen = chunk_len - boff;
+    if (blen > BLAKE3_BLOCK_LEN) blen = BLAKE3_BLOCK_LEN;
+
+    /* A full block is read in place; only a short last block is copied and zero-padded. */
+    uint8_t block[BLAKE3_BLOCK_LEN];
+    const uint8_t *src = chunk + boff;
+    if (blen < BLAKE3_BLOCK_LEN) {
+      memset(block, 0, sizeof block);
+      if (blen > 0) memcpy(block, src, blen);
+      src = block;
+    }
+
+    uint8_t flags = 0;
+    if (b == 0) flags |= BLAKE3_CHUNK_START;
+    if (b + 1 == nblocks) flags |= BLAKE3_CHUNK_END | root;
+
+    uint32_t words[16];
+    blake3_compress(cv, src, (uint8_t)blen, counter, flags, words);
+    for (size_t i = 0; i < 8; i++) cv[i] = words[i];
+  }
+}
+
+/* out may alias right. */
+static void parent_cv(const uint32_t left[8], const uint32_t right[8], uint8_t flags,
+                      uint32_t out[8]) {
+  uint8_t pblock[BLAKE3_BLOCK_LEN];
+  store_words_le(pblock, left, 8);
+  store_words_le(pblock + 32, right, 8);
+  uint32_t words[16];
+  blake3_compress(BLAKE3_IV, pblock, BLAKE3_BLOCK_LEN, 0, BLAKE3_PARENT | flags, words);
+  for (size_t i = 0; i < 8; i++) out[i] = words[i];
+}
+
+/* A completed non-final chunk: merge one subtree per trailing zero bit of the chunk count. */
+static void push_chunk(StigiBlake3 *h, const uint8_t *chunk) {
+  uint32_t cv[8];
+  chunk_cv(chunk, BLAKE3_CHUNK_LEN, h->chunk_counter, 0, cv);
+  h->chunk_counter++;
+  for (uint64_t total = h->chunk_counter; (total & 1U) == 0; total >>= 1) {
+    h->cv_stack_len--;
+    parent_cv(h->cv_stack[h->cv_stack_len], cv, 0, cv);
+  }
+  memcpy(h->cv_stack[h->cv_stack_len], cv, sizeof cv);
+  h->cv_stack_len++;
+}
+
+void blake3_init(StigiBlake3 *h) {
+  h->cv_stack_len = 0;
+  h->chunk_counter = 0;
+  h->chunk_len = 0;
+}
+
+/* A chunk is pushed only once more input follows it: the last chunk may be the root. */
+void blake3_update(StigiBlake3 *h, const uint8_t *in, size_t len) {
+  if (in == NULL) return;
+  while (len > 0) {
+    if (h->chunk_len == BLAKE3_CHUNK_LEN) {
+      push_chunk(h, h->chunk);
+      h->chunk_len = 0;
+    }
+    if (h->chunk_len == 0 && len > BLAKE3_CHUNK_LEN) {
+      push_chunk(h, in);
+      in += BLAKE3_CHUNK_LEN;
+      len -= BLAKE3_CHUNK_LEN;
+      continue;
+    }
+    size_t take = BLAKE3_CHUNK_LEN - h->chunk_len;
+    if (take > len) take = len;
+    memcpy(h->chunk + h->chunk_len, in, take);
+    h->chunk_len += take;
+    in += take;
+    len -= take;
+  }
+}
+
+/* The last chunk (tail, 0..1024 bytes) and the subtree stack give the root. */
+static inline void finalize_from(const StigiBlake3 *h, const uint8_t *tail, size_t tail_len,
+                          uint8_t out[32]) {
+  uint32_t cv[8];
+  chunk_cv(tail, tail_len, h->chunk_counter, h->cv_stack_len == 0 ? BLAKE3_ROOT : 0, cv);
+  for (size_t i = h->cv_stack_len; i > 0; i--) {
+    parent_cv(h->cv_stack[i - 1], cv, i == 1 ? BLAKE3_ROOT : 0, cv);
+  }
+  store_words_le(out, cv, 8);
+}
+
+void blake3_finalize(const StigiBlake3 *h, uint8_t out[32]) {
+  finalize_from(h, h->chunk, h->chunk_len, out);
+}
+
+/* One-shot: the same chunk and tree steps as the streaming hasher, with the tail read in place. */
 void blake3_hash(const uint8_t *in, size_t len, uint8_t out[32]) {
   if (out == NULL) return;
   if (in == NULL && len > 0) {
     memset(out, 0, 32);
     return;
   }
-
-  size_t num_chunks = len == 0 ? 1 : ((len - 1) / BLAKE3_CHUNK_LEN + 1);
-  uint32_t cv_stack[64][8];
-  size_t cv_stack_len = 0;
-
-  for (size_t c = 0; c < num_chunks; c++) {
-    size_t chunk_off = c * BLAKE3_CHUNK_LEN;
-    size_t chunk_len = len - chunk_off;
-    if (chunk_len > BLAKE3_CHUNK_LEN) chunk_len = BLAKE3_CHUNK_LEN;
-
-    uint32_t cv[8];
-    for (size_t i = 0; i < 8; i++) cv[i] = BLAKE3_IV[i];
-
-    size_t nblocks = chunk_len == 0 ? 1 : ((chunk_len - 1) / BLAKE3_BLOCK_LEN + 1);
-    for (size_t b = 0; b < nblocks; b++) {
-      size_t boff = b * BLAKE3_BLOCK_LEN;
-      size_t blen = chunk_len - boff;
-      if (blen > BLAKE3_BLOCK_LEN) blen = BLAKE3_BLOCK_LEN;
-
-      uint8_t block[BLAKE3_BLOCK_LEN];
-      memset(block, 0, sizeof block);
-      if (blen > 0 && in != NULL) {
-        memcpy(block, in + chunk_off + boff, blen);
-      }
-
-      uint8_t flags = 0;
-      if (b == 0) flags |= BLAKE3_CHUNK_START;
-      if (b + 1 == nblocks) flags |= BLAKE3_CHUNK_END;
-      if (num_chunks == 1 && b + 1 == nblocks) flags |= BLAKE3_ROOT;
-
-      uint32_t words[16];
-      blake3_compress(cv, block, (uint8_t)blen, (uint64_t)c, flags, words);
-      for (size_t i = 0; i < 8; i++) cv[i] = words[i];
-    }
-
-    if (c + 1 < num_chunks) {
-      for (size_t i = 0; i < 8; i++) cv_stack[cv_stack_len][i] = cv[i];
-      cv_stack_len++;
-      size_t total = c + 1;
-      while ((total & 1U) == 0) {
-        uint8_t pblock[BLAKE3_BLOCK_LEN];
-        store_words_le(pblock, cv_stack[cv_stack_len - 2], 8);
-        store_words_le(pblock + 32, cv_stack[cv_stack_len - 1], 8);
-        uint32_t words[16];
-        blake3_compress(BLAKE3_IV, pblock, BLAKE3_BLOCK_LEN, 0, BLAKE3_PARENT, words);
-        cv_stack_len--;
-        for (size_t i = 0; i < 8; i++) cv_stack[cv_stack_len - 1][i] = words[i];
-        total >>= 1;
-      }
-    } else if (num_chunks > 1) {
-      while (cv_stack_len > 0) {
-        uint8_t pblock[BLAKE3_BLOCK_LEN];
-        store_words_le(pblock, cv_stack[cv_stack_len - 1], 8);
-        store_words_le(pblock + 32, cv, 8);
-        cv_stack_len--;
-        uint8_t pflags = BLAKE3_PARENT | (cv_stack_len == 0 ? BLAKE3_ROOT : 0);
-        uint32_t words[16];
-        blake3_compress(BLAKE3_IV, pblock, BLAKE3_BLOCK_LEN, 0, pflags, words);
-        for (size_t i = 0; i < 8; i++) cv[i] = words[i];
-      }
-      store_words_le(out, cv, 8);
-    } else {
-      store_words_le(out, cv, 8);
-    }
-  }
+  StigiBlake3 h;
+  blake3_init(&h);
+  for (; len > BLAKE3_CHUNK_LEN; in += BLAKE3_CHUNK_LEN, len -= BLAKE3_CHUNK_LEN) push_chunk(&h, in);
+  finalize_from(&h, in, len, out);
 }
