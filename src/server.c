@@ -1233,23 +1233,16 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
       free(rb.buf);
       return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
     }
-    size_t fl = arg_len + 9U;
-    char *fdir = malloc(fl);
-    if (fdir == NULL) {
-      free(path_cstr);
-      free(rb.buf);
-      return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
-    }
-    (void)snprintf(fdir, fl, "%s.facts.d", path_cstr);
-    (void)mkdir(fdir, 0755);
-    Status st = stigi_door_export(ctx->door, path_cstr, fdir, diag);
+    StigiExportStats xs;
+    Status st = stigi_door_export(ctx->door, path_cstr, &xs, diag);
     if (st != STIGI_OK) {
       status_tag = "error";
       rb_fmt(&rb, "error export: %s\n", diag != NULL ? diag->msg : "failed");
     } else {
-      rb_fmt(&rb, "accepted export %s\n", path_cstr);
+      rb_fmt(&rb, "accepted export %s (units=%u negtests=%u negtest_local_dirs=%u negtests_without_datalog=%u rows=%llu)\n",
+             path_cstr, xs.unit_dirs, xs.negtest_dirs, xs.negtest_local_dirs, xs.negtests_without_datalog,
+             (unsigned long long)xs.rows);
     }
-    free(fdir);
     free(path_cstr);
     return finalize_reply(ctx, &rb, status_tag, NULL, out_reply, out_len, diag);
   }

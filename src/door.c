@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -921,6 +922,20 @@ static Status check_boundary_rules(const StigiImage *cand, bool kernel_mode,
 
 /* ---- Dependency-closed Datalog evaluation for one unit ---- */
 
+/* The fact set the door loads for one unit: its dependency-closed rows (the callee summary rows it reads) */
+static Status unit_fact_set(const StigiImage *img, uint32_t uidx, bool kernel_mode,
+                            StigiFactSet *fs, Diag *diag) {
+  Status st = stigi_extract_unit_closed(img, uidx, kernel_mode, fs, diag);
+  if (st != STIGI_OK) return st;
+  /* For Test units, seed testGot/testWant so tests.dl checks test-leaks-capability cleanly */
+  if (img->units[uidx].ast->decl->kind == STIGI_DECL_TEST) {
+    const char *got[2] = {img->units[uidx].name, "ok"};
+    st = stigi_facts_add_sym(fs, "testGot", 2, got, diag);
+    if (st == STIGI_OK) st = stigi_facts_add_sym(fs, "testWant", 2, got, diag);
+  }
+  return st;
+}
+
 static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage *img,
                                 uint32_t uidx, StigiDoorResult *out, Diag *diag) {
   Status st = stigi_dl_reset(dl, diag);
@@ -928,20 +943,10 @@ static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage 
 
   StigiFactSet fs;
   stigi_facts_init(&fs);
-  st = stigi_extract_unit_closed(img, uidx, kernel_mode, &fs, diag);
+  st = unit_fact_set(img, uidx, kernel_mode, &fs, diag);
   if (st != STIGI_OK) {
     stigi_facts_free(&fs);
     return st;
-  }
-  /* For Test units, seed testGot/testWant so tests.dl checks test-leaks-capability cleanly */
-  if (img->units[uidx].ast->decl->kind == STIGI_DECL_TEST) {
-    const char *got[2] = {img->units[uidx].name, "ok"};
-    st = stigi_facts_add_sym(&fs, "testGot", 2, got, diag);
-    if (st == STIGI_OK) st = stigi_facts_add_sym(&fs, "testWant", 2, got, diag);
-    if (st != STIGI_OK) {
-      stigi_facts_free(&fs);
-      return st;
-    }
   }
 
   Diag ld;
@@ -983,11 +988,70 @@ static Status eval_unit_datalog(StigiDl *dl, bool kernel_mode, const StigiImage 
   return STIGI_OK;
 }
 
+/* ---- Export: one fact directory per door evaluation, named by the hex unit id (S134 2) ---- */
+
+typedef struct {
+  const char *root;
+  uint32_t unit_dirs;
+  uint32_t negtest_dirs;
+  uint32_t negtest_local_dirs;
+  uint32_t negtests_without_datalog;
+  uint64_t rows;
+} ExportCtx;
+
+/* Create `parent/<hex id>`. Units with equal canonical bytes have one id but different names and facts
+ * (identity.md): the later ones take the suffix `.1`, `.2`, ... until the identity fix (Q0e) makes one
+ * directory per id. */
+static Status make_id_dir(const char *parent, const uint8_t id[32], char *dir, size_t cap, Diag *diag) {
+  int n = snprintf(dir, cap, "%s/", parent);
+  if (n < 0 || (size_t)n + 80U >= cap) {
+    return diag_set(diag, STIGI_ERR_IO, -1, "export path too long");
+  }
+  for (int i = 0; i < 32; i++) {
+    (void)snprintf(dir + n + 2 * i, 3, "%02x", (unsigned)id[i]);
+  }
+  size_t base_len = strlen(dir);
+  for (uint32_t twin = 1; mkdir(dir, 0755) != 0; twin++) {
+    if (errno != EEXIST || twin > 9999U) {
+      return diag_set(diag, STIGI_ERR_IO, errno, "cannot create %s", dir);
+    }
+    (void)snprintf(dir + base_len, cap - base_len, ".%u", twin);
+  }
+  return STIGI_OK;
+}
+
+static Status write_fact_dir(ExportCtx *ex, const char *parent, const uint8_t id[32],
+                             const StigiFactSet *fs, const char *rules_src, Diag *diag) {
+  char dir[1024];
+  Status st = make_id_dir(parent, id, dir, sizeof dir, diag);
+  if (st != STIGI_OK) return st;
+  ex->rows += fs->count;
+  return stigi_facts_write_dir(fs, dir, rules_src, diag);
+}
+
+/* A NegTest body as the door evaluates it: one directory `NegTest hex/local unit hex` per local unit */
+static Status export_negtest_facts(StigiDoor *door, ExportCtx *ex, const char *rules_src,
+                                   const StigiImage *priv, uint32_t local_start,
+                                   const uint8_t nt_id[32], Diag *diag) {
+  char nt_dir[1024];
+  Status st = make_id_dir(ex->root, nt_id, nt_dir, sizeof nt_dir, diag);
+  for (uint32_t i = local_start; i < priv->unit_count && st == STIGI_OK; i++) {
+    StigiFactSet fs;
+    stigi_facts_init(&fs);
+    st = unit_fact_set(priv, i, door->kernel_mode, &fs, diag);
+    if (st == STIGI_OK) st = write_fact_dir(ex, nt_dir, priv->units[i].unit_id, &fs, rules_src, diag);
+    if (st == STIGI_OK) ex->negtest_local_dirs++;
+    stigi_facts_free(&fs);
+  }
+  if (st == STIGI_OK) ex->negtest_dirs++;
+  return st;
+}
+
 /* ---- NegTest verifier (dynamic expect codes, known Stigi.Code.*, full pipeline) ---- */
 
 static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *active_rules_dl,
                                  const StigiImage *cand, uint32_t nt_idx,
-                                 StigiDoorResult *out, Diag *diag) {
+                                 StigiDoorResult *out, ExportCtx *ex, Diag *diag) {
   const StigiImageUnit *nt_u = &cand->units[nt_idx];
   const StigiDecl *nt_d = nt_u->ast->decl;
   const StigiExpr *body = nt_d->u.val_decl.body;
@@ -1168,9 +1232,16 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
   }
 
   if (st == STIGI_OK && priv_res.reject_count == 0) {
-    for (uint32_t i = local_start; i < priv.unit_count && st == STIGI_OK; i++) {
-      st = eval_unit_datalog(priv_dl, door->kernel_mode, &priv, i, &priv_res, diag);
+    if (ex != NULL) {
+      st = export_negtest_facts(door, ex, priv_has_custom ? priv_dl_src : active_rules_dl, &priv,
+                                local_start, nt_u->unit_id, diag);
+    } else {
+      for (uint32_t i = local_start; i < priv.unit_count && st == STIGI_OK; i++) {
+        st = eval_unit_datalog(priv_dl, door->kernel_mode, &priv, i, &priv_res, diag);
+      }
     }
+  } else if (st == STIGI_OK && ex != NULL) {
+    ex->negtests_without_datalog++;
   }
 
   stigi_dl_close(&local_dl);
@@ -1670,7 +1741,7 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
       }
       out->tests_computed++;
       uint32_t before = out->reject_count;
-      tx_st = check_negtest_unit(door, eval_dl, active_rules_src, &cand, i, out, diag);
+      tx_st = check_negtest_unit(door, eval_dl, active_rules_src, &cand, i, out, NULL, diag);
       if (tx_st == STIGI_OK && out->reject_count == before) {
         tx_st = keyset_insert(&staged_tkeys, ntkey, diag);
       }
@@ -1842,7 +1913,7 @@ Status stigi_door_set_budget(StigiDoor *door, uint64_t new_budget,
     StigiDeclKind k = door->image.units[i].ast->decl->kind;
     out->verdicts_computed++;
     if (k == STIGI_DECL_NEG_TEST) {
-      st = check_negtest_unit(door, &tmp_dl, door->rules_dl, &door->image, i, out, diag);
+      st = check_negtest_unit(door, &tmp_dl, door->rules_dl, &door->image, i, out, NULL, diag);
     } else {
       st = eval_unit_datalog(&tmp_dl, door->kernel_mode, &door->image, i, out, diag);
     }
@@ -2432,29 +2503,49 @@ Status stigi_door_gc(StigiDoor *door, uint32_t *out_removed_units,
   return st;
 }
 
-Status stigi_door_export(const StigiDoor *door, const char *out_dl_path,
-                         const char *out_facts_dir, Diag *diag) {
-  if (door == NULL || out_dl_path == NULL || out_facts_dir == NULL) {
+Status stigi_door_export(StigiDoor *door, const char *dir, StigiExportStats *stats, Diag *diag) {
+  if (door == NULL || dir == NULL || stats == NULL) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_door_export: invalid arguments");
   }
-  FILE *f = fopen(out_dl_path, "w");
-  if (f == NULL) {
-    return diag_set(diag, STIGI_ERR_IO, -1, "cannot write %s", out_dl_path);
+  if (mkdir(dir, 0755) != 0) {
+    return diag_set(diag, STIGI_ERR_IO, errno, "cannot create %s (the export directory must be new)", dir);
   }
+  char rules_path[1024];
+  int rn = snprintf(rules_path, sizeof rules_path, "%s/rules.dl", dir);
+  if (rn < 0 || (size_t)rn >= sizeof rules_path) {
+    return diag_set(diag, STIGI_ERR_IO, -1, "export path too long");
+  }
+  FILE *f = fopen(rules_path, "w");
+  if (f == NULL) return diag_set(diag, STIGI_ERR_IO, errno, "cannot write %s", rules_path);
   if (fwrite(door->rules_dl, 1, door->rules_dl_len, f) != door->rules_dl_len) {
     (void)fclose(f);
-    return diag_set(diag, STIGI_ERR_IO, -1, "write error on %s", out_dl_path);
+    return diag_set(diag, STIGI_ERR_IO, errno, "write error on %s", rules_path);
   }
-  if (fclose(f) != 0) {
-    return diag_set(diag, STIGI_ERR_IO, -1, "close failed on %s", out_dl_path);
-  }
+  if (fclose(f) != 0) return diag_set(diag, STIGI_ERR_IO, errno, "close failed on %s", rules_path);
 
-  StigiFactSet fs;
-  stigi_facts_init(&fs);
-  Status st = stigi_door_extract_image(door, &fs, diag);
-  if (st == STIGI_OK) {
-    st = stigi_facts_write_dir(&fs, out_facts_dir, door->rules_dl, diag);
+  ExportCtx ex = {dir, 0, 0, 0, 0, 0};
+  Status st = STIGI_OK;
+  const StigiImage *img = &door->image;
+  for (uint32_t i = 0; i < img->unit_count && st == STIGI_OK; i++) {
+    if (img->units[i].ast->decl->kind == STIGI_DECL_NEG_TEST) continue;
+    StigiFactSet fs;
+    stigi_facts_init(&fs);
+    st = unit_fact_set(img, i, door->kernel_mode, &fs, diag);
+    if (st == STIGI_OK) st = write_fact_dir(&ex, dir, img->units[i].unit_id, &fs, door->rules_dl, diag);
+    if (st == STIGI_OK) ex.unit_dirs++;
+    stigi_facts_free(&fs);
   }
-  stigi_facts_free(&fs);
+  for (uint32_t i = 0; i < img->unit_count && st == STIGI_OK; i++) {
+    if (img->units[i].ast->decl->kind != STIGI_DECL_NEG_TEST) continue;
+    StigiDoorResult ignored;
+    stigi_door_result_init(&ignored);
+    st = check_negtest_unit(door, &door->dl, door->rules_dl, img, i, &ignored, &ex, diag);
+    stigi_door_result_free(&ignored);
+  }
+  stats->unit_dirs = ex.unit_dirs;
+  stats->negtest_dirs = ex.negtest_dirs;
+  stats->negtest_local_dirs = ex.negtest_local_dirs;
+  stats->negtests_without_datalog = ex.negtests_without_datalog;
+  stats->rows = ex.rows;
   return st;
 }

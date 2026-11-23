@@ -38,6 +38,9 @@ void stigi_facts_free(StigiFactSet *fs);
 Status stigi_facts_add_sym(StigiFactSet *fs, const char *rel, int ncols,
                            const char *const *syms, Diag *diag);
 
+/* Copy every row of src into dst (strings are copied into dst's arena) */
+Status stigi_facts_append(StigiFactSet *dst, const StigiFactSet *src, Diag *diag);
+
 /* Single-pass extraction over one unit, dependency-closed unit subgraph, or the entire image */
 Status stigi_extract_unit(const StigiImage *img, uint32_t unit_idx,
                           StigiFactSet *fs, Diag *diag);

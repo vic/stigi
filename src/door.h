@@ -101,8 +101,16 @@ Status stigi_door_set_budget(StigiDoor *door, uint64_t new_budget,
 /* Extract full image facts including door metadata (imageMode, Test/NegTest verdicts) */
 Status stigi_door_extract_image(const StigiDoor *door, StigiFactSet *fs, Diag *diag);
 
-/* C7: export active rules to out_dl_path and all image facts to out_facts_dir */
-Status stigi_door_export(const StigiDoor *door, const char *out_dl_path,
-                         const char *out_facts_dir, Diag *diag);
+typedef struct {
+  uint32_t unit_dirs;                 /* admitted units: one fact directory each */
+  uint32_t negtest_dirs;              /* NegTest bodies whose rejection comes from Datalog: one directory each */
+  uint32_t negtest_local_dirs;        /* their local units: one evaluation, one directory inside it */
+  uint32_t negtests_without_datalog;  /* NegTest bodies rejected before Datalog (names, types): no directory */
+  uint64_t rows;
+} StigiExportStats;
+
+/* S134 2: `dir/rules.dl` once, and one fact directory `dir/<hex unit id>` per door evaluation (the fact set the
+ * door loads for that unit; a NegTest body is one directory, named by the NegTest's id). */
+Status stigi_door_export(StigiDoor *door, const char *dir, StigiExportStats *stats, Diag *diag);
 
 #endif

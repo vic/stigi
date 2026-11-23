@@ -4,6 +4,7 @@
 #include "door.h"
 #include "extract.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +57,19 @@ static int count_tupu_reject_rows(const char *out_buf) {
     }
   }
   return -1; /* Missing `relation reject` header: fail closed! */
+}
+
+/* Reject rows of `tupu` on one exported fact directory (-1: tupu failed or printed no reject relation) */
+static int tupu_reject_rows(const char *tupu_bin, const char *root, const char *dir) {
+  char cmd[2048];
+  (void)snprintf(cmd, sizeof cmd, "%s -F %s -D - %s/rules.dl", tupu_bin, dir, root);
+  FILE *fp = popen(cmd, "r");
+  if (fp == NULL) return -1;
+  char out_buf[8192];
+  size_t n = fread(out_buf, 1, sizeof(out_buf) - 1, fp);
+  out_buf[n] = '\0';
+  if (pclose(fp) != 0) return -1;
+  return count_tupu_reject_rows(out_buf);
 }
 
 int main(void) {
@@ -844,33 +858,68 @@ int main(void) {
     stigi_door_free(&p2door);
   }
 
-  /* 10. C7 export parity: export to /tmp/stigi-c7-export, run tupu CLI, assert EXACTLY 0 reject rows */
+  /* 10. C7 export parity (S134 2): rules.dl once; one fact directory per door evaluation; tupu on the
+   * directory of an admitted unit gives EXACTLY 0 reject rows; a NegTest body is a directory of its local
+   * units' directories and tupu gives at least one reject row over them */
   {
-    (void)mkdir("/tmp/stigi-c7-export", 0755);
-    CHECK(stigi_door_export(&door, "/tmp/stigi-c7-export/all.dl",
-                            "/tmp/stigi-c7-export", &d) == STIGI_OK,
-          "stigi_door_export");
+    char base[] = "/tmp/stigi-c7-export-XXXXXX";
+    CHECK(mkdtemp(base) != NULL, "mkdtemp export base");
+    char root[sizeof base + 8];
+    (void)snprintf(root, sizeof root, "%s/export", base);
+    StigiExportStats xs;
+    CHECK(stigi_door_export(&door, root, &xs, &d) == STIGI_OK, "stigi_door_export");
     const char *tupu_bin = getenv("TUPU_BIN");
     if (tupu_bin == NULL || tupu_bin[0] == '\0') {
       tupu_bin = "/home/vic/hk/tupu/result/bin/tupu";
     }
-    char cmd[512];
-    (void)snprintf(cmd, sizeof cmd, "%s -F /tmp/stigi-c7-export -D - /tmp/stigi-c7-export/all.dl",
-                   tupu_bin);
-    FILE *fp = popen(cmd, "r");
-    CHECK(fp != NULL, "popen tupu CLI on exported facts");
-    if (fp != NULL) {
-      char out_buf[8192];
-      size_t n = fread(out_buf, 1, sizeof(out_buf) - 1, fp);
-      out_buf[n] = '\0';
-      int rc = pclose(fp);
-      CHECK(rc == 0, "tupu CLI exited 0 on exported program");
-      int rej_rows = count_tupu_reject_rows(out_buf);
-      if (rej_rows != 0) {
-        fprintf(stderr, "FAIL tupu export had %d reject rows:\n%s\n", rej_rows, out_buf);
+    DIR *dp = opendir(root);
+    CHECK(dp != NULL, "open export directory");
+    uint32_t unit_dirs = 0, negtest_dirs = 0, local_dirs = 0;
+    int unit_rej = 0, negtest_rej = 0;
+    struct dirent *de;
+    while (dp != NULL && (de = readdir(dp)) != NULL) {
+      if (de->d_name[0] == '.' || strcmp(de->d_name, "rules.dl") == 0) continue;
+      char path[1024];
+      (void)snprintf(path, sizeof path, "%s/%s", root, de->d_name);
+      bool is_negtest_dir = false;
+      for (uint32_t u = 0; u < door.image.unit_count; u++) {
+        if (door.image.units[u].ast->decl->kind != STIGI_DECL_NEG_TEST) continue;
+        char hex[65];
+        for (int b = 0; b < 32; b++) (void)snprintf(hex + 2 * b, 3, "%02x", (unsigned)door.image.units[u].unit_id[b]);
+        if (strncmp(de->d_name, hex, 64) == 0) is_negtest_dir = true;
       }
-      CHECK(rej_rows == 0, "Wave 3: tupu CLI reject relation has EXACTLY 0 rows");
+      if (!is_negtest_dir) {
+        unit_dirs++;
+        int rows = tupu_reject_rows(tupu_bin, root, path);
+        CHECK(rows >= 0, "tupu on an admitted unit's fact directory prints the reject relation");
+        if (rows > 0) unit_rej += rows;
+        continue;
+      }
+      negtest_dirs++;
+      int rows_here = 0;
+      DIR *ndp = opendir(path);
+      CHECK(ndp != NULL, "open NegTest export directory");
+      struct dirent *le;
+      while (ndp != NULL && (le = readdir(ndp)) != NULL) {
+        if (le->d_name[0] == '.') continue;
+        char lpath[2048];
+        (void)snprintf(lpath, sizeof lpath, "%s/%s", path, le->d_name);
+        local_dirs++;
+        int rows = tupu_reject_rows(tupu_bin, root, lpath);
+        CHECK(rows >= 0, "tupu on a NegTest local unit's fact directory prints the reject relation");
+        if (rows > 0) rows_here += rows;
+      }
+      if (ndp != NULL) (void)closedir(ndp);
+      CHECK(rows_here > 0, "a NegTest body shows at least one reject row over its local directories");
+      negtest_rej += rows_here;
     }
+    if (dp != NULL) (void)closedir(dp);
+    CHECK(unit_dirs == xs.unit_dirs, "one fact directory per admitted unit");
+    CHECK(negtest_dirs == xs.negtest_dirs, "one directory per NegTest body with Datalog");
+    CHECK(local_dirs == xs.negtest_local_dirs, "one directory per NegTest local unit");
+    CHECK(unit_dirs > 0, "export holds at least one evaluation");
+    CHECK(unit_rej == 0, "Wave 3: tupu on every admitted unit's fact directory gives EXACTLY 0 reject rows");
+    CHECK(negtest_rej >= (int)xs.negtest_dirs, "tupu on the NegTest bodies gives their reject rows");
   }
 
   stigi_door_free(&door);

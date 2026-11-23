@@ -174,6 +174,28 @@ Status stigi_facts_add_sym(StigiFactSet *fs, const char *rel, int ncols,
   return fs_add(fs, rdup, ncols, cols, diag);
 }
 
+Status stigi_facts_append(StigiFactSet *dst, const StigiFactSet *src, Diag *diag) {
+  if (dst == NULL || src == NULL) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_facts_append: invalid arguments");
+  }
+  for (uint32_t i = 0; i < src->count; i++) {
+    const StigiFactRow *r = &src->rows[i];
+    const char *rel = fs_strdup(dst, r->rel, strlen(r->rel));
+    if (rel == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+    StigiFactCol cols[STIGI_MAX_FACT_COLS];
+    for (int c = 0; c < r->ncols; c++) {
+      cols[c] = r->cols[c];
+      if (!cols[c].is_num) {
+        cols[c].sym = fs_strdup(dst, r->cols[c].sym, strlen(r->cols[c].sym));
+        if (cols[c].sym == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+      }
+    }
+    Status st = fs_add(dst, rel, r->ncols, cols, diag);
+    if (st != STIGI_OK) return st;
+  }
+  return STIGI_OK;
+}
+
 static Status emit1(StigiFactSet *fs, const char *rel, StigiFactCol c0, Diag *d) {
   StigiFactCol cols[1] = {c0};
   return fs_add(fs, rel, 1, cols, d);
