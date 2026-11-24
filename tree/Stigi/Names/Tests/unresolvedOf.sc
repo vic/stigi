@@ -1,0 +1,36 @@
+// prompt: walk one unit text of a single declaration from an empty image and count the names it leaves unresolved; a setup failure counts as 999.
+def Stigi.Names.Tests.unresolvedOf {Stigi.Region, Stigi.Mut} (textCap: U64, text: Array[U8](textCap), size: U64) <lessOrEqual(size, textCap), lessOrEqual(size, Stigi.Limit.maxUnitBytes)>: U64 =
+  val Allocated(tables) = Stigi.Syntax.allocate{Stigi.Region}() else
+    case AllocationFailed => 999
+  val Filled(pool) = Array.tryFill[U8]{Stigi.Region}(Stigi.Limit.maxIndexBytes, 0) else
+    case FillFailed => 999
+  val Filled(entries) = Array.tryFill[Stigi.Names.Entry]{Stigi.Region}(Stigi.Limit.maxUnits, Entry(0, 0, DefKind, false)) else
+    case FillFailed => 999
+  val Filled(slots) = Array.tryFill[Stigi.Names.KeySlot]{Stigi.Region}(Stigi.Names.tableSlots, Vacant) else
+    case FillFailed => 999
+  val Filled(memberPool) = Array.tryFill[U8]{Stigi.Region}(Stigi.Limit.maxIndexBytes, 0) else
+    case FillFailed => 999
+  val Filled(table) = Array.tryFill[Stigi.Names.Member]{Stigi.Region}(Stigi.Names.maxMembers, Member(0, CaseMember, 0, 0)) else
+    case FillFailed => 999
+  val Filled(memberSlots) = Array.tryFill[Stigi.Names.KeySlot]{Stigi.Region}(Stigi.Names.tableSlots, Vacant) else
+    case FillFailed => 999
+  val Filled(tasks) = Array.tryFill[Stigi.Names.Task]{Stigi.Region}(Stigi.Names.maxScope, Restore(0)) else
+    case FillFailed => 999
+  val Filled(locals) = Array.tryFill[Stigi.Names.Local]{Stigi.Region}(Stigi.Names.maxScope, Local(Text(0, 0), WithoutCapability)) else
+    case FillFailed => 999
+  val Filled(sources) = Array.tryFill[U64]{Stigi.Region}(Stigi.Names.maxEdges, 0) else
+    case FillFailed => 999
+  val Filled(targets) = Array.tryFill[U64]{Stigi.Region}(Stigi.Names.maxEdges, 0) else
+    case FillFailed => 999
+  val Filled(stamps) = Array.tryFill[U64]{Stigi.Region}(Stigi.Limit.maxUnits, 0) else
+    case FillFailed => 999
+  val Parsed(root, _, _) = Stigi.Syntax.Parse.parseUnit(tables, textCap, text, size) else
+    case ParseRejected(_, _) | LexRejected(_) => 999
+  val Fetched(rootNode) = Stigi.Syntax.readSlot(tables, root) else
+    case MalformedTable(_) => 999
+  val UnitRoot(_, _, _, decl) = rootNode else
+    case Absent(_) | Name(_, _) | TypeRef(_, _, _, _, _) | FactAtom(_, _, _, _, _) | FactCompare(_, _, _, _, _, _) | FactArith(_, _, _, _, _, _, _) | FactDeny(_, _) | FactGroup(_, _) | Param(_, _, _) | CapParam(_, _, _) | CapGroup(_, _) | PatName(_, _) | PatLiteral(_, _) | PatCtor(_, _, _) | PatTuple(_, _) | PatOr(_, _) | PatRange(_, _, _) | Literal(_, _, _) | Ref(_, _) | Call(_, _, _, _, _, _) | Binary(_, _, _, _) | Unary(_, _, _) | IsTest(_, _, _) | IfElse(_, _, _, _) | WhileLoop(_, _, _) | MatchOn(_, _, _) | Arm(_, _, _, _) | ValStmt(_, _, _, _, _) | VarStmt(_, _, _, _, _) | AssignStmt(_, _, _) | IndexRead(_, _, _) | IndexWrite(_, _, _, _) | HandleStmt(_, _, _, _, _, _, _, _) | AssertStmt(_, _, _) | DenyStmt(_, _) | Block(_, _) | LocalDecl(_, _) | DefHead(_, _, _, _, _, _, _, _) | FunctionDecl(_, _, _, _, _, _, _) | ValDecl(_, _, _, _, _, _) | EnumDecl(_, _, _, _, _) | EnumCase(_, _, _, _, _) | TypeDecl(_, _, _, _, _, _, _, _) | CapabilityDecl(_, _, _, _, _, _, _, _) | HandlerDecl(_, _, _, _, _, _, _, _, _, _) | TraitDecl(_, _, _, _, _) | GivenDecl(_, _, _, _, _, _, _) | ExternDef(_, _, _, _, _, _) | ExternVal(_, _, _, _, _) | RelationDecl(_, _, _, _) | RuleDecl(_, _, _, _, _, _) | AliasLine(_, _, _) => 999
+  tasks(0) := Visit(decl)
+  val members: Stigi.Names.Members = Members(memberPool, 0, table, 0, memberSlots)
+  val Walker(_, _, _, _, _, _, unresolved, _, fault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, Edges(sources, targets, 0, stamps), 0, 0, 0, WalkSound), Image(pool, entries, 0, slots), members, tables, 0)
+  if fault is WalkSound then unresolved else 999

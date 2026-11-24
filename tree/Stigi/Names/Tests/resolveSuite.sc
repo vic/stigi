@@ -40,15 +40,15 @@ val Stigi.Names.Tests.resolveSuite {Stigi.Test}: Stigi.Test.Result =
     val pickOther: Array[U8](41) = "// prompt: demo.\nenum E.Pick:\n  case Two\n"
     val probe: Array[U8](107) = "// prompt: demo.\ndef A.B.c(x: U64): U64 =\n  d + x + C.x + C.y + zzz + One + Two + Three + A.Pick.One + B.d\n"
     val Recorded(one) = Stigi.Names.Tests.recordUnit(Members(memberPool, 0, table, 0, memberSlots), tables, 52, pickNear, 52, 5) else
-      case MembersFull => false
+      case MembersFull | MembersMalformed => false
     val Recorded(two) = Stigi.Names.Tests.recordUnit(one, tables, 54, pickFar, 54, 6) else
-      case MembersFull => false
+      case MembersFull | MembersMalformed => false
     val Recorded(three) = Stigi.Names.Tests.recordUnit(two, tables, 41, pickOther, 41, 7) else
-      case MembersFull => false
+      case MembersFull | MembersMalformed => false
     val Parsed(_, _, _) = Stigi.Syntax.Parse.parseUnit(tables, 107, probe, 107) else
       case ParseRejected(_, _) | LexRejected(_) => false
-    val found: Bool = Stigi.Names.resolveText(iota, three, tables, 0, 44, 45, false) is ToUnit(2) && Stigi.Names.resolveText(iota, three, tables, 0, 52, 55, false) is ToUnit(3) && Stigi.Names.resolveText(iota, three, tables, 0, 58, 61, false) is ToUnit(4) && Stigi.Names.visibleFrom(iota, 4, 0) == false && Stigi.Names.visibleFrom(iota, 3, 0)
-    val missed: Bool = Stigi.Names.resolveText(iota, three, tables, 0, 48, 49, false) is Unresolved && Stigi.Names.resolveText(iota, three, tables, 0, 64, 67, true) is Unresolved && Stigi.Names.resolveText(iota, three, tables, 0, 30, 33, false) is ToBuiltin && Stigi.Names.resolveText(iota, three, tables, 3, 103, 106, true) is Unresolved
-    val cases: Bool = Stigi.Names.resolveText(iota, three, tables, 0, 70, 73, true) is ToCase(5, _) && Stigi.Names.resolveText(iota, three, tables, 0, 76, 79, true) is ToCase(5, _) && Stigi.Names.resolveText(iota, three, tables, 0, 90, 100, true) is ToCase(5, _) && Stigi.Names.resolveText(iota, three, tables, 3, 82, 87, true) is ToCase(6, _) && Stigi.Names.resolveText(iota, three, tables, 3, 76, 79, true) is AmbiguousCase
+    val found: Bool = Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(44, 45), false) is ToUnit(2) && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(52, 55), false) is ToUnit(3) && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(58, 61), false) is ToUnit(4) && Stigi.Names.visibleFrom(iota, 4, 0) == false && Stigi.Names.visibleFrom(iota, 3, 0)
+    val missed: Bool = Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(48, 49), false) is Unresolved && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(64, 67), true) is Unresolved && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(30, 33), false) is ToBuiltin && Stigi.Names.resolveText(NameScope(iota, three), tables, 3, Text(103, 106), true) is Unresolved
+    val cases: Bool = Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(70, 73), true) is ToCase(5, _) && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(76, 79), true) is ToCase(5, _) && Stigi.Names.resolveText(NameScope(iota, three), tables, 0, Text(90, 100), true) is ToCase(5, _) && Stigi.Names.resolveText(NameScope(iota, three), tables, 3, Text(82, 87), true) is ToCase(6, _) && Stigi.Names.resolveText(NameScope(iota, three), tables, 3, Text(76, 79), true) is AmbiguousCase
     copied == 47 && found && missed && cases
   Stigi.Test.expect(passed, true, "name resolution prefers nearer units and cases, leaves visibility to the walker, and names builtins")

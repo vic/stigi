@@ -11,6 +11,6 @@ def Stigi.Names.hasOperation(members: Stigi.Names.Members, tables: Stigi.Syntax.
                 case Member(memberOwner, kind, _, _) =>
                   val operation: Bool = kind match
                     case OperationMember => true
-                    case CaseMember => false
+                    case CaseMember | ForCapabilityMember => false
                   if memberOwner == owner && operation then true else Stigi.Names.hasOperation(members, tables, owner, first, end, Stigi.Names.nextMember(members, tables, first, end, nextSlot, Stigi.Names.tableSlots), remaining - 1)
             else false

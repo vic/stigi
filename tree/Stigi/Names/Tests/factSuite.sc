@@ -43,9 +43,7 @@ val Stigi.Names.Tests.factSuite {Stigi.Test}: Stigi.Test.Result =
     tasks(0) := Visit(decl)
     val Walker(_, _, _, _, walked, references, unresolved, _, fault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, Edges(sources, targets, 0, stamps), 0, 0, 0, WalkSound), gamma, Members(memberPool, 0, table, 0, memberSlots), tables, 0)
     val Edges(edgeSources, edgeTargets, count, _) = walked
-    val sound: Bool = fault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val sound: Bool = fault is WalkSound
     if copied == 14 then
       if count == 2 then
         if edgeSources(0) == 0 && edgeSources(1) == 0 && edgeTargets(0) == 2 && edgeTargets(1) == 1 then

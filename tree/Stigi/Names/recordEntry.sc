@@ -1,5 +1,5 @@
 // prompt: record the member of one entry of a member list: an enum case or a def of a capability or a trait.
-def Stigi.Names.recordEntry {Stigi.Mut} (members: Stigi.Names.Members, tables: Stigi.Syntax.Tables, owner: U64, entry: Stigi.Syntax.Node) <below(0, Stigi.Limit.maxUnitBytes)>: Stigi.Names.Recorded =
+def Stigi.Names.recordEntry {Stigi.Mut} (members: Stigi.Names.Members, tables: Stigi.Syntax.Tables, owner: U64, entry: Stigi.Syntax.Node) <below(owner, Stigi.Limit.maxUnits)>: Stigi.Names.Recorded =
   entry match
     case EnumCase(_, name, _, _, _) => Stigi.Names.addMember(members, tables, owner, CaseMember, name)
     case FunctionDecl(_, _, _, name, _, _, _) => Stigi.Names.addMember(members, tables, owner, OperationMember, name)

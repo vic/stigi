@@ -1,5 +1,5 @@
 // prompt: record one member of the member table, copying its text from the unit source into the member pool and hashing it into the slots.
-def Stigi.Names.addMember {Stigi.Mut} (members: Stigi.Names.Members, tables: Stigi.Syntax.Tables, owner: U64, kind: Stigi.Names.MemberKind, text: Stigi.Syntax.Text) <below(0, Stigi.Limit.maxUnitBytes)>: Stigi.Names.Recorded =
+def Stigi.Names.addMember {Stigi.Mut} (members: Stigi.Names.Members, tables: Stigi.Syntax.Tables, owner: U64, kind: Stigi.Names.MemberKind, text: Stigi.Syntax.Text) <below(owner, Stigi.Limit.maxUnits)>: Stigi.Names.Recorded =
   members match
     case Members(pool, poolEnd, table, count, slots) =>
       text match

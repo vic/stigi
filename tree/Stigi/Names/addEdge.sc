@@ -1,10 +1,10 @@
-// prompt: record one dependency edge of a source unit, dropping targets outside the image, repeats of the source and edges past the limit.
-def Stigi.Names.addEdge {Stigi.Mut} (edges: Stigi.Names.Edges, from: U64, to: U64) <below(from, Stigi.Limit.maxUnits)>: Stigi.Names.Edges =
+// prompt: record one dependency edge between two units of the image: a repeat of the source keeps the edges as they are and an edge past the limit is the full result.
+def Stigi.Names.addEdge {Stigi.Mut} (edges: Stigi.Names.Edges, from: U64, to: U64) <below(from, Stigi.Limit.maxUnits), below(to, Stigi.Limit.maxUnits)>: Stigi.Names.EdgeAdded =
   val Edges(sources, targets, count, stamps) = edges
-  if to < Stigi.Limit.maxUnits && count < Stigi.Names.maxEdges then
-    if stamps(to) == from + 1 then edges else
+  if stamps(to) == from + 1 then EdgeKept(edges) else
+    if count < Stigi.Names.maxEdges then
       stamps(to) := from + 1
       sources(count) := from
       targets(count) := to
-      Edges(sources, targets, count + 1, stamps)
-  else edges
+      EdgeKept(Edges(sources, targets, count + 1, stamps))
+    else EdgesFull

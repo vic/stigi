@@ -1,5 +1,5 @@
 // prompt: the shape a declaration node gives its unit.
-def Stigi.Names.shapeOfDecl(node: Stigi.Syntax.Node) <below(0, Stigi.Limit.maxUnitNodes)>: Stigi.Names.DeclShape =
+def Stigi.Names.shapeOfDecl(node: Stigi.Syntax.Node): Stigi.Names.DeclShape =
   node match
     case FunctionDecl(_, isPublic, _, _, _, _, _) => Declared(DefKind, isPublic)
     case ValDecl(_, isPublic, _, caps, _, _) => ValueDecl(isPublic, caps)

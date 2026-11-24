@@ -2,3 +2,4 @@
 enum Stigi.Names.Recorded:
   case Recorded(members: Stigi.Names.Members)
   case MembersFull
+  case MembersMalformed

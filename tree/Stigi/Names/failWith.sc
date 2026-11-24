@@ -5,4 +5,4 @@ def Stigi.Names.failWith(walker: Stigi.Names.Walker, cause: Stigi.Names.WalkFaul
     case WalkSound =>
       @<lessOrEqual(steps, Stigi.Names.maxWalkSteps)>
       Walker(tasks, depth, locals, localCount, edges, references, unresolved, steps, cause)
-    case StackFull | ScopeFull | TableMalformed | StepsExhausted => walker
+    case StackFull | ScopeFull | TableMalformed | StepsExhausted | EdgesExhausted => walker

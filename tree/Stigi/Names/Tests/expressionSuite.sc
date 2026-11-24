@@ -35,7 +35,7 @@ val Stigi.Names.Tests.expressionSuite {Stigi.Test}: Stigi.Test.Result =
       case ImageFull | UnitUnshaped => 99
     val pick: Array[U8](52) = "// prompt: demo.\nenum A.Pick:\n  case One\n  case Two\n"
     val Recorded(members) = Stigi.Names.Tests.recordUnit(Members(memberPool, 0, table, 0, memberSlots), tables, 52, pick, 52, 1) else
-      case MembersFull => 99
+      case MembersFull | MembersMalformed => 99
     val sample: Array[U8](100) = "// prompt: demo.\ndef A.c(x: U64): U64 =\n  var t: U64 = f(x)\n  t = t + g\n  if x is One then w else t\n"
     val Parsed(root, _, _) = Stigi.Syntax.Parse.parseUnit(tables, 100, sample, 100) else
       case ParseRejected(_, _) | LexRejected(_) => 99
@@ -51,9 +51,7 @@ val Stigi.Names.Tests.expressionSuite {Stigi.Test}: Stigi.Test.Result =
     val seeded: Stigi.Names.Walker = Stigi.Names.pushTask(Walker(tasks, 1, locals, 0, Edges(sources, targets, 0, stamps), 0, 0, 0, WalkSound), BindLocal(Local(Text(25, 26), WithoutCapability)))
     val Walker(_, _, _, _, walked, references, unresolved, _, fault) = Stigi.Names.walkFrom(seeded, gamma, members, tables, 0)
     val Edges(edgeSources, edgeTargets, count, _) = walked
-    val sound: Bool = fault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val sound: Bool = fault is WalkSound
     if copied == 15 then
       if count == 2 then
         if edgeSources(0) == 0 && edgeSources(1) == 0 && edgeTargets(0) == 2 && edgeTargets(1) == 1 then

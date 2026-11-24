@@ -1,5 +1,5 @@
 // prompt: whether the unit named by the first index lies in the namespace of the unit named by the second, or is that very unit when it has no namespace.
-def Stigi.Names.sameNamespace(image: Stigi.Names.Image, target: U64, from: U64) <below(0, Stigi.Limit.maxUnitBytes)>: Bool =
+def Stigi.Names.sameNamespace(image: Stigi.Names.Image, target: U64, from: U64) <below(from, Stigi.Limit.maxUnits)>: Bool =
   image match
     case Image(pool, entries, count, _) =>
       if target < count && from < count then

@@ -9,5 +9,5 @@ def Stigi.Names.ownedCase(members: Stigi.Names.Members, tables: Stigi.Syntax.Tab
             if member < count then
               table(member) match
                 case Member(memberOwner, kind, _, _) =>
-                  if memberOwner == owner && kind is CaseMember then ToCase(owner, member) else Stigi.Names.ownedCase(members, tables, owner, first, end, Stigi.Names.nextMember(members, tables, first, end, nextSlot, Stigi.Names.tableSlots), remaining - 1)
+                  if memberOwner == owner && kind is CaseMember then ToCase(memberOwner, member) else Stigi.Names.ownedCase(members, tables, owner, first, end, Stigi.Names.nextMember(members, tables, first, end, nextSlot, Stigi.Names.tableSlots), remaining - 1)
             else Unresolved

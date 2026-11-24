@@ -1,5 +1,5 @@
 // prompt: the kind the unit relation gives one unit.
-enum Stigi.Names.UnitKind:
+pub enum Stigi.Names.UnitKind:
   case DefKind
   case ValKind
   case EnumKind

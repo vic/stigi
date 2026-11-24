@@ -35,7 +35,7 @@ val Stigi.Names.Tests.declarationSuite {Stigi.Test}: Stigi.Test.Result =
       case ImageFull | UnitUnshaped => 99
     val port: Array[U8](60) = "// prompt: demo.\ncapability A.Port:\n  def send(x: U64): U64\n"
     val Recorded(members) = Stigi.Names.Tests.recordUnit(Members(memberPool, 0, table, 0, memberSlots), tables, 60, port, 60, 1) else
-      case MembersFull => 99
+      case MembersFull | MembersMalformed => 99
     val sample: Array[U8](71) = "// prompt: demo.\ndef A.c {port: A.Port} (x: A.T): A.T =\n  port.send(x)\n"
     val Parsed(root, _, _) = Stigi.Syntax.Parse.parseUnit(tables, 71, sample, 71) else
       case ParseRejected(_, _) | LexRejected(_) => 99
@@ -46,9 +46,7 @@ val Stigi.Names.Tests.declarationSuite {Stigi.Test}: Stigi.Test.Result =
     tasks(0) := Visit(decl)
     val Walker(_, _, _, _, walked, references, unresolved, _, fault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, Edges(sources, targets, 0, stamps), 0, 0, 0, WalkSound), gamma, members, tables, 0)
     val Edges(edgeSources, edgeTargets, count, _) = walked
-    val sound: Bool = fault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val sound: Bool = fault is WalkSound
     if copied == 15 then
       if count == 2 then
         if edgeSources(0) == 0 && edgeSources(1) == 0 && edgeTargets(0) == 1 && edgeTargets(1) == 2 then

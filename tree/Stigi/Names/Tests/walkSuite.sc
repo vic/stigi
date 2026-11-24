@@ -49,15 +49,11 @@ val Stigi.Names.Tests.walkSuite {Stigi.Test}: Stigi.Test.Result =
     val seeded: Stigi.Names.Walker = Stigi.Names.pushTask(Walker(tasks, 1, locals, 0, Edges(sources, targets, 0, stamps), 0, 0, 0, WalkSound), BindLocal(Local(Text(27, 28), WithoutCapability)))
     val Walker(_, _, _, _, walked, references, unresolved, steps, fault) = Stigi.Names.walkFrom(seeded, gamma, members, tables, 0)
     val Edges(edgeSources, edgeTargets, count, _) = walked
-    val sound: Bool = fault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val sound: Bool = fault is WalkSound
     tasks(0) := Visit(Stigi.Limit.maxUnitNodes - 1)
     val Walker(_, _, _, _, kept, _, _, _, brokenFault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, walked, 0, 0, 0, WalkSound), gamma, members, tables, 0)
     val Edges(_, _, keptCount, _) = kept
-    val malformed: Bool = brokenFault match
-      case TableMalformed => true
-      case WalkSound | StackFull | ScopeFull | StepsExhausted => false
+    val malformed: Bool = brokenFault is TableMalformed
     if copied == 16 then
       if count == 2 then
         if unresolved == 1 then

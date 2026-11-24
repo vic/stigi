@@ -39,22 +39,19 @@ val Stigi.Names.Tests.ruleSuite {Stigi.Test}: Stigi.Test.Result =
     val sample: Array[U8](51) = "// prompt: demo.\nrule def A.r: A.rel(x) = A.rel(x)\n"
     val Parsed(ruleRoot, _, _) = Stigi.Syntax.Parse.parseUnit(tables, 51, sample, 51) else
       case ParseRejected(_, _) | LexRejected(_) => 99
-    val extended: Stigi.Names.Edges = Stigi.Names.unitEdges(Edges(sources, targets, 0, stamps), delta, members, tables, 1, ruleRoot)
+    val Walked(extended) = Stigi.Names.unitEdges(Edges(sources, targets, 0, stamps), delta, members, tables, 1, ruleRoot) else
+      case WalkFailed(_) => 99
     tasks(0) := Visit(ruleRoot)
     val Walker(_, _, _, _, ruleWalked, ruleReferences, ruleUnresolved, _, ruleFault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, extended, 0, 0, 0, WalkSound), delta, members, tables, 1)
     val Edges(ruleSources, ruleTargets, ruleCount, _) = ruleWalked
-    val ruleSound: Bool = ruleFault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val ruleSound: Bool = ruleFault is WalkSound
     val valText: Array[U8](34) = "// prompt: demo.\nval A.v: A.T = 0\n"
     val Parsed(valRoot, _, _) = Stigi.Syntax.Parse.parseUnit(tables, 34, valText, 34) else
       case ParseRejected(_, _) | LexRejected(_) => 99
     tasks(0) := Visit(valRoot)
     val Walker(_, _, _, _, valWalked, valReferences, valUnresolved, _, valFault) = Stigi.Names.walkFrom(Walker(tasks, 1, locals, 0, ruleWalked, 0, 0, 0, WalkSound), delta, members, tables, 3)
     val Edges(valSources, valTargets, valCount, _) = valWalked
-    val valSound: Bool = valFault match
-      case WalkSound => true
-      case StackFull | ScopeFull | TableMalformed | StepsExhausted => false
+    val valSound: Bool = valFault is WalkSound
     if copied == 18 then
       if ruleCount == 2 then
         if ruleSources(0) == 0 && ruleTargets(0) == 1 && ruleSources(1) == 1 && ruleTargets(1) == 0 then
