@@ -443,6 +443,14 @@ static bool is_bodyless_extern_decl(const StigiTok *toks, uint32_t count, uint32
   return true;
 }
 
+static bool ident_last_is_upper(const StigiTok *tok) {
+  const char *last = tok->ptr;
+  for (uint32_t k = 0; k + 1 < tok->len; k++) {
+    if (tok->ptr[k] == '.') last = tok->ptr + k + 1;
+  }
+  return tok->len > 0 && is_upper((unsigned char)last[0]);
+}
+
 static bool string_has_non_whitespace(const char *s, uint32_t len) {
   if (len < 2 || s[0] != '"' || s[len - 1] != '"') return false;
   uint32_t p = 1;
@@ -800,7 +808,11 @@ Status stigi_gate_check_tokens(const StigiTok *toks, uint32_t count,
             }
             b = next_sig_tok(toks, count, b + 1);
           }
-        } else {
+        } else if (!(t->kind == TOK_KW_VAL && after < count && toks[after].kind == TOK_ASSIGN &&
+                     ident_last_is_upper(&toks[n]))) {
+          /* language.md 4: `val Name =` with an upper-case Name is a fieldless constructor pattern (S123),
+           * resolved like a `case Name =>` arm; a declaration (`val Name:` or `val Name {`) and
+           * lower-case binders stay checked */
           bool allow_c_abi = (t->kind == TOK_KW_VAL) && is_bodyless_extern_decl(toks, count, i);
           loop_st = check_name_rules_ex(&toks[n], false, true, false, allow_c_abi, out, diag);
           if (loop_st != STIGI_OK) break;

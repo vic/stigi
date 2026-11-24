@@ -670,6 +670,31 @@ static void test_tenet_gate(void) {
       "  val Pair(bi, x2) = pair\n"
       "  bi\n",
       STIGI_GATE_CRYPTIC_NAME);
+  /* S123: a bare upper-case Name in a statement `val` is a fieldless constructor pattern */
+  check_gate_pos(
+      "pos_val_fieldless_ctor_else",
+      "// prompt: zero when the step for the input is done, one when it failed.\n"
+      "def Demo.failedCount(input: U64): U64 <lessOrEqual(result, 1)> =\n"
+      "  val Done = Demo.advance(input) else\n"
+      "    case Failed(_) => 1\n"
+      "  0\n");
+  check_gate_neg(
+      "neg_negtest_local_val_decl_upper",
+      "// prompt: upper-case local val declaration inside a NegTest.\n"
+      "val Demo.Tests.localBad {Stigi.NegTest}: Stigi.NegTest.Result =\n"
+      "  val Bad: U64 = 1\n"
+      "  Stigi.NegTest.expect(\"val Bad: U64 = 1\", \"name-case\")\n",
+      STIGI_GATE_NAME_CASE);
+  check_gate_neg(
+      "neg_val_decl_upper",
+      "// prompt: upper-case top-level val name.\n"
+      "val Demo.Tests.ValConst: U64 = 1\n",
+      STIGI_GATE_NAME_CASE);
+  check_gate_neg(
+      "neg_pub_val_decl_upper",
+      "// prompt: upper-case pub top-level val name.\n"
+      "pub val Demo.Limit.MaxBytes: U64 = 1\n",
+      STIGI_GATE_NAME_CASE);
   check_gate_neg(
       "neg_match_ctor_binder",
       "// prompt: cryptic binder in match arm pattern.\n"
