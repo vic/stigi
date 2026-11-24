@@ -1,39 +1,30 @@
 // prompt: verify linear-time Tarjan SCC on cycles and reachability BFS plus splitmix64 table probe.
 val Stigi.Names.Tests.graphSuite {Stigi.Test}: Stigi.Test.Result =
   val passed: Bool =
-    val Filled(edgeHead) = Array.tryFill[U64]{Stigi.Region}(8, 8) else
+    val Filled(heads) = Array.tryFill[Stigi.Names.EdgeLink]{Stigi.Region}(8, LastEdge) else
       case FillFailed => false
-    val Filled(edgeNext) = Array.tryFill[U64]{Stigi.Region}(8, 8) else
+    val Filled(edges) = Array.tryFill[Stigi.Names.Edge]{Stigi.Region}(8, Edge(0, LastEdge)) else
       case FillFailed => false
-    val Filled(edgeTarget) = Array.tryFill[U64]{Stigi.Region}(8, 0) else
-      case FillFailed => false
-    val Filled(compOut) = Array.tryFill[U64]{Stigi.Region}(8, 0) else
-      case FillFailed => false
-    val Filled(isRoot) = Array.tryFill[Bool]{Stigi.Region}(8, false) else
+    val Filled(visits) = Array.tryFill[Stigi.Names.Visit]{Stigi.Region}(8, Unseen) else
       case FillFailed => false
     val Filled(reached) = Array.tryFill[Bool]{Stigi.Region}(8, false) else
       case FillFailed => false
-    edgeHead(0) := 0
-    edgeTarget(0) := 1
-    edgeNext(0) := 8
-    edgeHead(1) := 1
-    edgeTarget(1) := 0
-    edgeNext(1) := 8
-    edgeHead(2) := 2
-    edgeTarget(2) := 1
-    edgeNext(2) := 8
-    val TarjanDone(compCount) = Stigi.Names.computeComponents{Stigi.Region}(8, 4, 8, edgeHead, edgeNext, edgeTarget, compOut) else
+    val Filled(table) = Array.tryFill[Stigi.Names.KeySlot]{Stigi.Region}(8, Vacant) else
+      case FillFailed => false
+    heads(0) := EdgeAt(0)
+    edges(0) := Edge(1, LastEdge)
+    heads(1) := EdgeAt(1)
+    edges(1) := Edge(0, LastEdge)
+    heads(2) := EdgeAt(2)
+    edges(2) := Edge(1, LastEdge)
+    val TarjanDone(compCount) = Stigi.Names.computeComponents{Stigi.Region}(8, 4, 8, heads, edges, visits) else
       case TarjanOutOfMemory => false
-    isRoot(2) := true
-    val reachCount: U64 = Stigi.Names.markReachable{Stigi.Region}(8, 4, 8, edgeHead, edgeNext, edgeTarget, isRoot, reached)
-    val Filled(occupied) = Array.tryFill[Bool]{Stigi.Region}(8, false) else
-      case FillFailed => false
-    val Filled(keys) = Array.tryFill[U64]{Stigi.Region}(8, 0) else
-      case FillFailed => false
+    reached(2) := true
+    val reachCount: U64 = Stigi.Names.markReachable{Stigi.Region}(8, 4, 8, heads, edges, reached)
     val targetSlot: U64 = Stigi.Raw.mixSlot(99, 8)
-    occupied(targetSlot) := true
-    keys(targetSlot) := 99
-    val probeHit: Bool = Stigi.sameValue(Stigi.Names.probeTable(8, occupied, keys, 99), Found(targetSlot))
-    val probeMiss: Bool = Stigi.sameValue(Stigi.Names.probeTable(8, occupied, keys, 77), Missing)
-    compCount == 3 && compOut(0) == compOut(1) && compOut(2) != compOut(0) && reachCount == 3 && reached(0) && reached(1) && reached(2) && !reached(3) && probeHit && probeMiss
+    table(targetSlot) := Keyed(99)
+    val probeHit: Bool = Stigi.sameValue(Stigi.Names.probeTable(8, table, 99, targetSlot, 8), Found(targetSlot))
+    val probeMiss: Bool = Stigi.Names.probeTable(8, table, 77, Stigi.Raw.mixSlot(77, 8), 8) is Missing
+    val sccValid: Bool = compCount == 3 && visits(0) is Placed(0) && visits(1) is Placed(0) && visits(2) is Placed(1) && visits(3) is Placed(2)
+    sccValid && reachCount == 3 && reached(0) && reached(1) && reached(2) && !reached(3) && probeHit && probeMiss
   Stigi.Test.expect(passed, true, "Tarjan SCC, BFS reachability, and hash probe must agree")
