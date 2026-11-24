@@ -10,3 +10,7 @@ def Stigi.Store.putFileName {Stigi.Mut} (reportCap: Stigi.EmitCap, report: Array
     case ModeFile => Stigi.Array.copy[U8](15, "imageMode.facts", 0, 15, reportCap, report, at)
     case TypeRangeFile => Stigi.Array.copy[U8](15, "typeRange.facts", 0, 15, reportCap, report, at)
     case TypeWidthFile => Stigi.Array.copy[U8](15, "typeWidth.facts", 0, 15, reportCap, report, at)
+    case LengthTermFile => Stigi.Array.copy[U8](16, "lengthTerm.facts", 0, 16, reportCap, report, at)
+    case LinearFormFile => Stigi.Array.copy[U8](16, "linearForm.facts", 0, 16, reportCap, report, at)
+    case TermOffsetFile => Stigi.Array.copy[U8](16, "termOffset.facts", 0, 16, reportCap, report, at)
+    case SameLengthFile => Stigi.Array.copy[U8](16, "sameLength.facts", 0, 16, reportCap, report, at)

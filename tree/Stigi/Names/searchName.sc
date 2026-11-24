@@ -1,5 +1,5 @@
 // prompt: search a name of the current unit through the namespaces of the unit that holds it.
-def Stigi.Names.searchName(image: Stigi.Names.Image, tables: Stigi.Syntax.Tables, from: U64, first: U64, end: U64) <below(from, Stigi.Limit.maxUnits), lessOrEqual(first, end), lessOrEqual(end, Stigi.Limit.maxUnitBytes)>: Stigi.Names.UnitLookup =
+pub def Stigi.Names.searchName(image: Stigi.Names.Image, tables: Stigi.Syntax.Tables, from: U64, first: U64, end: U64) <below(from, Stigi.Limit.maxUnits), lessOrEqual(first, end), lessOrEqual(end, Stigi.Limit.maxUnitBytes)>: Stigi.Names.UnitLookup =
   image match
     case Image(pool, entries, count, _) =>
       if from < count then

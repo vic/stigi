@@ -4,3 +4,7 @@ enum Stigi.Store.FactsFile:
   case ModeFile
   case TypeRangeFile
   case TypeWidthFile
+  case LengthTermFile
+  case LinearFormFile
+  case TermOffsetFile
+  case SameLengthFile

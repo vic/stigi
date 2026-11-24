@@ -26,8 +26,11 @@ def Stigi.Elaborate.emitCoreNode {Stigi.Mut} (tables: Stigi.Syntax.Tables, synId
                             exprs(emitIdx) := IntExpr(emitIdx, charVal, 0, 0)
                             true
                       case StringLiteral =>
-                        exprs(emitIdx) := TextExpr(emitIdx, CoreSpan(textFirst, textEnd), 0)
-                        true
+                        Stigi.Syntax.stringByteLength(Stigi.Limit.maxUnitBytes, source, textFirst, textEnd) match
+                          case MalformedString => false
+                          case DecodedLength(_) =>
+                            exprs(emitIdx) := TextExpr(emitIdx, CoreSpan(textFirst, textEnd), 0)
+                            true
                       case TrueLiteral =>
                         exprs(emitIdx) := TruthExpr(emitIdx, true)
                         true

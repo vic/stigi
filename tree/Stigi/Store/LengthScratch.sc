@@ -1,0 +1,3 @@
+// prompt: reusable per-run buffers and per-unit length tables for collecting length facts across a tree.
+enum Stigi.Store.LengthScratch:
+  case LengthScratch(pathBuf: Array[U8](4096), sourceBuf: Array[U8](Stigi.Limit.maxUnitBytes), synTables: Stigi.Syntax.Tables, coreTables: Stigi.Core.Tables, elabScratch: Stigi.Elaborate.Scratch, work: Array[Stigi.Store.VisitWork](4096), pool: Array[Stigi.Types.Linear.Term](1024), localStarts: Array[U64](256), localEnds: Array[U64](256), binders: Array[Stigi.Types.BinderKind](256), globals: Array[Stigi.Types.BinderKind](Stigi.Limit.maxUnits), unitForms: Array[Stigi.Types.Linear.Form](256), unitValid: Array[Bool](256), nodeStack: Array[U64](64), stepStack: Array[U64](64), formStack: Array[Stigi.Types.Linear.Form](64))

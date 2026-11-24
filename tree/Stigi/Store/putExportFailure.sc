@@ -4,6 +4,9 @@ def Stigi.Store.putExportFailure {region: Stigi.Region, Stigi.Mut} (report: Arra
     case FactsStopped(LaneFull(lane)) =>
       val named: U64 = Stigi.Store.putFailedFile(report, at, kind, LaneFile(lane))
       Stigi.Array.copy[U8](12, ": lane full\n", 0, 12, 65536, report, named)
+    case FactsStopped(TypeLaneFull(file)) =>
+      val named: U64 = Stigi.Store.putFailedFile(report, at, kind, file)
+      Stigi.Array.copy[U8](12, ": lane full\n", 0, 12, 65536, report, named)
     case FactsStopped(EdgeOutsideImage(edge)) =>
       val prefixed: U64 = Stigi.Store.putExportPrefix(report, at, kind)
       val head: U64 = Stigi.Array.copy[U8](5, "edge ", 0, 5, 65536, report, prefixed)
