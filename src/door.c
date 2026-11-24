@@ -2052,6 +2052,8 @@ static Status run_transaction(StigiDoor *door, const char *const *add_srcs,
                              er.diag_code != NULL ? er.diag_code : "eval-error", er.msg, diag);
         }
       }
+      /* the verdict is copied out (msg inline, code literal, value unread): drop this unit's eval memory */
+      arena_reset(&eval_arena);
     }
     arena_free(&eval_arena);
   }
