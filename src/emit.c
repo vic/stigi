@@ -5146,9 +5146,11 @@ Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
       if (!val_used_at_runtime(img, u->idx)) continue;
       stats->units_emitted++;
       eb_line_dir(&b, d->span.line, u->name, u->name_len);
-      eb_cstr(&b, "static const ");
+      eb_cstr(&b, "static ");
       emit_c_type(&b, img, u->idx, d->u.val_decl.type, 0);
-      eb_cstr(&b, " ");
+      /* the binding is const, the pointed bytes are not: a text val reaches defs as `uint8_t *`
+       * (the write-to-static rule keeps it read-only), so `const uint8_t *` discarded the qualifier */
+      eb_cstr(&b, " const ");
       eb_mangle_name(&b, u->name, u->name_len);
       eb_cstr(&b, " = ");
       EmitScalarTy vhint = ast_type_to_scalar(img, u->idx, d->u.val_decl.type, 0);
