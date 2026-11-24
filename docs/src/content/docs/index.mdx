@@ -1,0 +1,81 @@
+---
+title: Stigi
+description: A systems language and verification door for the era when AI writes most of the code.
+template: splash
+editUrl: false
+hero:
+  title: A language you can trust, even when AI writes it.
+  tagline: Stigi reads like clean Scala 3, compiles to plain C, and proves memory, bounds, arithmetic, stack and resource safety before any code gets in.
+  actions:
+    - text: Take the tour
+      link: /start/tour/
+      icon: right-arrow
+    - text: Why Stigi?
+      link: /start/why/
+      variant: minimal
+---
+
+import Features from '../../components/Features.astro';
+import Feature from '../../components/Feature.astro';
+import Ladder from '../../components/Ladder.astro';
+import Rung from '../../components/Rung.astro';
+import Explore from '../../components/Explore.astro';
+import GetInvolved from '../../components/GetInvolved.astro';
+import Sponsors from '../../components/Sponsors.astro';
+import Faq from '../../components/Faq.astro';
+
+## About
+
+AI writes code faster than any team can read it. It also cheats: it deletes failing tests, weakens checks and fills projects with glue nobody asked for.
+
+Stigi is a systems language built for that world. Every piece of code enters a program through one door. Before anything gets in, one Datalog engine proves that memory is used safely, that indexes stay in bounds, that numbers never overflow, that the stack never runs out and that files and sockets are always closed. Code that cannot be proved stays out. There is no garbage collector, no runtime panic and no out-of-memory kill.
+
+## What makes Stigi different
+
+<Features>
+	<Feature icon="proof" title="Proved before it runs">
+		Memory, bounds, arithmetic, stack depth and resource protocols are checked together, by one engine, at compile time.
+	</Feature>
+	<Feature icon="shake" title="Slop never gets in">
+		Unused code, dead branches and constant work are shaken out before anything is admitted.
+	</Feature>
+	<Feature icon="law" title="Agents cannot cheat">
+		Humans own the laws and tests. Agents own the implementations. No agent can weaken a spec.
+	</Feature>
+	<Feature icon="sheet" title="Read theory, not slop">
+		A one-screen theory sheet tells you what a whole subsystem can touch, and what it guarantees.
+	</Feature>
+</Features>
+
+## Where to start
+
+<Ladder>
+	<Rung href="/start/why/" title="Why Stigi exists">The problem we are solving, in five minutes.</Rung>
+	<Rung href="/start/tour/" title="A two-minute tour">Real Stigi code, and what the door proves about it.</Rung>
+	<Rung href="/language/units/" title="Learn the language">Small steps, from your first unit to laws.</Rung>
+	<Rung href="/door/image/" title="Meet the door">The one way into the image, and every check on the way.</Rung>
+</Ladder>
+
+## Explore
+
+<Explore />
+
+## Get involved
+
+Stigi is built in the open, and it compiles itself. Grab the source, open the development shell and look around. The best way to help right now is to try Stigi on a real problem and tell us what a rule rejects that it should not.
+
+:::note[Stigi is a work in progress]
+Stigi is an ambitious project, and it is still growing. I build it in the open, on my own time and with my own money. If you want to see it happen sooner, [sponsoring it](https://github.com/sponsors/vic) is the most direct way to help. Trying it on a real problem and [telling us what breaks](https://github.com/vic/stigi/issues) helps just as much. Thank you :)
+:::
+
+<GetInvolved />
+
+## Sponsors
+
+Stigi is not backed by an AI lab, a fund or a corporation. It is built by [one person](https://oeiuwq.com), and these are the people and companies who make that possible. Thank you.
+
+<Sponsors />
+
+## Frequently asked questions
+
+<Faq />

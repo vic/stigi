@@ -1,0 +1,35 @@
+---
+import Glyph from './Glyph.astro';
+---
+
+<section>
+	<a href="https://github.com/vic/stigi/issues"><Glyph name="branch" size="1.1em" />Contribute</a>
+	<a href="https://github.com/vic/stigi/discussions"><Glyph name="chat" size="1.1em" />Community</a>
+	<a href="https://github.com/sponsors/vic"><Glyph name="heart" size="1.1em" />Sponsor</a>
+</section>
+
+<style>
+	section {
+		display: flex;
+		justify-content: center;
+		flex-wrap: wrap;
+		gap: 0.5rem 1.75rem;
+		margin-top: 1.5rem;
+		padding-top: 1.5rem;
+		border-top: 1px solid var(--sl-color-hairline);
+		font-size: var(--sl-text-sm);
+	}
+
+	a {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		text-decoration: none;
+		color: var(--sl-color-gray-3);
+		transition: color 0.2s ease;
+	}
+
+	a:hover {
+		color: var(--stigi-cyan);
+	}
+</style>

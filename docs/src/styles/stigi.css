@@ -1,0 +1,51 @@
+/*
+ * Stigi's own touches on top of the shared layout.css and custom.css.
+ * Mauve (purple) is the accent from the Catppuccin plugin; sky (cyan) is the second colour.
+ */
+
+:root {
+  --stigi-cyan: #89dceb; /* Catppuccin Mocha sky */
+}
+
+:root[data-theme='light'] {
+  --stigi-cyan: #04a5e5; /* Catppuccin Latte sky */
+}
+
+/* Links in cyan, purple on hover: the two Stigi colours. */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--stigi-cyan);
+  text-decoration-color: color-mix(in srgb, var(--stigi-cyan) 40%, transparent);
+}
+
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+  color: var(--sl-color-accent-high);
+}
+
+/* The wordmark: cyan into purple. */
+.site-title {
+  background: linear-gradient(90deg, var(--stigi-cyan), var(--sl-color-accent) 70%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* A thin neon edge under the top bar, where the reading bar runs. */
+header.header {
+  border-bottom: 1px solid color-mix(in srgb, var(--sl-color-accent) 35%, var(--sl-color-hairline));
+}
+
+/* The reading bar goes cyan to purple too. */
+.reading-progress {
+  background: linear-gradient(90deg, var(--stigi-cyan), var(--sl-color-accent)) !important;
+}
+
+/* The big mark on the home page: a soft cyan-purple glow. */
+.hero-html .stigi-mark {
+  max-width: 16rem;
+  filter: drop-shadow(0 0 2.5rem color-mix(in srgb, var(--sl-color-accent) 45%, transparent));
+}
+
+/* The hero headline: one solid colour, easy to read. */
+.hero h1 {
+  color: var(--sl-color-white);
+}

@@ -1,0 +1,272 @@
+---
+// The home hero, laid out like ladybird.org: a big left-aligned claim and buttons,
+// and on the right a "screenshot" of Stigi at work: a unit and the door's reply.
+import Glyph, { type GlyphName } from './Glyph.astro';
+
+const { data } = Astro.locals.starlightRoute.entry;
+const { title = data.title, tagline, actions = [] } = data.hero || {};
+
+// Starlight icon names in the frontmatter, drawn with Stigi's own glyphs.
+const glyphs: Record<string, GlyphName> = { 'right-arrow': 'arrow', heart: 'heart' };
+---
+
+<div class="hero">
+	<div class="stack">
+		<h1 id="_top" data-page-title set:html={title} />
+		{tagline && <div class="tagline" set:html={tagline} />}
+		<p class="availability">Free and open source under the AGPL. Compiles to portable C11.</p>
+		{
+			actions.length > 0 && (
+				<div class="actions">
+					{actions.map(({ icon, link, text, variant }) => (
+						<a class:list={['action', variant === 'minimal' ? 'ghost' : 'primary']} href={link}>
+							{text}
+							{icon?.name && glyphs[icon.name] && <Glyph name={glyphs[icon.name]} size="1.1rem" />}
+						</a>
+					))}
+				</div>
+			)
+		}
+	</div>
+
+	<figure class="window" aria-label="A Stigi unit and the door's reply">
+		<div class="bar">
+			<span class="dots"><i></i><i></i><i></i></span>
+			<span class="file">Demo/Table/peek.sc</span>
+		</div>
+		<pre class="code"><code><span class="cm">// prompt: the entry of a table at an index.</span>
+<span class="kw">def</span> <span class="fn">Demo.Table.peek</span>(count: <span class="ty">U64</span>,
+    table: <span class="ty">Array</span>[<span class="ty">U64</span>](count), index: <span class="ty">U64</span>): <span class="ty">U64</span> =
+  table(index)</code></pre>
+		<div class="reply">
+			<pre><code><span class="bad">rejected</span> &#123;Demo.Table.peek&#125;: <span class="code-name">index-unproved</span>
+  need: <span class="fact">below(index, count)</span>
+  fix1 <span class="ok">(checked)</span>: add entry fact <span class="fact">&lt;below(index, count)&gt;</span>
+
+<span class="prompt">$</span> stigi accept fix1
+<span class="ok">admitted</span> Demo.Table.peek   laws ok   tests 3/3</code></pre>
+		</div>
+	</figure>
+</div>
+
+<style>
+	.hero {
+		display: grid;
+		align-items: center;
+		gap: 3rem;
+		padding-block: 2rem 2.5rem;
+	}
+
+	.stack {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 1.25rem;
+	}
+
+	h1 {
+		margin: 0;
+		font-size: clamp(2.1rem, calc(1rem + 3.4vw), 3.25rem);
+		line-height: 1.1;
+		padding-bottom: 0.08em;
+		font-weight: 400;
+		letter-spacing: -0.04em;
+	}
+
+	.tagline {
+		max-width: 44ch;
+		font-size: clamp(1rem, calc(0.6rem + 1vw), 1.2rem);
+		line-height: 1.65;
+		color: var(--sl-color-gray-2);
+	}
+
+	.availability {
+		margin: 0;
+		font-size: 0.85rem;
+		color: var(--sl-color-gray-3);
+	}
+
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+	}
+
+	.action {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.6rem;
+		padding: 0.75rem 1.4rem;
+		border-radius: 999px;
+		font-family: var(--font-victor-mono);
+		font-size: 0.95rem;
+		font-weight: 600;
+		line-height: 1;
+		text-decoration: none;
+		transition:
+			transform 0.2s ease,
+			box-shadow 0.2s ease,
+			border-color 0.2s ease,
+			color 0.2s ease;
+	}
+
+	.primary {
+		color: var(--sl-color-black);
+		background: linear-gradient(110deg, var(--stigi-cyan), var(--sl-color-accent));
+		box-shadow: 0 8px 24px -10px color-mix(in srgb, var(--sl-color-accent) 70%, transparent);
+	}
+
+	.primary:hover {
+		color: var(--sl-color-black);
+		transform: translateY(-1px);
+		box-shadow: 0 12px 30px -10px color-mix(in srgb, var(--sl-color-accent) 85%, transparent);
+	}
+
+	.ghost {
+		color: var(--sl-color-white);
+		border: 1px solid var(--sl-color-hairline-light);
+	}
+
+	.ghost:hover {
+		color: var(--sl-color-accent-high);
+		border-color: var(--sl-color-accent);
+	}
+
+	.action:focus-visible {
+		outline: 2px solid var(--sl-color-accent);
+		outline-offset: 3px;
+	}
+
+	/* the "screenshot": an editor window with the door's reply under the code */
+	.window {
+		margin: 0;
+		min-width: 0;
+		border: 1px solid transparent;
+		border-radius: 0.875rem;
+		overflow: hidden;
+		background:
+			linear-gradient(var(--sl-color-bg-nav), var(--sl-color-bg-nav)) padding-box,
+			linear-gradient(
+					135deg,
+					color-mix(in srgb, var(--stigi-cyan) 60%, transparent),
+					var(--sl-color-hairline) 50%,
+					color-mix(in srgb, var(--sl-color-accent) 60%, transparent)
+				)
+				border-box;
+		box-shadow: 0 30px 80px -30px color-mix(in srgb, var(--sl-color-accent) 55%, transparent);
+	}
+
+	.bar {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+		padding: 0.6rem 0.9rem;
+		border-bottom: 1px solid var(--sl-color-hairline);
+	}
+
+	.dots {
+		display: flex;
+		gap: 0.4rem;
+	}
+
+	.dots i {
+		width: 0.65rem;
+		height: 0.65rem;
+		border-radius: 50%;
+		background: var(--sl-color-gray-5);
+	}
+
+	.dots i:first-child {
+		background: var(--sl-color-red);
+	}
+
+	.dots i:nth-child(2) {
+		background: var(--sl-color-orange);
+	}
+
+	.dots i:last-child {
+		background: var(--sl-color-green);
+	}
+
+	.file {
+		font-family: var(--font-victor-mono);
+		font-size: 0.75rem;
+		color: var(--sl-color-gray-3);
+	}
+
+	pre {
+		margin: 0;
+		padding: 1rem 1.1rem;
+		overflow-x: auto;
+		font-family: 'Pragmasevka', monospace;
+		font-size: 0.875rem;
+		line-height: 1.6;
+		color: var(--sl-color-white);
+		background: transparent;
+		border: 0;
+	}
+
+	.code {
+		background: var(--sl-color-bg);
+	}
+
+	.reply pre {
+		font-size: 0.8125rem;
+		color: var(--sl-color-gray-2);
+		border-top: 1px dashed var(--sl-color-hairline-light);
+	}
+
+	.cm {
+		color: var(--sl-color-gray-3);
+		font-style: italic;
+	}
+
+	.kw {
+		color: var(--sl-color-accent);
+	}
+
+	.fn {
+		color: var(--stigi-cyan);
+	}
+
+	.ty {
+		color: var(--sl-color-orange-high);
+	}
+
+	.fact {
+		color: var(--sl-color-accent-high);
+	}
+
+	.bad {
+		color: var(--sl-color-red-high);
+		font-weight: 700;
+	}
+
+	.ok {
+		color: var(--sl-color-green-high);
+		font-weight: 700;
+	}
+
+	.code-name {
+		color: var(--sl-color-orange-high);
+	}
+
+	.prompt {
+		color: var(--stigi-cyan);
+		user-select: none;
+	}
+
+	@media (min-width: 60rem) {
+		.hero {
+			grid-template-columns: 1fr 1.05fr;
+			padding-block: clamp(2rem, calc(1rem + 5vmin), 4.5rem) 3rem;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.action {
+			transition: none;
+		}
+	}
+</style>

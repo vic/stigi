@@ -1,0 +1,125 @@
+---
+// A stacked reading list, like a news feed: topic tag, linked title, one line.
+import Glyph from './Glyph.astro';
+
+const entries = [
+	{ tag: 'The door', href: '/door/law-loop/', title: 'The law loop', line: 'Humans own the laws, agents own the code, and no agent can weaken a spec.' },
+	{ tag: 'Humans', href: '/humans/theory-sheet/', title: 'The proved theory sheet', line: 'One screen that tells you what a whole subsystem can touch, proved by the door.' },
+	{ tag: 'Agents', href: '/agents/tokens/', title: 'Tokens are money', line: 'Where an agent budget really goes, and why Stigi compresses reads, not syntax.' },
+	{ tag: 'Runtime', href: '/runtime/envelope/', title: 'The proved runtime envelope', line: 'Four runtime layers replaced by one admission verdict.' },
+	{ tag: 'Runtime', href: '/runtime/replay/', title: 'Replay and fork', line: 'Byte-identical replay of agent runs, without a hypervisor.' },
+	{ tag: 'Trust', href: '/trust/self-hosting/', title: 'Checking the checker', line: 'Self-hosting to a byte-identical fixpoint, with soundness proved outside.' },
+];
+---
+
+<ul class="explore not-content">
+	{
+		entries.map((e) => (
+			<li>
+				<a href={e.href}>
+					<span class="tag">{e.tag}</span>
+					<span class="text">
+						<span class="title">{e.title}</span>
+						<span class="line">{e.line}</span>
+					</span>
+					<Glyph name="arrow" class="arrow" size="1rem" />
+				</a>
+			</li>
+		))
+	}
+</ul>
+<a class="all not-content" href="/start/why/">Read the docs from the start <Glyph name="arrow" size="0.95rem" /></a>
+
+<style>
+	.explore {
+		list-style: none;
+		margin: 1.5rem 0 0;
+		padding: 0;
+		border-top: 1px solid var(--sl-color-hairline);
+	}
+
+	li {
+		border-bottom: 1px solid var(--sl-color-hairline);
+	}
+
+	li a {
+		display: grid;
+		grid-template-columns: 7.5rem 1fr auto;
+		align-items: baseline;
+		gap: 1rem;
+		padding: 1rem 0.5rem;
+		text-decoration: none;
+		color: inherit;
+		transition: background 0.2s ease;
+	}
+
+	li a:hover {
+		background: color-mix(in srgb, var(--sl-color-accent) 6%, transparent);
+	}
+
+	.tag {
+		font-family: var(--font-victor-mono);
+		font-size: 0.75rem;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		color: var(--sl-color-accent-high);
+	}
+
+	.text {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+	}
+
+	.title {
+		font-family: var(--font-victor-mono);
+		font-size: 1.05rem;
+		font-weight: 600;
+		color: var(--sl-color-white);
+	}
+
+	.line {
+		font-family: var(--font-jetbrains-mono);
+		font-size: 0.85rem;
+		line-height: 1.6;
+		color: var(--sl-color-gray-2);
+	}
+
+	li a :global(.arrow) {
+		align-self: center;
+		color: var(--sl-color-gray-4);
+		transition:
+			transform 0.2s ease,
+			color 0.2s ease;
+	}
+
+	li a:hover :global(.arrow) {
+		color: var(--stigi-cyan);
+		transform: translateX(4px);
+	}
+
+	.all {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin-top: 1rem;
+		font-family: var(--font-victor-mono);
+		font-size: 0.9rem;
+		color: var(--stigi-cyan);
+		text-decoration: none;
+	}
+
+	.all:hover {
+		color: var(--sl-color-accent-high);
+	}
+
+	@media (max-width: 40rem) {
+		li a {
+			grid-template-columns: 1fr auto;
+		}
+
+		.tag {
+			grid-column: 1 / -1;
+		}
+	}
+</style>

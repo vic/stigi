@@ -1,0 +1,123 @@
+---
+// Current GitHub sponsors, drawn by the public readme-contribs image service.
+import Glyph from './Glyph.astro';
+
+const image = 'https://readme-contribs.as93.net/sponsors/vic?avatarSize=56&perRow=10&margin=12&textColor=9399b2&outlineWidth=0';
+---
+
+<div class="sponsors not-content">
+	<a class="wall" href="https://github.com/sponsors/vic" aria-label="Stigi sponsors on GitHub">
+		<img src={image} alt="Avatars of the people and companies who sponsor Stigi on GitHub" loading="lazy" />
+	</a>
+	<div class="ways">
+		<div class="way">
+			<h3>Become a sponsor</h3>
+			<p>Sponsoring pays for compute, hardware and full-time focus. Every sponsor, person or company, is credited by name in each release.</p>
+			<a class="primary" href="https://github.com/sponsors/vic"><Glyph name="heart" size="1.1rem" />Sponsor on GitHub</a>
+		</div>
+		<div class="way">
+			<h3>Be an early adopter</h3>
+			<p>Put Stigi to work on a real problem, push on the rough edges and tell us what breaks. That is worth even more right now.</p>
+			<a class="ghost" href="https://github.com/vic/stigi/issues"><Glyph name="chat" size="1.1rem" />Open an issue</a>
+		</div>
+	</div>
+</div>
+
+<style>
+	.sponsors {
+		display: flex;
+		flex-direction: column;
+		gap: 1.5rem;
+		margin-top: 1.5rem;
+	}
+
+	.wall {
+		display: flex;
+		justify-content: center;
+		padding: 1.5rem;
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: 0.875rem;
+		background: color-mix(in srgb, var(--sl-color-accent) 4%, var(--sl-color-bg));
+	}
+
+	.wall img {
+		width: 100%;
+		max-width: 44rem;
+		height: auto;
+	}
+
+	.ways {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 1rem;
+	}
+
+	@media (min-width: 40rem) {
+		.ways {
+			grid-template-columns: 1fr 1fr;
+		}
+	}
+
+	.way {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.75rem;
+		padding: 1.5rem;
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: 0.875rem;
+	}
+
+	h3 {
+		margin: 0;
+		font-family: var(--font-victor-mono);
+		font-size: 1.15rem;
+		font-weight: 600;
+		color: var(--sl-color-white);
+	}
+
+	p {
+		margin: 0;
+		flex: 1;
+		font-size: 0.875rem;
+		line-height: 1.7;
+		color: var(--sl-color-gray-2);
+	}
+
+	a.primary,
+	a.ghost {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.55rem;
+		padding: 0.65rem 1.2rem;
+		border-radius: 999px;
+		font-family: var(--font-victor-mono);
+		font-size: 0.875rem;
+		font-weight: 600;
+		text-decoration: none;
+		transition:
+			box-shadow 0.2s ease,
+			color 0.2s ease,
+			border-color 0.2s ease;
+	}
+
+	.primary {
+		color: var(--sl-color-black);
+		background: linear-gradient(110deg, var(--stigi-cyan), var(--sl-color-accent));
+	}
+
+	.primary:hover {
+		color: var(--sl-color-black);
+		box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--sl-color-accent) 85%, transparent);
+	}
+
+	.ghost {
+		color: var(--sl-color-white);
+		border: 1px solid var(--sl-color-hairline-light);
+	}
+
+	.ghost:hover {
+		color: var(--sl-color-accent-high);
+		border-color: var(--sl-color-accent);
+	}
+</style>
