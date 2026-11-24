@@ -5,11 +5,7 @@ pub def Stigi.Store.runCli {region: Stigi.Region, clock: Stigi.Clock, Stigi.Mut}
   val Filled(cmdBuf) = Array.tryFill[U8]{region}(16384, 0) else
     case FillFailed => RunOutOfMemory
   val procLit: Array[U8](18) = "/proc/self/cmdline"
-  var idx: U64 = 0
-  while idx < 18 do
-    @<lessOrEqual(idx, 18)>
-    procPath(idx) := procLit(idx)
-    idx = idx + 1
+  Stigi.Array.copy(18, procLit, 0, 18, 4096, procPath, 0)
   val LoadedBytes(cmdLen) = Stigi.Posix.readFileBytes{region}(18, procPath, 16384, cmdBuf, 0) else
     case LoadFailed => RunFileError
     case LoadOverflow => RunCliError
@@ -22,14 +18,11 @@ pub def Stigi.Store.runCli {region: Stigi.Region, clock: Stigi.Clock, Stigi.Mut}
         if dirFin <= 16384 && outFin <= 16384 then
           val Filled(outPath) = Array.tryFill[U8]{region}(4096, 0) else
             case FillFailed => RunOutOfMemory
-          var outLen: U64 = 0
-          var scanPos: U64 = outBeg
-          while scanPos < outFin && outLen < 4095 do
-            @<lessOrEqual(outBeg, scanPos), lessOrEqual(scanPos, outFin), lessOrEqual(outLen, 4095)>
-            outPath(outLen) := cmdBuf(scanPos)
-            outLen = outLen + 1
-            scanPos = scanPos + 1
-          outPath(outLen) := 0
-          Stigi.Emit.compileTree{region}(16384, cmdBuf, dirBeg, dirFin, outLen, outPath)
+          val outLen: U64 = Stigi.Array.copy(16384, cmdBuf, outBeg, outFin, 4096, outPath, 0)
+          if outLen < 4096 then
+            @<below(outLen, 4096)>
+            outPath(outLen) := '\0'
+            Stigi.Emit.compileTree{region}(16384, cmdBuf, dirBeg, dirFin, outLen, outPath)
+          else RunCliError
         else RunCliError
       case CliInvalid => RunCliError

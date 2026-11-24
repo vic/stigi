@@ -1,43 +1,19 @@
 // prompt: parse NUL-separated /proc/self/cmdline bytes into a closed Stigi.Store.CliAction.
 def Stigi.Store.parseCmdline(bufCap: Stigi.ByteCap, buf: Array[U8](bufCap), bufLen: U64) <lessOrEqual(bufLen, bufCap)>: Stigi.Store.CliAction =
-  var pos: U64 = 0
-  while pos < bufLen && buf(pos) != 0 do
-    @<lessOrEqual(pos, bufLen)>
-    pos = pos + 1
-  if pos < bufLen then pos = pos + 1 else ()
-  if pos >= bufLen then CliRunContracts else
-    val argOneStart: U64 = pos
-    while pos < bufLen && buf(pos) != 0 do
-      @<lessOrEqual(argOneStart, pos), lessOrEqual(pos, bufLen)>
-      pos = pos + 1
-    val argOneEnd: U64 = pos
-    if pos < bufLen then pos = pos + 1 else ()
-    if pos >= bufLen then CliInvalid else
-      val argTwoStart: U64 = pos
-      while pos < bufLen && buf(pos) != 0 do
-        @<lessOrEqual(argTwoStart, pos), lessOrEqual(pos, bufLen)>
-        pos = pos + 1
-      val argTwoEnd: U64 = pos
-      if pos < bufLen then pos = pos + 1 else ()
-      if Stigi.Lex.sliceEquals(bufCap, buf, argOneStart, argOneEnd, 7, "--check") then
-        if pos >= bufLen && argTwoStart < argTwoEnd then CliCheckTree(argTwoStart, argTwoEnd) else CliInvalid
-      else if Stigi.Lex.sliceEquals(bufCap, buf, argOneStart, argOneEnd, 6, "--load") then
-        if pos >= bufLen then CliInvalid else
-          val argThreeStart: U64 = pos
-          while pos < bufLen && buf(pos) != 0 do
-            @<lessOrEqual(argThreeStart, pos), lessOrEqual(pos, bufLen)>
-            pos = pos + 1
-          val argThreeEnd: U64 = pos
-          if pos < bufLen then pos = pos + 1 else ()
-          if pos >= bufLen then CliInvalid else
-            val argFourStart: U64 = pos
-            while pos < bufLen && buf(pos) != 0 do
-              @<lessOrEqual(argFourStart, pos), lessOrEqual(pos, bufLen)>
-              pos = pos + 1
-            val argFourEnd: U64 = pos
-            if pos < bufLen then pos = pos + 1 else ()
-            val validEmitFlag: Bool = Stigi.Lex.sliceEquals(bufCap, buf, argThreeStart, argThreeEnd, 6, "--emit")
-            if validEmitFlag && pos >= bufLen && argTwoStart < argTwoEnd && argFourStart < argFourEnd then
-              CliLoadEmit(argTwoStart, argTwoEnd, argFourStart, argFourEnd)
-            else CliInvalid
-      else CliInvalid
+  val ArgAt(_, _, afterProgram) = Stigi.Store.nextArg(bufCap, buf, bufLen, 0) else
+    case ArgsEnd => CliRunContracts
+  val ArgAt(flagStart, flagEnd, afterFlag) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterProgram) else
+    case ArgsEnd => CliRunContracts
+  val ArgAt(dirStart, dirEnd, afterDir) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterFlag) else
+    case ArgsEnd => CliInvalid
+  if dirStart == dirEnd || bufCap < flagEnd then CliInvalid else
+    if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 7, "--check") then
+      if afterDir < bufLen then CliInvalid else CliCheckTree(dirStart, dirEnd)
+    else if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 6, "--load") then
+      val ArgAt(emitStart, emitEnd, afterEmit) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterDir) else
+        case ArgsEnd => CliInvalid
+      val ArgAt(outStart, outEnd, afterOut) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterEmit) else
+        case ArgsEnd => CliInvalid
+      if afterOut < bufLen || outStart == outEnd || bufCap < emitEnd then CliInvalid else
+        if Stigi.Lex.sliceEquals(bufCap, buf, emitStart, emitEnd, 6, "--emit") then CliLoadEmit(dirStart, dirEnd, outStart, outEnd) else CliInvalid
+    else CliInvalid

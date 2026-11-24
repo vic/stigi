@@ -8,28 +8,15 @@ pub def Stigi.Posix.verifyContracts {region: Stigi.Region, clock: Stigi.Clock, S
     val Filled(pathBuf) = Array.tryFill[U8]{region}(4096, 0) else
       case FillFailed => RunOutOfMemory
     val tagBytes: Array[U8](23) = "/tmp/stigi-v2-check.tmp"
-    var idx: U64 = 0
-    while idx < 23 do
-      @<lessOrEqual(idx, 23)>
-      pathBuf(idx) := tagBytes(idx)
-      idx = idx + 1
-    val Opened(writeDesc) = Stigi.Posix.openWrite(23, pathBuf) else
-      case OpenFailed => RunContractError
-    val wroteValid: Bool = Stigi.Posix.writeContractFixture(writeDesc)
-    if !wroteValid then
-      val removedErr: Bool = Stigi.Posix.removePath(23, pathBuf)
-      if removedErr then RunFileError else RunContractError
-    else
-      val Opened(readDesc) = Stigi.Posix.openRead(23, pathBuf) else
+    val pathLen: U64 = Stigi.Array.copy(23, tagBytes, 0, 23, 4096, pathBuf, 0)
+    if pathLen < 4096 then
+      @<below(pathLen, 4096)>
+      val Opened(writeDesc) = Stigi.Posix.openPath(pathLen, pathBuf, Stigi.Posix.writeCreateTruncate) else
         case OpenFailed => RunContractError
-      val readOutcome: Stigi.RunOutcome = Stigi.Posix.readContractFixture{region}(readDesc)
-      val unlinked: Bool = Stigi.Posix.removePath(23, pathBuf)
-      (readOutcome, unlinked) match
-        case (RunSuccess, true) => RunSuccess
-        case (RunSuccess, false) => RunContractError
-        case (RunCliError, _) => RunContractError
-        case (RunFileError, _) => RunContractError
-        case (RunOutOfMemory, _) => RunContractError
-        case (RunDoorRejected, _) => RunContractError
-        case (RunEmitError, _) => RunContractError
-        case (RunContractError, _) => RunContractError
+      if Stigi.Posix.writeContractFixture(writeDesc) is RunSuccess then
+        val Opened(readDesc) = Stigi.Posix.openPath(pathLen, pathBuf, Stigi.Posix.readOnly) else
+          case OpenFailed => RunContractError
+        val readOutcome: Stigi.RunOutcome = Stigi.Posix.readContractFixture{region}(readDesc)
+        if Stigi.Posix.removePath(pathLen, pathBuf) && readOutcome is RunSuccess then RunSuccess else RunContractError
+      else if Stigi.Posix.removePath(pathLen, pathBuf) then RunFileError else RunContractError
+    else RunContractError

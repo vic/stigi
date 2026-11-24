@@ -131,4 +131,4 @@ pub def Stigi.Emit.compileTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.
         Stigi.Emit.emitAllBodies{region, writer}(2097152, outBuf, 1048576, srcBuf, 131072, allToks, 4096, syms, symCount, 8192, fields, fieldCount)
         Stigi.Emit.emitMain{writer}(2097152, outBuf, 1048576, srcBuf, 4096, syms, symCount)
         val outLen: U64 = writer.writtenCount()
-        if writer.didOverflow() || outLen > 2097152 then RunEmitError else if Stigi.Posix.writeFileBytes{region}(outPathLen, outPath, 2097152, outBuf, outLen) then RunSuccess else RunFileError
+        if writer.didOverflow() || outLen > 2097152 then RunEmitError else Stigi.Posix.writeFileBytes{region}(outPathLen, outPath, 2097152, outBuf, outLen)

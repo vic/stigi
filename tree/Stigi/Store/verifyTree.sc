@@ -23,40 +23,4 @@ def Stigi.Store.verifyTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.Byte
       case LoadFailed => RunFileError
       case LoadOverflow => RunFileError
     if indexLen > 65536 then RunFileError else
-      var linePos: U64 = 0
-      var unitCount: U64 = 0
-      var outcome: Stigi.RunOutcome = RunSuccess
-      while linePos < indexLen && outcome == RunSuccess do
-        @<lessOrEqual(linePos, indexLen), lessOrEqual(unitCount, Stigi.Limit.maxUnits)>
-        val nameStart: U64 = linePos
-        while linePos < indexLen && indexBuf(linePos) != 9 && indexBuf(linePos) != 10 do
-          @<lessOrEqual(nameStart, linePos), lessOrEqual(linePos, indexLen)>
-          linePos = linePos + 1
-        val nameEnd: U64 = linePos
-        while linePos < indexLen && indexBuf(linePos) != 10 do
-          @<lessOrEqual(linePos, indexLen)>
-          linePos = linePos + 1
-        if linePos < indexLen then linePos = linePos + 1 else ()
-        if nameStart < nameEnd then
-          val builtPath: Stigi.Lookup = Stigi.Store.buildUnitPath(dirCap, dirBuf, dirStart, dirEnd, 65536, indexBuf, nameStart, nameEnd, pathBuf)
-          val fileLenRes: Stigi.Posix.LoadResult = builtPath match
-            case Found(unitPathLen) =>
-              if unitPathLen < 4096 then Stigi.Posix.readFileBytes{region}(unitPathLen, pathBuf, 65536, unitBuf, 0) else LoadFailed
-            case Missing => LoadFailed
-          val nextOutcome: Stigi.RunOutcome = fileLenRes match
-            case LoadedBytes(srcLen) =>
-              if srcLen <= 65536 then
-                Stigi.Door.verifyUnit{region}(65536, unitBuf, srcLen, 16384, toks, 16384, nodes, 16384, facts, 16384, rows, rules) match
-                  case DoorAccepted(_, _, _) => RunSuccess
-                  case DoorGateFailed => RunDoorRejected
-                  case DoorLexFailed => RunDoorRejected
-                  case DoorParseFailed => RunDoorRejected
-                  case DoorDatalogRejected(_) => RunDoorRejected
-                  case DoorOutOfMemory => RunOutOfMemory
-              else RunFileError
-            case LoadFailed => RunFileError
-            case LoadOverflow => RunFileError
-          outcome = nextOutcome
-          if unitCount < Stigi.Limit.maxUnits then unitCount = unitCount + 1 else outcome = RunFileError
-        else ()
-      if outcome == RunSuccess && unitCount == 0 then RunDoorRejected else outcome
+      Stigi.Store.verifyLines{region}(dirCap, dirBuf, dirStart, dirEnd, Scratch(pathBuf, indexBuf, unitBuf, toks, nodes, facts, rows, rules), indexLen, IndexWalk(0, 0), indexLen + 1)
