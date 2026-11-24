@@ -767,6 +767,28 @@ static EmitVar *emit_register_var(EmitCtx *ctx, StigiStr name, const StigiType *
   return v;
 }
 
+/* An untyped alias `val x = y` / `var x = y` of an array or cell local keeps y's identity, as the extractor's Val and
+ * Var binders do (nested patterns bind `val cells = patFieldN`). Searches below `v`, so a shadowing alias never finds
+ * itself. */
+static void emit_copy_alias(const EmitCtx *ctx, const StigiExpr *init, EmitVar *v) {
+  if (v == NULL || init == NULL || init->kind != STIGI_EXPR_LOCAL || v->is_array || v->is_cell) return;
+  for (uint32_t i = (uint32_t)(v - ctx->vars); i > 0; i--) {
+    const EmitVar *a = &ctx->vars[i - 1];
+    if (!str_eq_ss(a->name, init->u.ident.name)) continue;
+    if (a->is_array || a->is_cell) {
+      v->is_array = a->is_array;
+      v->is_cell = a->is_cell;
+      v->is_ptr = a->is_ptr;
+      v->len_expr = a->len_expr;
+      v->elem_scalar_ty = a->elem_scalar_ty;
+      v->elem_enum_uidx = a->elem_enum_uidx;
+      v->ast_type = a->ast_type;
+      v->type_uidx = a->type_uidx;
+    }
+    return;
+  }
+}
+
 static size_t unit_ns_prefix_len(const char *name, size_t len) {
   size_t last = 0;
   for (size_t i = 0; i < len; i++) {
@@ -2349,6 +2371,7 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       emit_expr_with_pre(ctx, e->u.val_stmt.init, vhint, &init_buf);
       EmitVar *v = emit_register_var(ctx, e->u.val_stmt.pat.name, e->u.val_stmt.type,
                                      ctx->uidx, false);
+      emit_copy_alias(ctx, e->u.val_stmt.init, v);
       if (v != NULL) {
         if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
         if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.val_stmt.init);
@@ -2407,6 +2430,7 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
       emit_expr_with_pre(ctx, e->u.var_stmt.init, vhint, &init_buf);
       EmitVar *v = emit_register_var(ctx, e->u.var_stmt.name, e->u.var_stmt.type,
                                      ctx->uidx, false);
+      emit_copy_alias(ctx, e->u.var_stmt.init, v);
       if (v != NULL) {
         if (v->scalar_ty == ETY_UNKNOWN) v->scalar_ty = vhint;
         if (v->enum_uidx < 0) v->enum_uidx = infer_expr_enum_uidx(ctx, e->u.var_stmt.init);

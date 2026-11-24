@@ -322,6 +322,47 @@ int main(void) {
       "  val byteCount: U64 = Stigi.Probe.copyRun(3, bytes, 3, 4, byteOut)\n"
       "  val wordCount: U64 = Stigi.Probe.copyRun(3, words, 3, 4, wordOut)\n"
       "  if byteCount == 3 && byteOut(2) == 'c' && wordOut(2) == U32.ofU64(7) then wordCount else 0\n";
+  /* emitter: a binder of a nested constructor pattern is a `val` alias of a fresh pattern field; an array alias
+   * keeps its array identity, so `cells(0)` emits an index read, never a C call */
+  const char *u_held_cells =
+      "// prompt: a counted run of words.\n"
+      "enum Demo.Sugar.Cells:\n"
+      "  case Cells(size: U64, cells: Array[U64](size))\n";
+  const char *u_held_holder =
+      "// prompt: an optional counted run of words.\n"
+      "enum Demo.Sugar.Holder:\n"
+      "  case Held(box: Demo.Sugar.Cells)\n"
+      "  case Unheld\n";
+  const char *u_held_first =
+      "// prompt: the first word of a held run through a nested pattern, zero when none.\n"
+      "def Demo.Sugar.firstHeld(holder: Demo.Sugar.Holder): U64 <lessOrEqual(0, result)> =\n"
+      "  holder match\n"
+      "    case Held(Cells(size, cells)) => if 0 < size then cells(0) else 0\n"
+      "    case Unheld => 0\n";
+  /* a second-level `val` alias and a `var` alias of the nested binder keep the array identity too */
+  const char *u_held_again =
+      "// prompt: the first word of a held run through a val alias of a nested binder, zero when none.\n"
+      "def Demo.Sugar.againHeld(holder: Demo.Sugar.Holder): U64 <lessOrEqual(0, result)> =\n"
+      "  holder match\n"
+      "    case Held(Cells(size, cells)) =>\n"
+      "      val again = cells\n"
+      "      if 0 < size then again(0) else 0\n"
+      "    case Unheld => 0\n";
+  const char *u_held_moved =
+      "// prompt: the first word of a held run through a var alias of a nested binder, zero when none.\n"
+      "def Demo.Sugar.movedHeld(holder: Demo.Sugar.Holder): U64 <lessOrEqual(0, result)> =\n"
+      "  holder match\n"
+      "    case Held(Cells(size, cells)) =>\n"
+      "      var moved = cells\n"
+      "      if 0 < size then moved(0) else 0\n"
+      "    case Unheld => 0\n";
+  const char *u_held_read =
+      "// prompt: seven when the first word of a held run of sevens reads back through a nested pattern and its aliases, else zero.\n"
+      "pub def Demo.Sugar.heldFirst {region: Stigi.Region} (): U64 <lessOrEqual(0, result)> =\n"
+      "  val Filled(words) = Array.tryFill[U64]{region}(3, 7) else\n"
+      "    case FillFailed => 0\n"
+      "  val held: Demo.Sugar.Holder = Held(Cells(3, words))\n"
+      "  if Demo.Sugar.firstHeld(Unheld) == 0 && Demo.Sugar.againHeld(held) == 7 && Demo.Sugar.movedHeld(held) == 7 then Demo.Sugar.firstHeld(held) else 0\n";
   const char *u_sugar_test =
       "// prompt: check the pattern sugar on fixed inputs in the evaluator.\n"
       "val Demo.Sugar.Tests.sugarSuite {Stigi.Test}: Stigi.Test.Result =\n"
@@ -400,14 +441,14 @@ int main(void) {
       "  val tagVal: U64 = Demo.extractTag(Number(7))\n"
       "  val tailVal: U64 = Demo.extractTail(Wide(9, 1))\n"
       "  val foundAt: U64 = Demo.findByte(3, \"abc\", 0, 3, 'c')\n"
-      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.wordRun(6, \"ab1D2c\") == 3 && Demo.Sugar.tagWalk(Number(3), Number(4), 5) == 7 && Demo.Sugar.copyBoth() == 3\n"
+      "  val sugarGood: Bool = Demo.Sugar.digitValue('7') == 7 && Demo.Sugar.smallDigit(3) && Demo.Sugar.isFlat(Line(4)) && Demo.Sugar.isLine(Line(1)) && Demo.Sugar.isYes(3, \"yes\") == 1 && Demo.Sugar.byteClass('/', '/') == 2 && Demo.Sugar.byteClass('/', 'x') == 0 && Demo.Sugar.pairClass('7', 0) == 2 && Demo.Sugar.pairClass('q', 0) == 0 && Demo.Sugar.bandClass(18, false, false) == 3 && Demo.Sugar.bandClass(25, true, true) == 2 && Demo.Sugar.wordRun(6, \"ab1D2c\") == 3 && Demo.Sugar.tagWalk(Number(3), Number(4), 5) == 7 && Demo.Sugar.copyBoth() == 3 && Demo.Sugar.heldFirst() == 7\n"
       "  val negInput: I32 = -5\n"
       "  val negWant: I32 = -1\n"
       "  val signResult: I32 = Demo.signCheck(negInput)\n"
       "  val signedCompareTrue: Bool = (-5 < 0)\n"
       "  if enumArrayGood && givenEqualGood && done == 0 && tagVal == 7 && tailVal == 9 && foundAt == 2 && sugarGood && first == 'a' && second == 'b' && guarded == 'c' && filledByte == 'Z' && dynamicByte == 'Y' && signResult == negWant && signedCompareTrue then 0 else 1\n";
 
-  const char *all_srcs[41] = {
+  const char *all_srcs[47] = {
       u_file,            u_mut,         u_region,        u_enum,        u_buf_enum,
       u_tail_enum,       u_alloc_use,   u_alloc_dyn,     u_alloc_loop,  u_extract,
       u_extract_tail,    u_signed,      u_at,            u_tainted,     u_tainted_guarded,
@@ -415,14 +456,15 @@ int main(void) {
       u_add_one,         u_eq_trait,    u_eq_word,       u_multi_head,  u_test_ok,
       u_main_ok,         u_find_scan,   u_sugar_shape,   u_sugar_digit, u_sugar_small,
       u_sugar_flat,      u_sugar_line,  u_sugar_yes,     u_sugar_guard, u_sugar_pair, u_sugar_band, u_sugar_run, u_sugar_walk, u_copy_run, u_copy_both,
+      u_held_cells,      u_held_holder, u_held_first,    u_held_again,  u_held_moved, u_held_read,
       u_sugar_test
   };
-  size_t all_lens[41];
-  for (int i = 0; i < 41; i++) all_lens[i] = strlen(all_srcs[i]);
+  size_t all_lens[47];
+  for (int i = 0; i < 47; i++) all_lens[i] = strlen(all_srcs[i]);
 
   StigiDoorResult dr;
   stigi_door_result_init(&dr);
-  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 41, &dr, &d) == STIGI_OK, "door submit");
+  CHECK(stigi_door_submit(&door, all_srcs, all_lens, 47, &dr, &d) == STIGI_OK, "door submit");
   if (!dr.accepted) {
     for (uint32_t i = 0; i < dr.reject_count; i++) {
       fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n",
