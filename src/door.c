@@ -1309,6 +1309,45 @@ static Status export_negtest_facts(StigiDoor *door, ExportCtx *ex, const char *r
 
 /* ---- NegTest verifier (dynamic expect codes, known Stigi.Code.*, full pipeline) ---- */
 
+static bool is_negtest_expect(const StigiExpr *s) {
+  return s->kind == STIGI_EXPR_CALL && s->u.call.callee->kind == STIGI_EXPR_GLOBAL &&
+         s->u.call.callee->u.ident.name.len == sizeof "Stigi.NegTest.expect" - 1 &&
+         memcmp(s->u.call.callee->u.ident.name.ptr, "Stigi.NegTest.expect", sizeof "Stigi.NegTest.expect" - 1) == 0;
+}
+
+/* T9, door.md section 5: a NegTest is rejected (invalid) code, so its private program depends only on the
+ * compiler: every Relation and Rule unit (step 5 compiles the private rules from them) and the units its local
+ * declarations name. The candidate's names pass walked the body from the NegTest unit, so the unit's out-edges
+ * reach every unit a local names, every given of a reached trait and every rule of a reached relation; the
+ * forward BFS over them is the closure, returned as a keep mask over the candidate's units. */
+static Status negtest_closure(const StigiImage *cand, uint32_t nt_idx, bool **keep_out, Diag *diag) {
+  uint32_t n = cand->unit_count;
+  bool *keep = calloc(n, sizeof *keep);
+  uint32_t *q = malloc((size_t)n * sizeof *q);
+  if (keep == NULL || q == NULL) {
+    free(keep);
+    free(q);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "negtest closure OOM");
+  }
+  uint32_t qt = 0;
+  keep[nt_idx] = true;
+  q[qt++] = nt_idx;
+  for (uint32_t i = 0; i < n; i++) {
+    StigiDeclKind k = cand->units[i].ast->decl->kind;
+    if ((k == STIGI_DECL_RELATION || k == STIGI_DECL_RULE) && !keep[i]) { keep[i] = true; q[qt++] = i; }
+  }
+  for (uint32_t qh = 0; qh < qt; qh++) {
+    uint32_t cur = q[qh];
+    for (uint32_t e = cur < cand->adj_cap ? cand->adj_head[cur] : UINT32_MAX; e != UINT32_MAX; e = cand->edge_next[e]) {
+      uint32_t to = cand->edges[e].to;
+      if (to < n && !keep[to]) { keep[to] = true; q[qt++] = to; }
+    }
+  }
+  free(q);
+  *keep_out = keep;
+  return STIGI_OK;
+}
+
 static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *active_rules_dl,
                                  const StigiImage *cand, uint32_t nt_idx,
                                  StigiDoorResult *out, ExportCtx *ex, Diag *diag) {
@@ -1317,6 +1356,20 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
   const StigiExpr *body = nt_d->u.val_decl.body;
   if (body == NULL || body->kind != STIGI_EXPR_BLOCK) {
     return add_reject(out, nt_u->name, "negtest-form", "NegTest body must be a block", diag);
+  }
+  /* language.md 6: the row is exactly `{Stigi.NegTest}`, the body local declarations followed by expect lines */
+  if (nt_d->u.val_decl.cap_count != 1 || nt_d->u.val_decl.caps[0].name.len != 0) {
+    return add_reject(out, nt_u->name, "negtest-form", "NegTest row must be exactly {Stigi.NegTest}", diag);
+  }
+  bool seen_expect = false;
+  for (uint32_t i = 0; i < body->u.block.count; i++) {
+    const StigiExpr *s = body->u.block.stmts[i];
+    bool is_expect = is_negtest_expect(s);
+    if (!is_expect && (s->kind != STIGI_EXPR_LOCAL_DECL || seen_expect)) {
+      return add_reject(out, nt_u->name, "negtest-form",
+                        "NegTest body must be local declarations followed by Stigi.NegTest.expect lines", diag);
+    }
+    seen_expect = seen_expect || is_expect;
   }
 
   char (*expected_codes)[64] = NULL;
@@ -1327,9 +1380,10 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
   StigiNameDiags pnd;
   stigi_name_diags_init(&pnd);
 
-  Status st = STIGI_OK;
+  bool *keep = NULL;
+  Status st = negtest_closure(cand, nt_idx, &keep, diag);
   for (uint32_t i = 0; i < cand->unit_count && st == STIGI_OK; i++) {
-    if (cand->units[i].ast->decl->kind == STIGI_DECL_NEG_TEST) continue;
+    if (cand->units[i].ast->decl->kind == STIGI_DECL_NEG_TEST || !keep[i]) continue;
     Arena ta;
     arena_init(&ta);
     char *pr = NULL;
@@ -1340,6 +1394,7 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
     }
     arena_free(&ta);
   }
+  free(keep);
 
   uint32_t local_start = priv.unit_count;
   for (uint32_t i = 0; i < body->u.block.count && st == STIGI_OK; i++) {
@@ -1360,10 +1415,7 @@ static Status check_negtest_unit(StigiDoor *door, StigiDl *dl, const char *activ
         st = stigi_image_add_source(&priv, pr, plen, &pnd, diag);
       }
       arena_free(&ta);
-    } else if (s->kind == STIGI_EXPR_CALL &&
-               s->u.call.callee->kind == STIGI_EXPR_GLOBAL &&
-               s->u.call.callee->u.ident.name.len == 20 &&
-               memcmp(s->u.call.callee->u.ident.name.ptr, "Stigi.NegTest.expect", 20) == 0) {
+    } else if (is_negtest_expect(s)) {
       if (s->u.call.arg_count != 2 ||
           (s->u.call.args[0]->kind != STIGI_EXPR_GLOBAL &&
            s->u.call.args[0]->kind != STIGI_EXPR_LOCAL)) {
@@ -2239,10 +2291,7 @@ Status stigi_door_extract_image(const StigiDoor *door, StigiFactSet *fs, Diag *d
       if (body != NULL && body->kind == STIGI_EXPR_BLOCK) {
         for (uint32_t k = 0; k < body->u.block.count && st == STIGI_OK; k++) {
           const StigiExpr *s = body->u.block.stmts[k];
-          if (s->kind == STIGI_EXPR_CALL &&
-              s->u.call.callee->kind == STIGI_EXPR_GLOBAL &&
-              s->u.call.callee->u.ident.name.len == 20 &&
-              memcmp(s->u.call.callee->u.ident.name.ptr, "Stigi.NegTest.expect", 20) == 0 &&
+          if (is_negtest_expect(s) &&
               s->u.call.arg_count == 2 &&
               (s->u.call.args[0]->kind == STIGI_EXPR_GLOBAL ||
                s->u.call.args[0]->kind == STIGI_EXPR_LOCAL)) {

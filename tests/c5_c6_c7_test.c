@@ -417,6 +417,95 @@ int main(void) {
     CHECK(!r.accepted && has_reject_code(&r, "negtest-wrong-code"),
           "NegTest with wrong expected code gives negtest-wrong-code");
     stigi_door_result_free(&r);
+
+    /* T9: the private program is the NegTest's dependency closure; a unit reached only transitively
+     * (inner, through outer) must be in it. */
+    const char *lib_inner = "// prompt: identity.\ndef Demo.Lib.inner(value: U64) <lessOrEqual(0, value)>: U64 = value\n";
+    const char *lib_outer = "// prompt: wraps inner.\npub def Demo.Lib.outer(value: U64) <lessOrEqual(0, value)>: U64 = Demo.Lib.inner(value)\n";
+    const char *nt_transitive =
+        "// prompt: unguarded index behind a transitive callee must be rejected.\n"
+        "val Demo.NegTests.transitive {Stigi.NegTest}: Never =\n"
+        "  def viaOuter(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 =\n"
+        "    Demo.Lib.outer(table(index))\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n";
+    const char *tsrcs[3] = {lib_inner, lib_outer, nt_transitive};
+    size_t tlens[3] = {strlen(lib_inner), strlen(lib_outer), strlen(nt_transitive)};
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_submit(&door, tsrcs, tlens, 3, &r, &d) == STIGI_OK, "submit nt_transitive");
+    if (!r.accepted) dump_rejects("nt_transitive", &r);
+    CHECK(r.accepted, "NegTest whose local reaches a unit only transitively is admitted");
+    stigi_door_result_free(&r);
+
+    const char *nt_collide =
+        "// prompt: a local named like an image unit is private.\n"
+        "val Demo.Lib.collide {Stigi.NegTest}: Never =\n"
+        "  def inner(value: U64) <lessOrEqual(0, value)>: U64 = value\n"
+        "  def probe(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 = table(index)\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n";
+    srcs[0] = nt_collide;
+    lens[0] = strlen(nt_collide);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nt_collide");
+    if (!r.accepted) dump_rejects("nt_collide", &r);
+    /* rulings.md 123: locals private, no whole-image collisions */
+    CHECK(r.accepted, "NegTest local named like an image unit is private to its body and admitted");
+    stigi_door_result_free(&r);
+
+    const char *nt_collide_ci =
+        "// prompt: a local named like an image unit in another case is private.\n"
+        "val Demo.Lib.collideCase {Stigi.NegTest}: Never =\n"
+        "  def inNer(value: U64) <lessOrEqual(0, value)>: U64 = value\n"
+        "  def probe(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 = table(index)\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n";
+    srcs[0] = nt_collide_ci;
+    lens[0] = strlen(nt_collide_ci);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nt_collide_ci");
+    if (!r.accepted) dump_rejects("nt_collide_ci", &r);
+    /* rulings.md 123: locals private, no whole-image collisions */
+    CHECK(r.accepted, "NegTest local named like an image unit in another case is private and admitted");
+    stigi_door_result_free(&r);
+
+    /* rulings.md 121: the body is only local declarations then expect lines; a `var` statement is negtest-form */
+    const char *nt_binder =
+        "// prompt: a NegTest-level binder is not a NegTest shape.\n"
+        "val Demo.Lib.binderShape {Stigi.NegTest}: Never =\n"
+        "  var inner: U64 = 0\n"
+        "  def viaBinder(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 =\n"
+        "    inner(table(index))\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n";
+    srcs[0] = nt_binder;
+    lens[0] = strlen(nt_binder);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nt_binder");
+    CHECK(!r.accepted && has_reject_code(&r, "negtest-form"), "NegTest with a var statement gives negtest-form");
+    stigi_door_result_free(&r);
+
+    /* rulings.md 121: the row is exactly {Stigi.NegTest}; a named binder is negtest-form */
+    const char *nt_named =
+        "// prompt: a named NegTest binder is not a NegTest shape.\n"
+        "val Demo.Lib.namedRow {test: Stigi.NegTest}: Never =\n"
+        "  def probeNamed(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 = table(index)\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n";
+    srcs[0] = nt_named;
+    lens[0] = strlen(nt_named);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nt_named");
+    CHECK(!r.accepted && has_reject_code(&r, "negtest-form"), "NegTest with a named row binder gives negtest-form");
+    stigi_door_result_free(&r);
+
+    /* rulings.md 121: local declarations come before the expect lines; a local after an expect is negtest-form */
+    const char *nt_order =
+        "// prompt: a local after an expect line is not a NegTest shape.\n"
+        "val Demo.Lib.orderShape {Stigi.NegTest}: Never =\n"
+        "  Stigi.NegTest.expect(Stigi.Code.IndexUnproved, \"no fact bounds the index\")\n"
+        "  def probeLate(count: U64, table: Array[U64](count), index: U64) <lessOrEqual(0, count)>: U64 = table(index)\n";
+    srcs[0] = nt_order;
+    lens[0] = strlen(nt_order);
+    stigi_door_result_init(&r);
+    CHECK(stigi_door_check(&door, srcs, lens, 1, &r, &d) == STIGI_OK, "check nt_order");
+    CHECK(!r.accepted && has_reject_code(&r, "negtest-form"), "NegTest with a local after an expect gives negtest-form");
+    stigi_door_result_free(&r);
   }
 
   /* 7. Ruling S38: lowering rowBudget to 0 or 5 is rejected with datalog-budget */
