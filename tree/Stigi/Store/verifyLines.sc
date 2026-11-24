@@ -4,7 +4,7 @@ def Stigi.Store.verifyLines {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.Byt
   if remaining < 1 || indexLen <= linePos then
     if unitCount == 0 then RunDoorRejected else RunSuccess
   else
-    val Scratch(_, indexBuf, _, _, _, _, _, _) = scratch
+    val Scratch(_, indexBuf, _, _, _, _, _, _, _) = scratch
     val nameEnd: U64 = Stigi.Store.indexStop(indexBuf, indexLen, linePos, true)
     val lineEnd: U64 = Stigi.Store.indexStop(indexBuf, indexLen, nameEnd, false)
     val nextLine: U64 = if lineEnd < indexLen then lineEnd + 1 else lineEnd

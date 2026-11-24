@@ -1,6 +1,7 @@
 // prompt: load, verify through Stigi.Door, index, emit deterministic ISO C11, and write output file.
 pub def Stigi.Emit.compileTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64, outPathLen: U64, outPath: Array[U8](4096)) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap), below(outPathLen, 4096)>: Stigi.RunOutcome =
   handle writer = Stigi.Emit.BufferWriter(2097152)
+  val padCell: Stigi.Datalog.Store.Cell = SymCell(0)
   val Filled(pathBuf) = Array.tryFill[U8]{region}(4096, 0) else
     case FillFailed => RunOutOfMemory
   val Filled(indexBuf) = Array.tryFill[U8]{region}(65536, 0) else
@@ -17,9 +18,11 @@ pub def Stigi.Emit.compileTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.
     case FillFailed => RunOutOfMemory
   val Filled(facts) = Array.tryFill[Stigi.Extract.FactRow]{region}(8192, FactRow(FactCall, 0, 0, 0)) else
     case FillFailed => RunOutOfMemory
-  val Filled(rows) = Array.tryFill[Stigi.Datalog.TupleRow]{region}(8192, TupleRow(0, 0, 0, 0)) else
+  val Filled(rows) = Array.tryFill[Stigi.Datalog.Store.Tuple]{region}(8192, StoreRow(0, 0, padCell, padCell, padCell, padCell, padCell, padCell, padCell)) else
     case FillFailed => RunOutOfMemory
-  val Filled(rules) = Array.tryFill[Stigi.Datalog.RuleSpec]{region}(4, RuleSpec(0, 0, 0, JoinCopy)) else
+  val Filled(nextInRel) = Array.tryFill[Stigi.Datalog.Store.Slot]{region}(8192, StoreVacant) else
+    case FillFailed => RunOutOfMemory
+  val Filled(smallSlots) = Array.tryFill[Stigi.Datalog.Store.Slot]{region}(512, StoreVacant) else
     case FillFailed => RunOutOfMemory
   val Filled(syms) = Array.tryFill[Stigi.Emit.SymEntry]{region}(4096, SymEntry(SymFunc, 0, 0, 0, 0, 0, 0, 0, 0, 0)) else
     case FillFailed => RunOutOfMemory
@@ -73,7 +76,7 @@ pub def Stigi.Emit.compileTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.
             if nextSrcOff > 1048576 then
               outcome = RunFileError
             else
-              val doorVerdict: Stigi.Door.Verdict = Stigi.Door.verifyUnit{region}(65536, unitBuf, unitBytes, 8192, unitToks, 8192, nodes, 8192, facts, 8192, rows, rules)
+              val doorVerdict: Stigi.Door.Verdict = Stigi.Door.verifyUnit{region}(65536, unitBuf, unitBytes, 8192, unitToks, 8192, nodes, 8192, facts, 8192, rows, nextInRel, smallSlots)
               val doorPassed: Bool = doorVerdict match
                 case DoorAccepted(_, _, _) => true
                 case DoorGateFailed => false

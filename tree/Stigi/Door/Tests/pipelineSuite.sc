@@ -1,5 +1,6 @@
 // prompt: verify full self-hosted door pipeline accepts valid units and rejects missing prompts.
 val Stigi.Door.Tests.pipelineSuite {Stigi.Test}: Stigi.Test.Result =
+  Stigi.Datalog.Store.Laws.tupleSlotRange(StoreRow(1, 3, SymCell(0), SymCell(0), SymCell(0), SymCell(0), SymCell(0), SymCell(0), SymCell(0)), 64)
   val goodUnit: Array[U8](45) = "// prompt: ok.\ndef Demo.add(a: U64) = a < 10\n"
   val badUnit: Array[U8](25) = "def Demo.noHeader(a) = 1\n"
   val acceptValid: Bool = Stigi.Door.admitUnit{Stigi.Region}(45, goodUnit, 45) match
