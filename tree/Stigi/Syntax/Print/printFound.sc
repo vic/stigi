@@ -132,6 +132,8 @@ def Stigi.Syntax.Print.printFound {Stigi.Mut} (tables: Stigi.Syntax.Tables, foun
         val headed: Stigi.Syntax.Print.Pen = Stigi.Syntax.Print.printNode(tables, head, Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.putText(tables, Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.putPublic(tables, pen, isPublic), 9, "rule def "), name), 2, ": "), indent, inner)
         val opened: Stigi.Syntax.Print.Pen = if multiline then Stigi.Syntax.Print.putSpaces(tables, Stigi.Syntax.Print.putLiteral(tables, headed, 3, " =\n"), indent + 2) else Stigi.Syntax.Print.putLiteral(tables, headed, 3, " = ")
         if Stigi.Syntax.Print.hasItems(body) then Stigi.Syntax.Print.printList(tables, body, JoinedByComma, opened, indent, inner) else headed
-      case UnitRoot(_, prompt, decl) =>
-        val prompted: Stigi.Syntax.Print.Pen = Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.putText(tables, Stigi.Syntax.Print.putLiteral(tables, pen, 11, "// prompt: "), prompt), 1, "\n")
-        Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.printNode(tables, decl, prompted, 0, inner), 1, "\n")
+      case UnitRoot(_, prompt, aliases, decl) =>
+        val prompted: Stigi.Syntax.Print.Pen = Stigi.Syntax.Print.putText(tables, Stigi.Syntax.Print.putLiteral(tables, pen, 11, "// prompt: "), prompt)
+        val aliased: Stigi.Syntax.Print.Pen = Stigi.Syntax.Print.printList(tables, aliases, EachOnLine, prompted, 0, inner)
+        Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.printNode(tables, decl, Stigi.Syntax.Print.putLiteral(tables, aliased, 1, "\n"), 0, inner), 1, "\n")
+      case AliasLine(_, name, target) => Stigi.Syntax.Print.printNode(tables, target, Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.printNode(tables, name, Stigi.Syntax.Print.putLiteral(tables, pen, 6, "alias "), indent, inner), 3, " = "), indent, inner)

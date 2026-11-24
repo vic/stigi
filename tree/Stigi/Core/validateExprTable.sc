@@ -9,7 +9,7 @@ pub def Stigi.Core.validateExprTable(nodeCap: U64, exprs: Array[Stigi.Core.Expr]
     val curExpr: Stigi.Core.Expr = exprs(idx)
     val nodeAt: U64 = Stigi.Core.exprAtOf(curExpr)
     if nodeAt != idx then
-      verdict = MalformedTable(idx)
+      verdict = MalformedExprTable(idx)
       failed = true
     else
       val entryGood: Bool = curExpr match
@@ -43,7 +43,7 @@ pub def Stigi.Core.validateExprTable(nodeCap: U64, exprs: Array[Stigi.Core.Expr]
         case AssertValExpr(_, _, _, _) => true
         case DenyExpr(_, _, _, _) => true
       if !entryGood then
-        verdict = MalformedTable(idx)
+        verdict = MalformedExprTable(idx)
         failed = true
       else
         ()

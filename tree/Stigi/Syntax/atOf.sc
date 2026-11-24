@@ -52,4 +52,5 @@ def Stigi.Syntax.atOf(node: Stigi.Syntax.Node): U64 =
     case ExternVal(at, _, _, _, _) => at
     case RelationDecl(at, _, _, _) => at
     case RuleDecl(at, _, _, _, _, _) => at
-    case UnitRoot(at, _, _) => at
+    case UnitRoot(at, _, _, _) => at
+    case AliasLine(at, _, _) => at

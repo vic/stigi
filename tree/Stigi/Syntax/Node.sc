@@ -51,4 +51,5 @@ pub enum Stigi.Syntax.Node:
   case ExternVal(at: Stigi.Syntax.NodeAt, isPublic: Bool, abi: Stigi.Syntax.Text, name: Stigi.Syntax.Text, declared: Stigi.Syntax.NodeAt) <below(declared, at)>
   case RelationDecl(at: Stigi.Syntax.NodeAt, isPublic: Bool, name: Stigi.Syntax.Text, columns: Stigi.Syntax.Span)
   case RuleDecl(at: Stigi.Syntax.NodeAt, isPublic: Bool, name: Stigi.Syntax.Text, head: Stigi.Syntax.NodeAt, body: Stigi.Syntax.Span, multiline: Bool) <below(head, at)>
-  case UnitRoot(at: Stigi.Syntax.NodeAt, prompt: Stigi.Syntax.Text, decl: Stigi.Syntax.NodeAt) <below(decl, at)>
+  case UnitRoot(at: Stigi.Syntax.NodeAt, prompt: Stigi.Syntax.Text, aliases: Stigi.Syntax.Span, decl: Stigi.Syntax.NodeAt) <below(decl, at)>
+  case AliasLine(at: Stigi.Syntax.NodeAt, name: Stigi.Syntax.NodeAt, target: Stigi.Syntax.NodeAt) <below(name, at), below(target, at)>

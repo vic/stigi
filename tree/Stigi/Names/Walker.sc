@@ -1,0 +1,3 @@
+// prompt: the walk state of one unit: its task stack and depth, its locals and count, the edges, the counts of references and unresolved names, the steps taken and the fault that stopped it.
+enum Stigi.Names.Walker:
+  case Walker(tasks: Array[Stigi.Names.Task](Stigi.Names.maxScope), depth: U64, locals: Array[Stigi.Names.Local](Stigi.Names.maxScope), localCount: U64, edges: Stigi.Names.Edges, references: U64, unresolved: U64, steps: U64, fault: Stigi.Names.WalkFault) <lessOrEqual(depth, Stigi.Names.maxScope), lessOrEqual(localCount, Stigi.Names.maxScope), lessOrEqual(references, steps), lessOrEqual(unresolved, steps), lessOrEqual(steps, Stigi.Names.maxWalkSteps)>

@@ -38,7 +38,7 @@ val Stigi.Elaborate.Tests.elaborateSuite {Stigi.Test}: Stigi.Test.Result =
                                       if exprCount <= 64 && listCount <= 64 && rootCore < 64 then
                                         val validFlag: Bool = Stigi.Core.validateExprTable(64, exprs, exprCount, 16, arms, 0, 64, childLists, listCount) match
                                           case TableValid(cnt) => cnt == exprCount
-                                          case MalformedTable(_) => false
+                                          case MalformedExprTable(_) => false
                                         val swapFlag: Bool = exprs(rootCore) match
                                           case CompareExpr(_, cmpKind, leftAt, _) =>
                                             val isLess: Bool = cmpKind match
@@ -62,7 +62,7 @@ val Stigi.Elaborate.Tests.elaborateSuite {Stigi.Test}: Stigi.Test.Result =
                                       if exprCount <= 64 && listCount <= 64 && rootCore < 64 then
                                         val validPipe: Bool = Stigi.Core.validateExprTable(64, exprs, exprCount, 16, arms, 0, 64, childLists, listCount) match
                                           case TableValid(cnt) => cnt == exprCount
-                                          case MalformedTable(_) => false
+                                          case MalformedExprTable(_) => false
                                         val callGood: Bool = exprs(rootCore) match
                                           case CallExpr(_, _, _, TailCall, _) => false
                                           case CallExpr(_, _, argSpan, NormalCall, _) =>
@@ -81,7 +81,7 @@ val Stigi.Elaborate.Tests.elaborateSuite {Stigi.Test}: Stigi.Test.Result =
                               exprs(1) := CallExpr(1, SelfGroupRef(0), CoreSpan(0, 1), NormalCall, 0)
                               childLists(0) := 1
                               val chkBad: Bool = Stigi.Core.validateExprTable(64, exprs, 2, 16, arms, 0, 64, childLists, 1) match
-                                case MalformedTable(badIdx) => badIdx == 1
+                                case MalformedExprTable(badIdx) => badIdx == 1
                                 case TableValid(_) => false
                               chkCmp && chkPipe && chkBad
   Stigi.Test.expect(allPass, true, "Stigi.Elaborate must lower real parsed units into valid Stigi.Core postorder tables")
