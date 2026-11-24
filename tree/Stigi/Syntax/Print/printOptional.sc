@@ -1,3 +1,0 @@
-// prompt: print a prefix and an optional node only when the node is present.
-def Stigi.Syntax.Print.printOptional {Stigi.Mut} (tables: Stigi.Syntax.Tables, node: Stigi.Syntax.NodeAt, size: U64, prefix: Array[U8](size), pen: Stigi.Syntax.Print.Pen, indent: U64, depth: U64) <lessOrEqual(size, Stigi.Limit.maxUnitBytes), lessOrEqual(depth, Stigi.Limit.maxParseDepth), decreases(depth)>: Stigi.Syntax.Print.Pen =
-  if depth < 1 then PenFailed(PrintTooDeep) else if Stigi.Syntax.Print.isAbsent(tables, node) then pen else Stigi.Syntax.Print.printNode(tables, node, Stigi.Syntax.Print.putLiteral(tables, pen, size, prefix), indent, depth - 1)
