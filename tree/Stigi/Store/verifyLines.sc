@@ -1,5 +1,5 @@
 // prompt: check every unit named on the index lines from a line position, stopping at the first failure.
-def Stigi.Store.verifyLines {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64, scratch: Stigi.Store.Scratch, indexLen: U64, walk: Stigi.Store.IndexWalk, remaining: U64) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap), lessOrEqual(indexLen, 65536), decreases(remaining)>: Stigi.RunOutcome =
+def Stigi.Store.verifyLines {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64, scratch: Stigi.Store.Scratch, indexLen: U64, walk: Stigi.Store.IndexWalk, remaining: U64) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap), lessOrEqual(indexLen, 262144), decreases(remaining)>: Stigi.RunOutcome =
   val IndexWalk(linePos, unitCount) = walk
   if remaining < 1 || indexLen <= linePos then
     if unitCount == 0 then RunDoorRejected else RunSuccess

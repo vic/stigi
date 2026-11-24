@@ -1,0 +1,29 @@
+// prompt: return the postorder index stored inside a Checked-IR expression node.
+def Stigi.Core.exprAtOf(expr: Stigi.Core.Expr): U64 =
+  expr match
+    case LocalExpr(at, _, _) => at
+    case GlobalExpr(at, _, _) => at
+    case IntExpr(at, _, _, _) => at
+    case TruthExpr(at, _) => at
+    case NothingExpr(at) => at
+    case TextExpr(at, _, _) => at
+    case ConstructExpr(at, _, _, _, _) => at
+    case CallExpr(at, _, _, _, _) => at
+    case OperCallExpr(at, _, _, _, _) => at
+    case ExactExpr(at, _, _, _, _) => at
+    case CompareExpr(at, _, _, _) => at
+    case BothExpr(at, _, _) => at
+    case EitherExpr(at, _, _) => at
+    case NegateExpr(at, _) => at
+    case ChoiceExpr(at, _, _, _, _) => at
+    case LoopExpr(at, _, _, _, _) => at
+    case SelectExpr(at, _, _, _) => at
+    case BindExpr(at, _, _, _, _) => at
+    case MutableExpr(at, _, _, _, _, _) => at
+    case AssignExpr(at, _, _) => at
+    case ElemReadExpr(at, _, _, _) => at
+    case ElemWriteExpr(at, _, _, _) => at
+    case HandleExpr(at, _, _, _, _, _) => at
+    case AssertExpr(at, _, _, _) => at
+    case AssertValExpr(at, _, _, _) => at
+    case DenyExpr(at, _, _, _) => at

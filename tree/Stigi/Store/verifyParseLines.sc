@@ -1,5 +1,5 @@
 // prompt: check every unit named on the index lines from a line position, adding each outcome to the running counts.
-def Stigi.Store.verifyParseLines {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64, scratch: Stigi.Store.ParseScratch, indexLen: U64, walk: Stigi.Store.IndexWalk, tally: Stigi.Store.ParseTally, remaining: U64) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap), lessOrEqual(indexLen, 65536), decreases(remaining)>: Stigi.Store.ParseTally =
+def Stigi.Store.verifyParseLines {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64, scratch: Stigi.Store.ParseScratch, indexLen: U64, walk: Stigi.Store.IndexWalk, tally: Stigi.Store.ParseTally, remaining: U64) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap), lessOrEqual(indexLen, 262144), decreases(remaining)>: Stigi.Store.ParseTally =
   val IndexWalk(linePos, unitCount) = walk
   if remaining < 1 || indexLen <= linePos then tally else
     val ParseScratch(_, indexBuf, _, _, _) = scratch

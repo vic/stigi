@@ -1,7 +1,7 @@
 // prompt: write one report line for a unit that did not print back byte for byte: its name, the failure and its position.
-def Stigi.Store.putFailure {region: Stigi.Region, Stigi.Mut} (scratch: Stigi.Store.ParseScratch, at: U64, nameStart: U64, nameEnd: U64, outcome: Stigi.Syntax.RoundTrip) <lessOrEqual(at, 65536), lessOrEqual(nameStart, nameEnd), lessOrEqual(nameEnd, 65536)>: U64 <lessOrEqual(result, 65536)> =
+def Stigi.Store.putFailure {region: Stigi.Region, Stigi.Mut} (scratch: Stigi.Store.ParseScratch, at: U64, nameStart: U64, nameEnd: U64, outcome: Stigi.Syntax.RoundTrip) <lessOrEqual(at, 65536), lessOrEqual(nameStart, nameEnd), lessOrEqual(nameEnd, 262144)>: U64 <lessOrEqual(result, 65536)> =
   val ParseScratch(_, indexBuf, _, report, _) = scratch
-  val named: U64 = Stigi.Array.copy[U8](65536, indexBuf, nameStart, nameEnd, 65536, report, at)
+  val named: U64 = Stigi.Array.copy[U8](262144, indexBuf, nameStart, nameEnd, 65536, report, at)
   val spaced: U64 = Stigi.Array.copy[U8](1, " ", 0, 1, 65536, report, named)
   val worded: U64 = outcome match
     case TextMatched(_, _, _) => spaced

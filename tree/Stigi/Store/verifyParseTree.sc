@@ -2,7 +2,7 @@
 def Stigi.Store.verifyParseTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.ByteCap, dirBuf: Array[U8](dirCap), dirStart: U64, dirEnd: U64) <lessOrEqual(dirStart, dirEnd), lessOrEqual(dirEnd, dirCap)>: Stigi.RunOutcome =
   val Filled(pathBuf) = Array.tryFill[U8]{region}(4096, 0) else
     case FillFailed => RunOutOfMemory
-  val Filled(indexBuf) = Array.tryFill[U8]{region}(65536, 0) else
+  val Filled(indexBuf) = Array.tryFill[U8]{region}(262144, 0) else
     case FillFailed => RunOutOfMemory
   val Filled(unitBuf) = Array.tryFill[U8]{region}(65536, 0) else
     case FillFailed => RunOutOfMemory
@@ -13,10 +13,10 @@ def Stigi.Store.verifyParseTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi
   val Found(idxPathLen) = Stigi.Store.buildIndexPath(dirCap, dirBuf, dirStart, dirEnd, pathBuf) else
     case Missing => RunFileError
   if idxPathLen >= 4096 then RunFileError else
-    val LoadedBytes(indexLen) = Stigi.Posix.readFileBytes{region}(idxPathLen, pathBuf, 65536, indexBuf, 0) else
+    val LoadedBytes(indexLen) = Stigi.Posix.readFileBytes{region}(idxPathLen, pathBuf, 262144, indexBuf, 0) else
       case LoadFailed => RunFileError
       case LoadOverflow => RunFileError
-    if indexLen > 65536 then RunFileError else
+    if indexLen > 262144 then RunFileError else
       val ParseTally(units, matched, bytes, tokens, nodes, reportAt) = Stigi.Store.verifyParseLines{region}(dirCap, dirBuf, dirStart, dirEnd, ParseScratch(pathBuf, indexBuf, unitBuf, report, tables), indexLen, IndexWalk(0, 0), ParseTally(0, 0, 0, 0, 0, 0), indexLen + 1)
       val unitsEnd: U64 = Stigi.Store.putCount{region}(report, reportAt, 6, "units ", units)
       val matchedEnd: U64 = Stigi.Store.putCount{region}(report, unitsEnd, 9, " matched ", matched)

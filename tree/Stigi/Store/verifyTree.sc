@@ -3,7 +3,7 @@ def Stigi.Store.verifyTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.Byte
   val padCell: Stigi.Datalog.Store.Cell = SymCell(0)
   val Filled(pathBuf) = Array.tryFill[U8]{region}(4096, 0) else
     case FillFailed => RunOutOfMemory
-  val Filled(indexBuf) = Array.tryFill[U8]{region}(65536, 0) else
+  val Filled(indexBuf) = Array.tryFill[U8]{region}(262144, 0) else
     case FillFailed => RunOutOfMemory
   val Filled(unitBuf) = Array.tryFill[U8]{region}(65536, 0) else
     case FillFailed => RunOutOfMemory
@@ -22,8 +22,8 @@ def Stigi.Store.verifyTree {region: Stigi.Region, Stigi.Mut} (dirCap: Stigi.Byte
   val Found(idxPathLen) = Stigi.Store.buildIndexPath(dirCap, dirBuf, dirStart, dirEnd, pathBuf) else
     case Missing => RunFileError
   if idxPathLen >= 4096 then RunFileError else
-    val LoadedBytes(indexLen) = Stigi.Posix.readFileBytes{region}(idxPathLen, pathBuf, 65536, indexBuf, 0) else
+    val LoadedBytes(indexLen) = Stigi.Posix.readFileBytes{region}(idxPathLen, pathBuf, 262144, indexBuf, 0) else
       case LoadFailed => RunFileError
       case LoadOverflow => RunFileError
-    if indexLen > 65536 then RunFileError else
+    if indexLen > 262144 then RunFileError else
       Stigi.Store.verifyLines{region}(dirCap, dirBuf, dirStart, dirEnd, Scratch(pathBuf, indexBuf, unitBuf, toks, nodes, facts, rows, nextInRel, smallSlots), indexLen, IndexWalk(0, 0), indexLen + 1)

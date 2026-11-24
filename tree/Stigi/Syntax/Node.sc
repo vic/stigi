@@ -1,5 +1,5 @@
 // prompt: one node of the postorder syntax table of a unit: each node holds its own index and every child index is below it.
-enum Stigi.Syntax.Node:
+pub enum Stigi.Syntax.Node:
   case Absent(at: Stigi.Syntax.NodeAt)
   case Name(at: Stigi.Syntax.NodeAt, text: Stigi.Syntax.Text)
   case TypeRef(at: Stigi.Syntax.NodeAt, name: Stigi.Syntax.Text, typeArgs: Stigi.Syntax.Span, lengthArgs: Stigi.Syntax.Span, capArg: Stigi.Syntax.NodeAt) <below(capArg, at)>
