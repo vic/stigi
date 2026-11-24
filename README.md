@@ -3,8 +3,11 @@
 [![Sponsor](https://img.shields.io/badge/sponsor-vic-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/vic)
 
 
-> Stigi is very much a work in progress! Yes, it is an ambitious project, that is the very
-> reason I'm dedicating my own time and resources to it.
+> Stigi is very much a work in progress! [./src](./src) contains our seed compiler and [./tree](./tree) the current bootstrapped Stigi source code.
+>
+> Stigi is an ambitious project, that is the very
+> reason I'm dedicating my own time and resources to it, because I absolutely want to make it possible.
+>
 > And that is also why it needs your support, from leaving an star, showing it to your friends,
 > [trying it or sponsoring its development](#11-sponsor-early-adopters-and-license-agpl).
 
