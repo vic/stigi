@@ -1,5 +1,5 @@
-// prompt: represent the outcome of emitting one postorder Checked-IR expression node.
+// prompt: represent the outcome of emitting one core node: the tables and scratch given back, or a full table, or invalid syntax.
 enum Stigi.Elaborate.EmitResult:
-  case EmitDone(nextCore: U64, nextList: U64, nextArm: U64)
+  case EmitDone(core: Stigi.Core.Tables, scratch: Stigi.Elaborate.Scratch)
   case EmitFull
   case EmitInvalid

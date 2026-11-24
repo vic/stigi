@@ -1,0 +1,29 @@
+// prompt: intern one Array type three times on a table with room for one committed Array row and one staged candidate, and report whether all three share one index.
+def Stigi.Types.Tests.reuseProbe {region: Stigi.Region, Stigi.Mut} (slotCapacity: U64) <below(0, slotCapacity)>: Bool =
+  val TableReady(table) = Stigi.Types.allocateTable{region}(2, slotCapacity, 2, 2, 2) else
+    case TableUnavailable => false
+  val Filled(pool) = Array.tryFill[Stigi.Types.Linear.Term]{region}(1, LinearTerm(5, WideInt(1, 0))) else
+    case FillFailed => false
+  val formBinder: Stigi.Types.Linear.Form = LinearForm(WideInt(0, 0), 0, 1)
+  val arrayUnit: Stigi.Core.Reference = ExternalRef(4, 0)
+  val InternedAt(withByte, byteAt) = Stigi.Types.intern(table, Primitive(UnsignedByte)) else
+    case TypeTableFull => false
+  val StagedRows(firstArgs, firstArgRows) = Stigi.Types.stageArgument(withByte, byteAt) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val StagedRows(firstLengths, firstLengthRows) = Stigi.Types.stageLength(firstArgs, 1, pool, formBinder) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val InternedAt(firstTable, firstAt) = Stigi.Types.intern(firstLengths, Named(arrayUnit, firstArgRows, firstLengthRows)) else
+    case TypeTableFull => false
+  val StagedRows(secondArgs, secondArgRows) = Stigi.Types.stageArgument(firstTable, byteAt) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val StagedRows(secondLengths, secondLengthRows) = Stigi.Types.stageLength(secondArgs, 1, pool, formBinder) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val InternedAt(secondTable, secondAt) = Stigi.Types.intern(secondLengths, Named(arrayUnit, secondArgRows, secondLengthRows)) else
+    case TypeTableFull => false
+  val StagedRows(thirdArgs, thirdArgRows) = Stigi.Types.stageArgument(secondTable, byteAt) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val StagedRows(thirdLengths, thirdLengthRows) = Stigi.Types.stageLength(thirdArgs, 1, pool, formBinder) else
+    case StageFull | StageNotUnsigned | StageBadBinder => false
+  val InternedAt(_, thirdAt) = Stigi.Types.intern(thirdLengths, Named(arrayUnit, thirdArgRows, thirdLengthRows)) else
+    case TypeTableFull => false
+  firstAt == secondAt && secondAt == thirdAt

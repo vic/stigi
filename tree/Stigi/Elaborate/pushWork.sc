@@ -1,9 +1,10 @@
-// prompt: push one syntax node index and visit phase onto the elaboration stack.
-def Stigi.Elaborate.pushWork {Stigi.Mut} (workCap: U64, workNode: Array[U64](workCap), workPhase: Array[U8](workCap), topIdx: U64, synIdx: U64, phaseVal: U64) <lessOrEqual(topIdx, workCap), below(phaseVal, 256)>: Stigi.Elaborate.PushResult =
-  if topIdx < workCap then
-    val nextTop: U64 = topIdx + 1
-    workNode(topIdx) := synIdx
-    workPhase(topIdx) := U8.ofU64(phaseVal)
-    PushDone(nextTop)
-  else
-    PushFull
+// prompt: push one elaboration work item onto the work stack and give back the scratch with the new top.
+def Stigi.Elaborate.pushWork {Stigi.Mut} (scratch: Stigi.Elaborate.Scratch, item: Stigi.Elaborate.Work): Stigi.Elaborate.PushResult =
+  scratch match
+    case WorkScratch(capacity, work, top, mapped, patRes) =>
+      if top < capacity then
+        @<below(top, capacity)>
+        val nextTop: U64 = top + 1
+        work(top) := item
+        PushDone(WorkScratch(capacity, work, nextTop, mapped, patRes))
+      else PushFull

@@ -1,0 +1,3 @@
+// prompt: the checked-IR tables of one unit, each table with its own capacity, its fill mark and its fill end; the rows from a mark to its end are the ones appended since the mark was set.
+pub enum Stigi.Core.Tables:
+  case CoreTables(expressionCapacity: U64, expressions: Array[Stigi.Core.Expr](expressionCapacity), expressionMark: U64, expressionEnd: U64, listCapacity: U64, childLists: Array[U64](listCapacity), listMark: U64, listEnd: U64, armCapacity: U64, arms: Array[Stigi.Core.Arm](armCapacity), armMark: U64, armEnd: U64) <lessOrEqual(expressionMark, expressionEnd), lessOrEqual(expressionEnd, expressionCapacity), lessOrEqual(listMark, listEnd), lessOrEqual(listEnd, listCapacity), lessOrEqual(armMark, armEnd), lessOrEqual(armEnd, armCapacity)>
