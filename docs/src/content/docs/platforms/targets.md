@@ -14,4 +14,4 @@ Stigi keeps one checked representation of your program across very different mac
 
 The same rules that keep a server process safe keep a toaster safe.
 
-Next: [code identity](/platforms/identity/).
+Next: [trust](/trust/self-hosting/).

@@ -28,4 +28,4 @@ There is no back door. Not for the standard library, not for tests, not "just fo
 
 Agents send small edits to a live image. Humans change the reviewed tree and load it. Both go through the same door, but only the reviewed tree can change laws, tests and public contracts. More on that in [the law loop](/door/law-loop/).
 
-Next: [one reasoning engine](/door/datalog/).
+Next: [hashes and dependencies](/door/identity/).
