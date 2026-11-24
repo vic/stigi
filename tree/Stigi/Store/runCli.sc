@@ -20,6 +20,8 @@ pub def Stigi.Store.runCli {region: Stigi.Region, clock: Stigi.Clock, Stigi.Mut}
         if dirFin <= 16384 then Stigi.Store.exportNamesTree{region}(16384, cmdBuf, dirBeg, dirFin) else RunCliError
       case CliExportNamesTo(dirBeg, dirFin, outBeg, outFin) =>
         if dirFin <= 16384 && outFin <= 16384 then Stigi.Store.exportNamesFiles{region}(16384, cmdBuf, dirBeg, dirFin, outBeg, outFin) else RunCliError
+      case CliExportTypes(dirBeg, dirFin, outBeg, outFin) =>
+        if dirFin <= 16384 && outFin <= 16384 then Stigi.Store.exportTypesFiles{region}(16384, cmdBuf, dirBeg, dirFin, outBeg, outFin) else RunCliError
       case CliLoadEmit(dirBeg, dirFin, outBeg, outFin) =>
         if dirFin <= 16384 && outFin <= 16384 then
           val Filled(outPath) = Array.tryFill[U8]{region}(4096, 0) else

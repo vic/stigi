@@ -1,5 +1,5 @@
 // prompt: compute the unsigned 128-bit magnitude of a signed wide integer.
-def Stigi.Exact.magnitudeOf(value: Stigi.Exact.IntWide): Stigi.Exact.UnsignedWide =
+pub def Stigi.Exact.magnitudeOf(value: Stigi.Exact.IntWide): Stigi.Exact.UnsignedWide =
   value match
     case WideInt(lowWord, highWord) =>
       if highWord < 0 then

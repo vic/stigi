@@ -17,6 +17,12 @@ def Stigi.Store.parseCmdline(bufCap: Stigi.ByteCap, buf: Array[U8](bufCap), bufL
           case ArgsEnd => CliInvalid
         if afterNamesOut < bufLen || namesOutStart == namesOutEnd then CliInvalid else CliExportNamesTo(dirStart, dirEnd, namesOutStart, namesOutEnd)
       else CliExportNames(dirStart, dirEnd)
+    else if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 14, "--export-types") then
+      if afterDir < bufLen then
+        val ArgAt(typesOutStart, typesOutEnd, afterTypesOut) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterDir) else
+          case ArgsEnd => CliInvalid
+        if afterTypesOut < bufLen || typesOutStart == typesOutEnd then CliInvalid else CliExportTypes(dirStart, dirEnd, typesOutStart, typesOutEnd)
+      else CliInvalid
     else if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 6, "--load") then
       val ArgAt(emitStart, emitEnd, afterEmit) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterDir) else
         case ArgsEnd => CliInvalid

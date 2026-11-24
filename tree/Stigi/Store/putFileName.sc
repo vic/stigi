@@ -8,3 +8,5 @@ def Stigi.Store.putFileName {Stigi.Mut} (reportCap: Stigi.EmitCap, report: Array
     case LaneFile(NegTestLane) => Stigi.Array.copy[U8](13, "negtest.facts", 0, 13, reportCap, report, at)
     case LaneFile(EdgeLane) => Stigi.Array.copy[U8](10, "edge.facts", 0, 10, reportCap, report, at)
     case ModeFile => Stigi.Array.copy[U8](15, "imageMode.facts", 0, 15, reportCap, report, at)
+    case TypeRangeFile => Stigi.Array.copy[U8](15, "typeRange.facts", 0, 15, reportCap, report, at)
+    case TypeWidthFile => Stigi.Array.copy[U8](15, "typeWidth.facts", 0, 15, reportCap, report, at)
