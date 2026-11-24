@@ -1,5 +1,5 @@
 // prompt: iteratively lower a parsed Stigi syntax unit body into flat postorder Checked-IR tables with comparison swap and pipe desugaring.
-def Stigi.Elaborate.lowerUnit {Stigi.Mut} (tables: Stigi.Syntax.Tables, rootSyn: Stigi.Syntax.NodeAt, nodeCap: U64, exprs: Array[Stigi.Core.Expr](nodeCap), listCap: U64, childLists: Array[U64](listCap), workCap: U64, workNode: Array[U64](workCap), workPhase: Array[U8](workCap), mapCap: U64, mapped: Array[U64](mapCap)) <below(0, nodeCap), below(0, listCap), below(0, workCap), lessOrEqual(1, workCap), below(0, mapCap)>: Stigi.Elaborate.LowerOutcome =
+def Stigi.Elaborate.lowerUnit {Stigi.Mut} (tables: Stigi.Syntax.Tables, rootSyn: Stigi.Syntax.NodeAt, nodeCap: U64, exprs: Array[Stigi.Core.Expr](nodeCap), listCap: U64, childLists: Array[U64](listCap), armCap: U64, arms: Array[Stigi.Core.Arm](armCap), workCap: U64, workNode: Array[U64](workCap), workPhase: Array[U8](workCap), mapCap: U64, mapped: Array[U64](mapCap), patRes: Array[Stigi.Elaborate.PatResolution](mapCap)) <below(0, nodeCap), below(0, listCap), below(0, armCap), below(0, workCap), lessOrEqual(1, workCap), below(0, mapCap)>: Stigi.Elaborate.LowerOutcome =
   val Tables(_, _, synNodes, _, _, _) = tables
   val rootBodyOpt: U64 = synNodes(rootSyn) match
     case UnitRoot(_, _, _, declIdx) =>
@@ -13,10 +13,11 @@ def Stigi.Elaborate.lowerUnit {Stigi.Mut} (tables: Stigi.Syntax.Tables, rootSyn:
   workPhase(0) := U8.ofU64(0)
   var curCore: U64 = 0
   var curList: U64 = 0
+  var curArm: U64 = 0
   var failed: Bool = false
   var overflowFlag: Bool = false
   while topIdx > 0 && !failed && !overflowFlag do
-    @<lessOrEqual(topIdx, workCap), lessOrEqual(curCore, nodeCap), lessOrEqual(curList, listCap)>
+    @<lessOrEqual(topIdx, workCap), lessOrEqual(curCore, nodeCap), lessOrEqual(curList, listCap), lessOrEqual(curArm, armCap)>
     val popIdx: U64 = topIdx - 1
     topIdx = popIdx
     val synIdx: U64 = workNode(popIdx)
@@ -31,13 +32,14 @@ def Stigi.Elaborate.lowerUnit {Stigi.Mut} (tables: Stigi.Syntax.Tables, rootSyn:
     else if curCore >= nodeCap then
       overflowFlag = true
     else
-      Stigi.Elaborate.emitCoreNode(tables, synIdx, nodeCap, exprs, curCore, listCap, childLists, curList, mapCap, mapped) match
+      Stigi.Elaborate.emitCoreNode(tables, synIdx, nodeCap, exprs, curCore, listCap, childLists, curList, armCap, arms, curArm, mapCap, mapped, patRes) match
         case EmitFull => overflowFlag = true
         case EmitInvalid => failed = true
-        case EmitDone(nextCore, nextList) =>
-          if nextCore <= nodeCap && nextList <= listCap then
+        case EmitDone(nextCore, nextList, nextArm) =>
+          if nextCore <= nodeCap && nextList <= listCap && nextArm <= armCap then
             curCore = nextCore
             curList = nextList
+            curArm = nextArm
           else
             overflowFlag = true
-  if overflowFlag then LowerOverflow else if failed || rootBodyOpt >= mapCap then LowerInvalid else Lowered(mapped(rootBodyOpt), curCore, curList)
+  if overflowFlag then LowerOverflow else if failed || rootBodyOpt >= mapCap then LowerInvalid else Lowered(mapped(rootBodyOpt), curCore, curArm, curList)

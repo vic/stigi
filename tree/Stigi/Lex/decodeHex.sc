@@ -1,5 +1,5 @@
-// prompt: decode an ASCII byte into a proved hexadecimal nibble below sixteen.
-def Stigi.Lex.decodeHex(byte: U8): Stigi.Lex.HexDigit =
+// prompt: decode an ASCII byte into a proved hexadecimal nibble below sixteen, shared by the lexer and character escapes.
+pub def Stigi.Lex.decodeHex(byte: U8): Stigi.Lex.HexDigit =
   case '0'..'9' =>
     val nibble: U64 = U64.ofU8(byte - '0')
     if nibble < 16 then HexValue(nibble@<below(nibble, 16)>) else NotHex

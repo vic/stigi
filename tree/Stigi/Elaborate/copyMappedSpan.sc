@@ -17,4 +17,4 @@ def Stigi.Elaborate.copyMappedSpan {Stigi.Mut} (tables: Stigi.Syntax.Tables, spa
         else
           fullFlag = true
         pos = nextPos
-      if fullFlag then EmitFull else EmitDone(0, curList)
+      if fullFlag then EmitFull else EmitDone(0, curList, 0)

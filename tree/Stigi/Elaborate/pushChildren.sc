@@ -26,6 +26,20 @@ def Stigi.Elaborate.pushChildren {Stigi.Mut} (tables: Stigi.Syntax.Tables, synId
             Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topAfterSelf, operSyn, 0)
           case Call(_, _, _, _, argsSpan, _) =>
             Stigi.Elaborate.pushSpan(tables, argsSpan, workCap, workNode, workPhase, topAfterSelf)
+          case IsTest(_, subjectSyn, _) =>
+            Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topAfterSelf, subjectSyn, 0)
+          case MatchOn(_, scrutSpan, armsSpan) =>
+            Stigi.Elaborate.pushSpan(tables, armsSpan, workCap, workNode, workPhase, topAfterSelf) match
+              case PushFull => PushFull
+              case PushDone(topMid) =>
+                if topMid <= workCap then Stigi.Elaborate.pushSpan(tables, scrutSpan, workCap, workNode, workPhase, topMid) else PushFull
+          case Arm(_, _, guardSyn, bodySyn) =>
+            Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topAfterSelf, bodySyn, 0) match
+              case PushFull => PushFull
+              case PushDone(topOne) =>
+                if topOne <= workCap then
+                  if synNodes(guardSyn) is Absent(_) then PushDone(topOne) else Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topOne, guardSyn, 0)
+                else PushFull
           case IfElse(_, condSyn, thenSyn, elseSyn) =>
             Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topAfterSelf, elseSyn, 0) match
               case PushFull => PushFull
@@ -64,5 +78,5 @@ def Stigi.Elaborate.pushChildren {Stigi.Mut} (tables: Stigi.Syntax.Tables, synId
                   Stigi.Elaborate.pushWork(workCap, workNode, workPhase, topAfterSelf, synLists(lastPos), 0)
                 else
                   PushDone(topAfterSelf)
-          case Absent(_) | Name(_, _) | TypeRef(_, _, _, _, _) | FactAtom(_, _, _, _, _) | FactCompare(_, _, _, _, _, _) | FactArith(_, _, _, _, _, _, _) | FactDeny(_, _) | FactGroup(_, _) | Param(_, _, _) | CapParam(_, _, _) | CapGroup(_, _) | PatName(_, _) | PatLiteral(_, _) | PatCtor(_, _, _) | PatTuple(_, _) | PatOr(_, _) | PatRange(_, _, _) | Literal(_, _, _) | Ref(_, _) | IsTest(_, _, _) | MatchOn(_, _, _) | Arm(_, _, _, _) | ValStmt(_, _, _, _, _) | VarStmt(_, _, _, _, _) | AssignStmt(_, _, _) | HandleStmt(_, _, _, _, _, _, _, _) | AssertStmt(_, _, _) | DenyStmt(_, _) | LocalDecl(_, _) | DefHead(_, _, _, _, _, _, _, _) | FunctionDecl(_, _, _, _, _, _, _) | ValDecl(_, _, _, _, _, _) | EnumDecl(_, _, _, _, _) | EnumCase(_, _, _, _, _) | TypeDecl(_, _, _, _, _, _, _, _) | CapabilityDecl(_, _, _, _, _, _, _, _) | HandlerDecl(_, _, _, _, _, _, _, _, _, _) | TraitDecl(_, _, _, _, _) | GivenDecl(_, _, _, _, _, _, _) | ExternDef(_, _, _, _, _, _) | ExternVal(_, _, _, _, _) | RelationDecl(_, _, _, _) | RuleDecl(_, _, _, _, _, _) | UnitRoot(_, _, _, _) | AliasLine(_, _, _) =>
+          case Absent(_) | Name(_, _) | TypeRef(_, _, _, _, _) | FactAtom(_, _, _, _, _) | FactCompare(_, _, _, _, _, _) | FactArith(_, _, _, _, _, _, _) | FactDeny(_, _) | FactGroup(_, _) | Param(_, _, _) | CapParam(_, _, _) | CapGroup(_, _) | PatName(_, _) | PatLiteral(_, _) | PatCtor(_, _, _) | PatTuple(_, _) | PatOr(_, _) | PatRange(_, _, _) | Literal(_, _, _) | Ref(_, _) | ValStmt(_, _, _, _, _) | VarStmt(_, _, _, _, _) | AssignStmt(_, _, _) | HandleStmt(_, _, _, _, _, _, _, _) | AssertStmt(_, _, _) | DenyStmt(_, _) | LocalDecl(_, _) | DefHead(_, _, _, _, _, _, _, _) | FunctionDecl(_, _, _, _, _, _, _) | ValDecl(_, _, _, _, _, _) | EnumDecl(_, _, _, _, _) | EnumCase(_, _, _, _, _) | TypeDecl(_, _, _, _, _, _, _, _) | CapabilityDecl(_, _, _, _, _, _, _, _) | HandlerDecl(_, _, _, _, _, _, _, _, _, _) | TraitDecl(_, _, _, _, _) | GivenDecl(_, _, _, _, _, _, _) | ExternDef(_, _, _, _, _, _) | ExternVal(_, _, _, _, _) | RelationDecl(_, _, _, _) | RuleDecl(_, _, _, _, _, _) | UnitRoot(_, _, _, _) | AliasLine(_, _, _) =>
             PushDone(topAfterSelf)
