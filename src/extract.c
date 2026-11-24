@@ -1105,6 +1105,41 @@ static void ext_emit_denial(ExtCtx *ctx, const StigiFactItem *deny_it) {
   ext_push_denial(ctx, dsym);
 }
 
+/* The state S of the first `at(binder, S)` in a fact group (capabilities.md 4, ruling S142); false when none */
+static bool fact_group_state_of(const StigiFactGroup *fg, StigiStr binder, StigiStr *out_state) {
+  for (uint32_t i = 0; i < fg->count; i++) {
+    const StigiFactItem *it = &fg->items[i];
+    if (it->kind == STIGI_FACT_ATOM && it->arg_count == 2 &&
+        (str_eq_c(it->atom_name, "at") || str_eq_c(it->atom_name, "Stigi.Facts.at")) &&
+        (it->args[0]->kind == STIGI_EXPR_LOCAL || it->args[0]->kind == STIGI_EXPR_GLOBAL) &&
+        (it->args[1]->kind == STIGI_EXPR_LOCAL || it->args[1]->kind == STIGI_EXPR_GLOBAL) &&
+        it->args[0]->u.ident.name.len == binder.len &&
+        memcmp(it->args[0]->u.ident.name.ptr, binder.ptr, binder.len) == 0) {
+      *out_state = it->args[1]->u.ident.name;
+      return true;
+    }
+  }
+  return false;
+}
+
+/* The entry (pre fact groups) or exit state a def head states for its capability binder; an exit with no `at` of
+   its own is the entry state, so a def can never change the state behind its caller (ruling S142 tightened) */
+static bool def_head_state_of(const StigiDefHead *h, StigiStr binder, bool exit, StigiStr *out_state) {
+  if (exit) {
+    for (uint32_t g = 0; g < h->exit_fact_count; g++) {
+      if (fact_group_state_of(&h->exit_facts[g], binder, out_state)) return true;
+    }
+    return def_head_state_of(h, binder, false, out_state);
+  }
+  for (uint32_t g = 0; g < h->pre_group_count; g++) {
+    if (h->pre_groups[g].is_fact && fact_group_state_of(&h->pre_groups[g].facts, binder, out_state)) return true;
+  }
+  for (uint32_t g = 0; g < h->post_val_fact_count; g++) {
+    if (fact_group_state_of(&h->post_val_facts[g], binder, out_state)) return true;
+  }
+  return false;
+}
+
 static void ext_emit_credits_subst(ExtCtx *ctx, const StigiFactGroup *fg, const char *sc,
                                    const char *res_sym, const StigiParam *sp,
                                    const char *const *sv, uint32_t scnt) {
@@ -2550,8 +2585,31 @@ static ExtVal ext_expr(ExtCtx *ctx, const StigiExpr *e, const char *hint_ty, boo
                                                 : ctx_strdup(ctx, cap_n.ptr, cap_n.len);
                 ctx_emit2(ctx, "needsCapability", col_sym(op), col_sym(cap_s));
                 ExtCap *prov = ext_find_cap_by_unit(ctx, cap_s);
+                for (uint32_t a = 0; a < e->u.call.cap_arg_count; a++) {
+                  ExtCap *named = ext_find_cap_by_binder(ctx, e->u.call.cap_args[a]);
+                  if (named != NULL && strcmp(named->unit_sym, cap_s) == 0) prov = named;
+                }
                 if (prov != NULL) {
                   ctx_emit2(ctx, "provider", col_sym(op), col_sym(prov->prov_sym));
+                  /* S142: a callee that states `at` for this capability is a transition of the caller's state */
+                  StigiStr pb = ch->pre_groups[g].caps[c].name;
+                  StigiStr s_in = {NULL, 0};
+                  StigiStr s_out = {NULL, 0};
+                  bool has_in = pb.len > 0 && def_head_state_of(ch, pb, false, &s_in);
+                  bool has_out = pb.len > 0 && def_head_state_of(ch, pb, true, &s_out);
+                  if (has_in || has_out) {
+                    const char *call_op_sym = ctx_fmt(ctx, "%s{%.*s}", ctx->img->units[tgt].name, (int)pb.len, pb.ptr);
+                    ctx_emit4(ctx, "operationCall", col_sym(op), col_sym(prov->prov_sym), col_sym(call_op_sym),
+                              col_sym(pt));
+                    if (has_in) {
+                      ctx_emit2(ctx, "entryState", col_sym(call_op_sym),
+                                col_sym(ctx_strdup(ctx, s_in.ptr, s_in.len)));
+                    }
+                    if (has_out) {
+                      ctx_emit2(ctx, "exitState", col_sym(call_op_sym),
+                                col_sym(ctx_strdup(ctx, s_out.ptr, s_out.len)));
+                    }
+                  }
                 }
               }
             }
@@ -3678,6 +3736,25 @@ static Status extract_def_body(const StigiImage *img, uint32_t unit_idx, const c
           ec->from_handle = false;
         }
         ctx_emit2(&ctx, "capabilityOf", col_sym(prov), col_sym(cs));
+        /* S142: a stateful capability parameter enters in its entry `at` state; with none it has no state, so every
+           stateful operation on it fails closed (op-not-allowed) */
+        StigiStr binder = h->pre_groups[i].caps[c].name;
+        StigiStr entry_state = {NULL, 0};
+        StigiStr exit_state = {NULL, 0};
+        if (cidx >= 0 && binder.len > 0 && ctx.img->units[cidx].ast->decl->kind == STIGI_DECL_CAPABILITY &&
+            ctx.img->units[cidx].ast->decl->u.cap_decl.state_count > 0) {
+          bool has_entry = def_head_state_of(h, binder, false, &entry_state);
+          bool has_exit = def_head_state_of(h, binder, true, &exit_state);
+          if (has_entry) {
+            ctx_emit3(&ctx, "paramState", col_sym(prov), col_sym(p0),
+                      col_sym(ctx_strdup(&ctx, entry_state.ptr, entry_state.len)));
+          }
+          if (has_exit) {
+            const char *sr = ext_new_atom(&ctx);
+            ctx_emit3(&ctx, "stateRef", col_sym(sr), col_sym(cs),
+                      col_sym(ctx_strdup(&ctx, exit_state.ptr, exit_state.len)));
+          }
+        }
       }
     }
   }
@@ -3746,6 +3823,16 @@ static Status extract_def_body(const StigiImage *img, uint32_t unit_idx, const c
   }
   ctx_emit2(&ctx, "returnOf", col_sym(exit_pt), col_sym(ret_v.sym));
   ctx_emit1(&ctx, "exit", col_sym(exit_pt));
+  /* S142: the def owes the exit `at` state of each capability parameter at its exit point */
+  for (uint32_t i = 0; i < ctx.cap_count; i++) {
+    StigiStr exit_state = {NULL, 0};
+    if (ctx.caps[i].from_handle || ctx.caps[i].binder.len == 0 ||
+        !def_head_state_of(h, ctx.caps[i].binder, true, &exit_state)) {
+      continue;
+    }
+    ctx_emit4(&ctx, "exitStateOwed", col_sym(ext_new_op(&ctx)), col_sym(ctx.caps[i].prov_sym), col_sym(exit_pt),
+              col_sym(ctx_strdup(&ctx, exit_state.ptr, exit_state.len)));
+  }
   ext_emit_scope_spans(&ctx);
 
   Status ret = ctx.err;

@@ -808,6 +808,87 @@ int main(void) {
     stigi_door_free(&ddoor);
   }
 
+  /* S142 (capabilities.md 4): a def receiving a stateful capability states its entry and exit with at(c, S), or with
+   * no at fact preserves the state and may call only state-preserving operations; a call of an at def is a state
+   * transition of the caller */
+  {
+    const char *pipe_cap =
+        "// prompt: a pipe that is open until it is shut.\n"
+        "pub capability Demo.Pipe:\n"
+        "  state Open, Closed\n"
+        "  start Open\n"
+        "  stop Closed\n"
+        "  def peek() <at(self, Open)>: Bool <at(self, Open)>\n"
+        "  def shut() <at(self, Open)>: Bool <at(self, Closed)>\n";
+    const char *pipe_handler =
+        "// prompt: an in-memory pipe.\n"
+        "pub handler Demo.MemPipe(ready: Bool) for Demo.Pipe:\n"
+        "  def peek(): Bool = ready\n"
+        "  def shut(): Bool = ready\n";
+    const char *drain_ok =
+        "// prompt: peek an open pipe after a bounded number of tail steps.\n"
+        "pub def Demo.drain {pipe: Demo.Pipe} (limit: U64) <at(pipe, Open), decreases(limit)>: Bool <at(pipe, Open)> =\n"
+        "  if limit < 1 then pipe.peek() else Demo.drain{pipe}(limit - 1)\n";
+    const char *look_ok =
+        "// prompt: peek an open pipe; with no exit state stated it leaves the pipe open.\n"
+        "pub def Demo.look {pipe: Demo.Pipe} (limit: U64) <at(pipe, Open), below(limit, 10)>: Bool =\n"
+        "  pipe.peek()\n";
+    const char *look_no_state =
+        "// prompt: peek a pipe with no state stated for it.\n"
+        "pub def Demo.look {pipe: Demo.Pipe} (limit: U64) <below(limit, 10)>: Bool =\n"
+        "  pipe.peek()\n";
+    const char *main_ok =
+        "// prompt: drain and look at a pipe a bounded number of steps, then shut it.\n"
+        "pub def main(limit: U64) <below(limit, 10)>: Bool =\n"
+        "  handle pipe = Demo.MemPipe(true)\n"
+        "  val drained: Bool = Demo.drain{pipe}(limit)\n"
+        "  val looked: Bool = Demo.look{pipe}(2)\n"
+        "  pipe.shut() && drained && looked\n";
+    const char *drain_unknown =
+        "// prompt: a state name that the pipe does not have.\n"
+        "pub def Demo.drain {pipe: Demo.Pipe} (limit: U64) <at(pipe, Opn), decreases(limit)>: Bool <at(pipe, Open)> =\n"
+        "  if limit < 1 then pipe.peek() else Demo.drain{pipe}(limit - 1)\n";
+    const char *drain_shuts =
+        "// prompt: promise an open pipe on exit and shut it.\n"
+        "pub def Demo.drain {pipe: Demo.Pipe} (limit: U64) <at(pipe, Open), below(limit, 10)>: Bool <at(pipe, Open)> =\n"
+        "  pipe.shut()\n";
+    const char *look_shuts =
+        "// prompt: an entry-only open pipe def that shuts the pipe.\n"
+        "pub def Demo.look {pipe: Demo.Pipe} (limit: U64) <at(pipe, Open), below(limit, 10)>: Bool =\n"
+        "  pipe.shut()\n";
+    const char *main_late =
+        "// prompt: drain a pipe after it is shut.\n"
+        "pub def main(): Bool =\n"
+        "  handle pipe = Demo.MemPipe(true)\n"
+        "  val looked: Bool = Demo.look{pipe}(2)\n"
+        "  val shutFirst: Bool = pipe.shut()\n"
+        "  shutFirst && looked && Demo.drain{pipe}(3)\n";
+    struct { const char *label; const char *drain; const char *look; const char *main; const char *code; } cases[6] = {
+        {"S142 at(c, Open) tail recursion and an entry-only def accepted", drain_ok, look_ok, main_ok, NULL},
+        {"S142 unknown state name rejected with unknown-state", drain_unknown, look_ok, main_ok, "unknown-state"},
+        {"S142 exit at(c, Open) after shut rejected with exit-unproved", drain_shuts, look_ok, main_ok, "exit-unproved"},
+        {"S142 entry-only at(c, Open) def that shuts rejected with exit-unproved", drain_ok, look_shuts, main_ok,
+         "exit-unproved"},
+        {"S142 def with no state for its pipe calling peek rejected with op-not-allowed", drain_ok, look_no_state,
+         main_ok, "op-not-allowed"},
+        {"S142 caller draining a shut pipe rejected with op-not-allowed", drain_ok, look_ok, main_late,
+         "op-not-allowed"},
+    };
+    for (int k = 0; k < 6; k++) {
+      const char *psrcs[5] = {pipe_cap, pipe_handler, cases[k].drain, cases[k].look, cases[k].main};
+      size_t plens[5];
+      for (int i = 0; i < 5; i++) plens[i] = strlen(psrcs[i]);
+      StigiDoorResult pr;
+      stigi_door_result_init(&pr);
+      CHECK(stigi_door_check(&door, psrcs, plens, 5, &pr, &d) == STIGI_OK, cases[k].label);
+      bool want_ok = cases[k].code == NULL;
+      bool got = want_ok ? pr.accepted : (!pr.accepted && has_reject_code(&pr, cases[k].code));
+      if (!got) dump_rejects(cases[k].label, &pr);
+      CHECK(got, cases[k].label);
+      stigi_door_result_free(&pr);
+    }
+  }
+
   /* 9h. Phase 2.1 oracles: fact-idle, (A || B) && C, val Ctor, nominal type T = U <facts>, protocol-only sigs */
   {
     StigiDoor p2door;

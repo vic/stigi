@@ -3292,7 +3292,10 @@ static Status walk_fact_item(ResCtx *ctx, const StigiFactItem *it, bool is_rule)
     st = resolve_ref(ctx, it->atom_name, it->span, false);
     if (st != STIGI_OK) return st;
     if (!is_rule) {
-      for (uint32_t i = 0; i < it->arg_count; i++) {
+      /* at(c, S): S is a state of the capability of c (stateRef, unknown-state), never a value name (S142) */
+      bool state_atom = it->arg_count == 2 && (str_eq_ss(it->atom_name, (StigiStr){"at", 2}) ||
+                                               str_eq_ss(it->atom_name, (StigiStr){"Stigi.Facts.at", 14}));
+      for (uint32_t i = 0; i < (state_atom ? 1U : it->arg_count); i++) {
         st = walk_expr(ctx, it->args[i]);
         if (st != STIGI_OK) return st;
       }
