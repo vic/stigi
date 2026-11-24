@@ -21,6 +21,27 @@ pub def Bytes.countMatches(size: U64, block: Array[U8](size), target: U8): U64 <
 
 No bounds check and no overflow check in the emitted C: both are proved. The [two-minute tour](https://stigi.org/start/tour/) walks through what the door knows about this little function.
 
+Resources follow rules too. A file can only be read while it is open, and it must be closed on every path:
+
+```scala
+// prompt: read the first bytes of an open file, then close it.
+pub def Storage.readFirst {file: Stigi.File} <at(file, Open)> (size: U64, buffer: Array[U8](size))
+    : Stigi.File.Read <at(file, Closed)> =
+  val outcome = file.read(size, buffer)
+  val _ = file.close()
+  outcome
+```
+
+Swap the two middle lines and nothing runs. The door answers:
+
+```text
+rejected {Storage.readFirst}: op-not-allowed at Storage.readFirst.body[1]
+  need:  at(file, Open)
+  found: at(file, Closed)
+```
+
+Forget `close()` on any path, and you get `capability-not-ended` instead. Read about [resource protocols](https://stigi.org/language/protocols/).
+
 > [!NOTE]
 > **Stigi is a work in progress.** It is an ambitious project, and I build it in the open, on my own time and with my own money. If you want to see it happen sooner, [sponsoring it](https://github.com/sponsors/vic) is the most direct way to help. Leaving a star, telling a friend, or trying it on a real problem and [telling us what breaks](https://github.com/vic/stigi/issues) helps a lot too. Thank you :)
 

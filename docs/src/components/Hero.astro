@@ -29,22 +29,47 @@ const glyphs: Record<string, GlyphName> = { 'right-arrow': 'arrow', heart: 'hear
 		}
 	</div>
 
-	<figure class="window" aria-label="A Stigi unit and the door's reply">
+	<figure class="window" aria-label="Stigi units and the door's replies">
+		<input type="radio" name="hero-tab" id="hero-tab-bounds" class="tab-input" checked />
+		<input type="radio" name="hero-tab" id="hero-tab-file" class="tab-input" />
 		<div class="bar">
 			<span class="dots"><i></i><i></i><i></i></span>
-			<span class="file">Demo/Table/peek.sc</span>
+			<label for="hero-tab-bounds" class="tab tab-bounds">peek.sc</label>
+			<label for="hero-tab-file" class="tab tab-file">readFirst.sc</label>
 		</div>
-		<pre class="code"><code><span class="cm">// prompt: the entry of a table at an index.</span>
+
+		<div class="panels">
+		<div class="panel panel-bounds">
+			<pre class="code"><code><span class="cm">// prompt: the entry of a table at an index.</span>
 <span class="kw">def</span> <span class="fn">Demo.Table.peek</span>(count: <span class="ty">U64</span>,
     table: <span class="ty">Array</span>[<span class="ty">U64</span>](count), index: <span class="ty">U64</span>): <span class="ty">U64</span> =
   table(index)</code></pre>
-		<div class="reply">
-			<pre><code><span class="bad">rejected</span> &#123;Demo.Table.peek&#125;: <span class="code-name">index-unproved</span>
+			<div class="reply">
+				<pre><code><span class="bad">rejected</span> &#123;Demo.Table.peek&#125;: <span class="code-name">index-unproved</span>
   need: <span class="fact">below(index, count)</span>
   fix1 <span class="ok">(checked)</span>: add entry fact <span class="fact">&lt;below(index, count)&gt;</span>
 
 <span class="prompt">$</span> stigi accept fix1
 <span class="ok">admitted</span> Demo.Table.peek   laws ok   tests 3/3</code></pre>
+			</div>
+		</div>
+
+		<div class="panel panel-file">
+			<pre class="code"><code><span class="cm">// prompt: read the first bytes of an open file, then close it.</span>
+<span class="kw">def</span> <span class="fn">Storage.readFirst</span> &#123;file: <span class="ty">Stigi.File</span>&#125; <span class="fact">&lt;at(file, Open)&gt;</span>
+    (size: <span class="ty">U64</span>, buffer: <span class="ty">Array</span>[<span class="ty">U8</span>](size))
+    : <span class="ty">Stigi.File.Read</span> <span class="fact">&lt;at(file, Closed)&gt;</span> =
+  <span class="kw">val</span> _ = file.close()
+  file.read(size, buffer)</code></pre>
+			<div class="reply">
+				<pre><code><span class="bad">rejected</span> &#123;Storage.readFirst&#125;: <span class="code-name">op-not-allowed</span>
+  need:  <span class="fact">at(file, Open)</span>
+  found: <span class="fact">at(file, Closed)</span>
+
+the file is read after close: nothing runs,
+nothing enters the image.</code></pre>
+			</div>
+		</div>
 		</div>
 	</figure>
 </div>
@@ -140,6 +165,7 @@ const glyphs: Record<string, GlyphName> = { 'right-arrow': 'arrow', heart: 'hear
 
 	/* the "screenshot": an editor window with the door's reply under the code */
 	.window {
+		position: relative;
 		margin: 0;
 		min-width: 0;
 		border: 1px solid transparent;
@@ -168,6 +194,56 @@ const glyphs: Record<string, GlyphName> = { 'right-arrow': 'arrow', heart: 'hear
 	.dots {
 		display: flex;
 		gap: 0.4rem;
+		margin-right: 0.25rem;
+	}
+
+	/* CSS-only tabs: a radio per tab, the checked one shows its panel */
+	.tab-input {
+		position: absolute;
+		opacity: 0;
+		pointer-events: none;
+	}
+
+	.tab {
+		padding: 0.2rem 0.7rem;
+		border-radius: 0.4rem;
+		font-family: var(--font-victor-mono);
+		font-size: 0.75rem;
+		color: var(--sl-color-gray-3);
+		cursor: pointer;
+		transition:
+			background 0.2s ease,
+			color 0.2s ease;
+	}
+
+	.tab:hover {
+		color: var(--sl-color-white);
+	}
+
+	#hero-tab-bounds:checked ~ .bar .tab-bounds,
+	#hero-tab-file:checked ~ .bar .tab-file {
+		color: var(--sl-color-white);
+		background: color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
+	}
+
+	#hero-tab-bounds:focus-visible ~ .bar .tab-bounds,
+	#hero-tab-file:focus-visible ~ .bar .tab-file {
+		outline: 2px solid var(--sl-color-accent);
+		outline-offset: 1px;
+	}
+
+	#hero-tab-bounds:checked ~ .panels .panel-file,
+	#hero-tab-file:checked ~ .panels .panel-bounds {
+		visibility: hidden;
+	}
+
+	/* both panels share one cell, so the window keeps the height of the taller one */
+	.panels {
+		display: grid;
+	}
+
+	.panel {
+		grid-area: 1 / 1;
 	}
 
 	.dots i {
@@ -189,11 +265,6 @@ const glyphs: Record<string, GlyphName> = { 'right-arrow': 'arrow', heart: 'hear
 		background: var(--sl-color-green);
 	}
 
-	.file {
-		font-family: var(--font-victor-mono);
-		font-size: 0.75rem;
-		color: var(--sl-color-gray-3);
-	}
 
 	pre {
 		margin: 0;
