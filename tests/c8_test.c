@@ -584,6 +584,105 @@ int main(void) {
     }
   }
 
+  {
+    /* types.md 3: a field's length term names the case's fields; a pattern binds them under its own names, so the
+     * length of a pattern-bound array (mask bound, tryGrow old length) names the binders. `other` is bound as `size`
+     * so a bound naming the field instead of the binder is wrong, not undeclared; a `_` length field is read into a
+     * hidden local `_len_size`, so tryGrow still copies the old elements. */
+    const char *box_src =
+        "// prompt: a box of one dependent-length array.\n"
+        "enum Demo.Box:\n"
+        "  case Boxed(size: U64, other: U64, cells: Array[U64](size))\n";
+    const char *wrap_src =
+        "// prompt: a wrapped box.\n"
+        "enum Demo.Wrap:\n"
+        "  case Wrapped(box: Demo.Box)\n";
+    const char *pair_src =
+        "// prompt: a run sized by the sum of two counts.\n"
+        "enum Demo.Pair:\n"
+        "  case Paired(size: U64, other: U64, cells: Array[U64](size + other)) <below(size, 1000), below(other, 1000)>\n";
+    const char *test_src =
+        "// prompt: the second boxed word is seven.\n"
+        "val Demo.Tests.boxSuite {Stigi.Test}: Stigi.Test.Result =\n"
+        "  Stigi.Test.expect(Demo.boxSecond{Stigi.Region}(), 7, \"boxed word reads back\")\n";
+#define BOX_DRIVE(value)                                                                \
+  "// prompt: seven when the second word of a run of sevens reads back, else zero.\n" \
+  "def Demo.boxSecond {region: Stigi.Region} (): U64 <lessOrEqual(0, result)> =\n"     \
+  "  val Filled(words) = Array.tryFill[U64]{region}(3, 7) else\n"                       \
+  "    case FillFailed => 0\n"                                                          \
+  "  Demo.cellAt" value "\n"
+    struct {
+      const char *def;
+      const char *drive;
+      const char *extra;
+      const char *bound;
+    } cases[5] = {
+        {"// prompt: the cell at a position of a box, or its other number.\n"
+         "def Demo.cellAt(box: Demo.Box, at: U64): U64 <lessOrEqual(0, result)> =\n"
+         "  box match\n"
+         "    case Boxed(count, size, cells) => if at < count then cells(at) else size\n",
+         BOX_DRIVE("(Boxed(3, 0, words), 1)"), box_src, "(uint64_t)(count))"},
+        {"// prompt: the cell at a position of a box, or its other number.\n"
+         "def Demo.cellAt(box: Demo.Box, at: U64): U64 <lessOrEqual(0, result)> =\n"
+         "  val Boxed(count, size, cells) = box\n"
+         "  if at < count then cells(at) else size\n",
+         BOX_DRIVE("(Boxed(3, 0, words), 1)"), box_src, "(uint64_t)(count))"},
+        {"// prompt: the cell at a position of a wrapped box, or its other number.\n"
+         "def Demo.cellAt(wrap: Demo.Wrap, at: U64): U64 <lessOrEqual(0, result)> =\n"
+         "  wrap match\n"
+         "    case Wrapped(Boxed(count, size, cells)) => if at < count then cells(at) else size\n",
+         BOX_DRIVE("(Wrapped(Boxed(3, 0, words)), 1)"), wrap_src, "(uint64_t)(patField1))"},
+        {"// prompt: the cell at a position of a box grown to eight cells, or its other number.\n"
+         "def Demo.cellAt {region: Stigi.Region} (box: Demo.Box, at: U64): U64 <lessOrEqual(0, result)> =\n"
+         "  box match\n"
+         "    case Boxed(_, size, cells) =>\n"
+         "      Array.tryGrow{region}(cells, 8, 0) match\n"
+         "        case Grown(grown) => if at < 8 then grown(at) else size\n"
+         "        case GrowFailed(_) => size\n",
+         BOX_DRIVE("{region}(Boxed(3, 0, words), 1)"), box_src, " = (uint64_t)(_len_size);"},
+        {"// prompt: the cell at a position of a paired run grown to eight cells, or its other number.\n"
+         "def Demo.cellAt {region: Stigi.Region} (pair: Demo.Pair, at: U64): U64 <lessOrEqual(0, result)> =\n"
+         "  pair match\n"
+         "    case Paired(other, size, cells) =>\n"
+         "      Array.tryGrow{region}(cells, 8, 0) match\n"
+         "        case Grown(grown) => if at < 8 then grown(at) else size\n"
+         "        case GrowFailed(_) => size\n",
+         BOX_DRIVE("{region}(Paired(3, 0, words), 1)"), pair_src, " = (uint64_t)((other + size));"}};
+#undef BOX_DRIVE
+    for (int k = 0; k < 5; k++) {
+      StigiDoor bd;
+      Diag bdg;
+      diag_clear(&bdg);
+      CHECK(stigi_door_init(&bd, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &bdg) == STIGI_OK,
+            "binder door init");
+      const char *srcs[5] = {cases[k].extra, cases[k].def, cases[k].drive, test_src, box_src};
+      size_t lens[5];
+      for (int i = 0; i < 5; i++) lens[i] = strlen(srcs[i]);
+      StigiDoorResult br;
+      stigi_door_result_init(&br);
+      CHECK(stigi_door_submit(&bd, srcs, lens, k == 2 ? 5U : 4U, &br, &bdg) == STIGI_OK && br.accepted,
+            "binder-rename program admitted");
+      for (uint32_t i = 0; i < br.reject_count; i++) {
+        fprintf(stderr, "  reject[%d]: subj=%s code=%s msg=%s\n", k, br.rejects[i].subject, br.rejects[i].code,
+                br.rejects[i].msg);
+      }
+      stigi_door_result_free(&br);
+      char *bc = NULL;
+      size_t bl = 0;
+      StigiEmitStats bs;
+      Status bst = stigi_emit_c(&bd, STIGI_EMIT_TEST, &bc, &bl, &bs, &bdg);
+      CHECK(bst == STIGI_OK && bc != NULL, "binder emit");
+      if (bst != STIGI_OK) fprintf(stderr, "  binder[%d] emit: %s\n", k, bdg.msg);
+      if (getenv("STIGI_C8_BINDER_DUMP") != NULL && bc != NULL) fprintf(stderr, "---- binder[%d]\n%s\n", k, bc);
+      CHECK(bc != NULL && strstr(bc, cases[k].bound) != NULL && strstr(bc, "(uint64_t)(size))") == NULL,
+            "types.md 3: the length of a pattern-bound array names the binders of its length fields");
+      CHECK(bc != NULL && clang_compiles(bc, bl, "/tmp/stigi-c8-binder.c"),
+            "clang compiles C for an array bound under renamed binders");
+      free(bc);
+      stigi_door_free(&bd);
+    }
+  }
+
   /* 2. CRASH LINE, tenet gate on emitted C, zero GNU builtins, 1-word nullable-ptr, tail-tag */
   CHECK(c1 != NULL && strstr(c1, "abort(") == NULL, "CRASH LINE: zero abort(");
   CHECK(c1 != NULL && strstr(c1, "exit(") == NULL, "CRASH LINE: zero exit(");

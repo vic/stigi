@@ -582,6 +582,7 @@ typedef struct {
   uint32_t mono_tp_count;
   MonoList *mono_list;
   Arena *mono_arena;
+  Arena term_arena; /* case-binder length terms (case_binder_len); zeroed = empty */
 } EmitCtx;
 
 static void emit_ctx_pop_vars(EmitCtx *ctx, uint32_t saved_count) {
@@ -605,6 +606,7 @@ static void emit_ctx_free(EmitCtx *ctx) {
   free(ctx->param_cnames);
   ctx->param_cnames = NULL;
   ctx->param_cname_count = 0;
+  arena_free(&ctx->term_arena);
 }
 
 static const EmitVar *emit_find_var(const EmitCtx *ctx, StigiStr name) {
@@ -770,6 +772,90 @@ static EmitVar *emit_register_var(EmitCtx *ctx, StigiStr name, const StigiType *
   return v;
 }
 
+
+/* A case pattern's binders over one scrutinee. `src` is the C text of the case payload up to a field name. */
+typedef struct {
+  const StigiEnumCase *ec;
+  const StigiStr *binders;
+  uint32_t binder_count;
+  uint32_t type_uidx;
+  const char *src;
+  uint32_t first_var; /* var_count before the pattern; its hidden length locals sit above it */
+} CaseBind;
+
+static const StigiExpr *case_len_fail(EmitCtx *ctx, const char *why) {
+  ctx->fail_closed = true;
+  (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg, "%s in '%s'", why, ctx->img->units[ctx->uidx].name);
+  return NULL;
+}
+
+/* The name of field f under the pattern: its binder, or for a `_` binder a hidden local `_len_<field>` (no source
+ * identifier starts with `_`) read from the scrutinee once per pattern. Empty name = out of memory. */
+static StigiStr case_field_name(EmitCtx *ctx, const CaseBind *cb, uint32_t f) {
+  StigiStr none = {NULL, 0};
+  if (f < cb->binder_count && !(cb->binders[f].len == 1 && cb->binders[f].ptr[0] == '_')) return cb->binders[f];
+  if (cb->src == NULL) return none;
+  StigiStr field = cb->ec->fields[f].name;
+  char *buf = arena_alloc(&ctx->term_arena, (size_t)field.len + 5U);
+  if (buf == NULL) return none;
+  memcpy(buf, "_len_", 5U);
+  memcpy(buf + 5, field.ptr, field.len);
+  StigiStr name = {buf, field.len + 5U};
+  for (uint32_t i = cb->first_var; i < ctx->var_count; i++) {
+    if (str_eq_ss(ctx->vars[i].name, name)) return name;
+  }
+  EmitVar *v = emit_register_var(ctx, name, cb->ec->fields[f].type, cb->type_uidx, false);
+  if (v == NULL) return none;
+  eb_cstr(ctx->b, "  ");
+  emit_c_type(ctx->b, ctx->img, cb->type_uidx, cb->ec->fields[f].type, 0);
+  eb_cstr(ctx->b, " const ");
+  emit_var_cname(ctx->b, v);
+  eb_fmt(ctx->b, " = %s", cb->src);
+  eb_c_ident(ctx->b, field);
+  eb_cstr(ctx->b, ";\n  (void)");
+  emit_var_cname(ctx->b, v);
+  eb_cstr(ctx->b, ";\n");
+  return name;
+}
+
+/* types.md 3: a case field's length term names the case's fields over literals, top-level vals and linear ops, and a
+ * pattern binds the fields under its own names, so a binder's length term is its field's term with every field name
+ * replaced by that field's name under the pattern. Any other term kind, or out of memory, fails closed (NULL). */
+static const StigiExpr *case_binder_len(EmitCtx *ctx, const CaseBind *cb, const StigiExpr *t) {
+  if (t == NULL) return NULL;
+  switch (t->kind) {
+    case STIGI_EXPR_LIT_INT:
+    case STIGI_EXPR_GLOBAL:
+      return t;
+    case STIGI_EXPR_LOCAL: {
+      uint32_t f = 0;
+      while (f < cb->ec->field_count && !str_eq_ss(cb->ec->fields[f].name, t->u.ident.name)) f++;
+      if (f == cb->ec->field_count) return t;
+      StigiStr name = case_field_name(ctx, cb, f);
+      if (name.ptr == NULL) return case_len_fail(ctx, "out of memory renaming a case field length term");
+      if (str_eq_ss(name, t->u.ident.name)) return t;
+      StigiExpr *r = arena_alloc(&ctx->term_arena, sizeof *r);
+      if (r == NULL) return case_len_fail(ctx, "out of memory renaming a case field length term");
+      *r = *t;
+      r->u.ident.name = name;
+      return r;
+    }
+    case STIGI_EXPR_BINOP: {
+      const StigiExpr *l = case_binder_len(ctx, cb, t->u.binop.lhs);
+      const StigiExpr *rh = case_binder_len(ctx, cb, t->u.binop.rhs);
+      if (l == NULL || rh == NULL) return NULL;
+      if (l == t->u.binop.lhs && rh == t->u.binop.rhs) return t;
+      StigiExpr *r = arena_alloc(&ctx->term_arena, sizeof *r);
+      if (r == NULL) return case_len_fail(ctx, "out of memory renaming a case field length term");
+      *r = *t;
+      r->u.binop.lhs = (StigiExpr *)l;
+      r->u.binop.rhs = (StigiExpr *)rh;
+      return r;
+    }
+    default:
+      return case_len_fail(ctx, "case field length term is not a literal, top-level val, binder or linear op");
+  }
+}
 /* An untyped alias `val x = y` / `var x = y` of an array or cell local keeps y's identity, as the extractor's Val and
  * Var binders do (nested patterns bind `val cells = patFieldN`). Searches below `v`, so a shadowing alias never finds
  * itself. */
@@ -1711,7 +1797,11 @@ static void emit_alloc_match(EmitCtx *ctx, const StigiExpr *e, int akind,
       free(olen_b.buf);
       eb_cstr(ctx->b, ")");
     } else {
-      eb_cstr(ctx->b, "UINT64_C(0)");
+      /* an unknown old length never becomes 0: that would drop every old element */
+      ctx->fail_closed = true;
+      (void)snprintf(ctx->fail_msg, sizeof ctx->fail_msg,
+                     "cannot emit Array.tryGrow: missing array length expression in '%s'",
+                     ctx->img->units[ctx->uidx].name);
     }
     eb_cstr(ctx->b, ";\n  ");
     eb_mem(ctx->b, elem_ct.buf, elem_ct.len);
@@ -1966,12 +2056,24 @@ static void emit_match_core(EmitCtx *ctx, const StigiExpr *e, const char *lhs_va
       eb_cstr(ctx->b, "_");
       eb_str(ctx->b, ec->name);
       eb_cstr(ctx->b, ": {\n");
+      EmitBuf srcb;
+      memset(&srcb, 0, sizeof srcb);
+      eb_fmt(&srcb, eli.tag_in_tail ? "_sc%u." : "_sc%u.u.", sid);
+      eb_str(&srcb, ec->name);
+      eb_cstr(&srcb, ".");
       uint32_t saved = ctx->var_count;
+      const CaseBind cb = {ec, pat->fields, pat->field_count, (uint32_t)enum_uidx, srcb.buf, saved};
       for (uint32_t f = 0; f < pat->field_count && f < ec->field_count; f++) {
         if (pat->fields[f].len == 1 && pat->fields[f].ptr[0] == '_') continue;
         if (ast_type_is_void(ctx->img, (uint32_t)enum_uidx, ec->fields[f].type)) continue;
         EmitVar *v = emit_register_var(ctx, pat->fields[f], ec->fields[f].type,
                                        (uint32_t)enum_uidx, false);
+        if (v != NULL && v->is_array) {
+          uint32_t vi = (uint32_t)(v - ctx->vars);
+          const StigiExpr *len = case_binder_len(ctx, &cb, v->len_expr); /* may grow ctx->vars */
+          v = &ctx->vars[vi];
+          v->len_expr = len;
+        }
         if (v != NULL) {
           eb_cstr(ctx->b, "      ");
           emit_c_type(ctx->b, ctx->img, (uint32_t)enum_uidx, ec->fields[f].type, 0);
@@ -1988,6 +2090,7 @@ static void emit_match_core(EmitCtx *ctx, const StigiExpr *e, const char *lhs_va
           eb_cstr(ctx->b, ";\n");
         }
       }
+      free(srcb.buf);
       if (eff_lhs != NULL) {
         emit_assign_to(ctx, e->u.match_expr.arms[a].body, eff_lhs,
                        emit_tail_ret ? ctx->ret_scalar : hint);
@@ -2317,11 +2420,25 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
         const StigiDecl *ed = ctx->img->units[eidx].ast->decl;
         const StigiEnumCase *ec = &ed->u.enum_decl.cases[cidx];
         StigiEnumLayoutInfo eli = stigi_enum_layout_info(ctx->img, (uint32_t)eidx, NULL, 0);
+        uint32_t first = ctx->var_count;
+        EmitBuf srcb;
+        memset(&srcb, 0, sizeof srcb);
+        eb_fmt(&srcb, eli.tag_in_tail ? "%s." : "%s.u.", tname);
+        eb_str(&srcb, ec->name);
+        eb_cstr(&srcb, ".");
+        const CaseBind cb = {ec, e->u.val_stmt.pat.fields, e->u.val_stmt.pat.field_count, (uint32_t)eidx, srcb.buf,
+                             first};
         for (uint32_t f = 0; f < e->u.val_stmt.pat.field_count && f < ec->field_count; f++) {
           StigiStr fn = e->u.val_stmt.pat.fields[f];
           if (fn.len == 1 && fn.ptr[0] == '_') continue;
           if (ast_type_is_void(ctx->img, (uint32_t)eidx, ec->fields[f].type)) continue;
           EmitVar *v = emit_register_var(ctx, fn, ec->fields[f].type, (uint32_t)eidx, false);
+          if (v != NULL && v->is_array) {
+            uint32_t vi = (uint32_t)(v - ctx->vars);
+            const StigiExpr *len = case_binder_len(ctx, &cb, v->len_expr); /* may grow ctx->vars */
+            v = &ctx->vars[vi];
+            v->len_expr = len;
+          }
           if (v != NULL) {
             eb_cstr(ctx->b, "  ");
             emit_c_type(ctx->b, ctx->img, (uint32_t)eidx, ec->fields[f].type, 0);
@@ -2344,6 +2461,7 @@ static void emit_stmt_or_ret(EmitCtx *ctx, const StigiExpr *e, bool is_tail, boo
             }
           }
         }
+        free(srcb.buf);
       }
       free(ctype_b.buf);
       if (is_tail && is_void && ctx->is_tail_loop) eb_cstr(ctx->b, "  return;\n");
