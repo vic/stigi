@@ -14,6 +14,8 @@ pub def Stigi.Store.runCli {region: Stigi.Region, clock: Stigi.Clock, Stigi.Mut}
       case CliRunContracts => Stigi.Posix.verifyContracts{region, clock}()
       case CliCheckTree(dirBeg, dirFin) =>
         if dirFin <= 16384 then Stigi.Store.verifyTree{region}(16384, cmdBuf, dirBeg, dirFin) else RunCliError
+      case CliVerifyParse(dirBeg, dirFin) =>
+        if dirFin <= 16384 then Stigi.Store.verifyParseTree{region}(16384, cmdBuf, dirBeg, dirFin) else RunCliError
       case CliLoadEmit(dirBeg, dirFin, outBeg, outFin) =>
         if dirFin <= 16384 && outFin <= 16384 then
           val Filled(outPath) = Array.tryFill[U8]{region}(4096, 0) else

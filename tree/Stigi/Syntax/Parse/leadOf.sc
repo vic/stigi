@@ -1,0 +1,19 @@
+// prompt: classify the token kind that starts an expression or a statement.
+def Stigi.Syntax.Parse.leadOf(kind: Stigi.Lex.TokenKind): Stigi.Syntax.Parse.Lead =
+  case TokInt => StartsLiteral(IntLiteral)
+  case TokChar => StartsLiteral(CharLiteral)
+  case TokStr => StartsLiteral(StringLiteral)
+  case TokTrue => StartsLiteral(TrueLiteral)
+  case TokFalse => StartsLiteral(FalseLiteral)
+  case TokIdent | TokUpper | TokState | TokStart | TokStop => StartsName
+  case TokLeftParen => StartsParen
+  case TokBang => StartsPrefix(LogicNot)
+  case TokMinus => StartsPrefix(Negate)
+  case TokIf => StartsIf
+  case TokWhile => StartsWhile
+  case TokVal => StartsVal
+  case TokVar => StartsVar
+  case TokHandle => StartsHandle
+  case TokAt => StartsAssert
+  case TokDef | TokEnum | TokType | TokTrait | TokGiven | TokCapability | TokHandler | TokExtern | TokRelation | TokRule | TokLemma | TokPub => StartsDecl
+  case TokCase | TokMatch | TokThen | TokElse | TokLoopBody | TokFor | TokIs | TokPipe | TokArrow | TokColonAssign | TokEqual | TokNotEqual | TokLessEqual | TokGreatEqual | TokLogicAnd | TokLogicOr | TokBar | TokLess | TokGreat | TokPlus | TokStar | TokSlash | TokPercent | TokAssign | TokColon | TokComma | TokDot | TokDotDot | TokRightParen | TokLeftBrack | TokRightBrack | TokLeftBrace | TokRightBrace | TokNewline | TokEnd => StartsNothing

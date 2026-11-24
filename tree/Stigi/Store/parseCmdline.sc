@@ -9,6 +9,8 @@ def Stigi.Store.parseCmdline(bufCap: Stigi.ByteCap, buf: Array[U8](bufCap), bufL
   if dirStart == dirEnd || bufCap < flagEnd then CliInvalid else
     if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 7, "--check") then
       if afterDir < bufLen then CliInvalid else CliCheckTree(dirStart, dirEnd)
+    else if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 14, "--verify-parse") then
+      if afterDir < bufLen then CliInvalid else CliVerifyParse(dirStart, dirEnd)
     else if Stigi.Lex.sliceEquals(bufCap, buf, flagStart, flagEnd, 6, "--load") then
       val ArgAt(emitStart, emitEnd, afterEmit) = Stigi.Store.nextArg(bufCap, buf, bufLen, afterDir) else
         case ArgsEnd => CliInvalid

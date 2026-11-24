@@ -1,5 +1,5 @@
 // prompt: write an entire source slice to an opened descriptor via typestate Stigi.File and close it once.
-def Stigi.Posix.writeToDesc {region: Stigi.Region, Stigi.Mut} (desc: I32, srcCap: Stigi.EmitCap, srcBuf: Array[U8](srcCap), srcLen: U64) <lessOrEqual(srcLen, srcCap)>: Stigi.RunOutcome =
+pub def Stigi.Posix.writeToDesc {region: Stigi.Region, Stigi.Mut} (desc: I32, srcCap: Stigi.EmitCap, srcBuf: Array[U8](srcCap), srcLen: U64) <lessOrEqual(srcLen, srcCap)>: Stigi.RunOutcome =
   handle outFile = Stigi.Posix.File(desc)
   val Filled(chunkBuf) = Array.tryFill[U8]{region}(4096, 0) else
     case FillFailed =>

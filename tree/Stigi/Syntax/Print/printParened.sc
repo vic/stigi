@@ -1,0 +1,3 @@
+// prompt: print a node, in parentheses when asked.
+def Stigi.Syntax.Print.printParened {Stigi.Mut} (tables: Stigi.Syntax.Tables, node: Stigi.Syntax.NodeAt, parens: Bool, pen: Stigi.Syntax.Print.Pen, indent: U64, depth: U64) <lessOrEqual(depth, Stigi.Limit.maxParseDepth), decreases(depth)>: Stigi.Syntax.Print.Pen =
+  if depth < 1 then PenFailed(PrintTooDeep) else if parens then Stigi.Syntax.Print.putLiteral(tables, Stigi.Syntax.Print.printNode(tables, node, Stigi.Syntax.Print.putLiteral(tables, pen, 1, "("), indent, depth - 1), 1, ")") else Stigi.Syntax.Print.printNode(tables, node, pen, indent, depth - 1)
