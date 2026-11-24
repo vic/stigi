@@ -40,6 +40,21 @@ THEORY SHEET: Payments.Worker.main   (312 units collapsed, 0 ambient I/O)
 
 A full sheet has five views: authority and envelope, checked summary, protocols, laws with decision tables, and an information-flow matrix. Each is derived from facts the door already proved.
 
+## Where data can flow
+
+The last view answers a question reviewers care about a lot: can this secret end up in that log? Stigi tracks how values move between capabilities, through both data and control flow, and draws a matrix from sources to sinks:
+
+```text
+[5. INFORMATION-FLOW MATRIX — PROVED]
+  Source \ Sink      | LedgerFile.write | Socket.write | AuditLog.write
+  -------------------+------------------+--------------+---------------
+  Socket.read        | YES              | YES          | YES
+  Config.secretKey   | NO (disjoint)    | YES (TLS)    | NO (disjoint)
+  Clock.monotonic    | NO (disjoint)    | NO (disjoint)| YES
+```
+
+Every `NO` says exactly what it rests on, so you know how strong it is.
+
 ## Zooming out never lies
 
 Like abstraction in static analysis, zooming out forgets details but never invents a guarantee. `stigi zoom` goes from this one screen down to the code, one level at a time.
