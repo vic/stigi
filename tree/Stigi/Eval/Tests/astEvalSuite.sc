@@ -14,7 +14,9 @@ val Stigi.Eval.Tests.astEvalSuite {Stigi.Test}: Stigi.Test.Result =
       case LexSyntaxError(_, _) => false
     val ParsedUnit(header, nodeCount) = Stigi.Parse.parseUnit(32, exprSrc, 32, toks, tokCount, 32, nodes) else
       case ParseFailed(_) => false
-    val UnitHeader(_, _, _, _, _, _, rootIdx) = header
+    val UnitHeader(_, _, _, _, _, _, root) = header
+    val ExprRoot(rootIdx) = root else
+      case NonExprBody => false
     if rootIdx < nodeCount && nodeCount <= 32 then
       Stigi.Eval.evalAst{Stigi.Region}(32, exprSrc, 32, toks, tokCount, 32, nodes, nodeCount, rootIdx) match
         case ValWord(num) => num == 42

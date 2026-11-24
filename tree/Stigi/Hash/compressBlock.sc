@@ -1,16 +1,7 @@
-// prompt: compress one sixty-four-byte BLAKE3 block into eight chaining words.
-def Stigi.Hash.compressBlock {region: Stigi.Region, Stigi.Mut} (chain: Array[U32](8), blockWords: Array[U32](16), counter: U64, blockLen: U32, flags: U32) <lessOrEqual(blockLen, 64)>: Bool =
-  val Filled(state) = Array.tryFill[U32]{region}(16, U32.ofU64(0)) else
-    case FillFailed => false
-  val Filled(msg) = Array.tryFill[U32]{region}(16, U32.ofU64(0)) else
-    case FillFailed => false
-  val Filled(scratch) = Array.tryFill[U32]{region}(16, U32.ofU64(0)) else
-    case FillFailed => false
-  var idx: U64 = 0
-  while idx < 8 do
-    @<lessOrEqual(idx, 8)>
-    state(idx) := chain(idx)
-    idx = idx + 1
+// prompt: compress one sixty-four-byte BLAKE3 block of the work message into its eight chaining words.
+def Stigi.Hash.compressBlock {Stigi.Mut} (work: Stigi.Hash.Work, counter: U64, blockLen: U32, flags: U32) <lessOrEqual(blockLen, 64)>: Unit =
+  val Work(chain, block, state, msg, scratch, _, _) = work
+  Stigi.Array.copy(8, chain, 0, 8, 16, state, 0)
   state(8) := Stigi.Hash.initWord(0)
   state(9) := Stigi.Hash.initWord(1)
   state(10) := Stigi.Hash.initWord(2)
@@ -19,11 +10,7 @@ def Stigi.Hash.compressBlock {region: Stigi.Region, Stigi.Mut} (chain: Array[U32
   state(13) := U32.ofU64(U64.bitwiseAnd(U64.shiftRight(counter, 32), 0xffffffff))
   state(14) := blockLen
   state(15) := flags
-  var msgIdx: U64 = 0
-  while msgIdx < 16 do
-    @<lessOrEqual(msgIdx, 16)>
-    msg(msgIdx) := blockWords(msgIdx)
-    msgIdx = msgIdx + 1
+  Stigi.Array.copy(16, block, 0, 16, 16, msg, 0)
   var round: U64 = 0
   while round < 7 do
     @<lessOrEqual(round, 7)>
@@ -34,8 +21,5 @@ def Stigi.Hash.compressBlock {region: Stigi.Region, Stigi.Mut} (chain: Array[U32
   while outIdx < 8 do
     @<lessOrEqual(outIdx, 8)>
     val highIdx: U64 = outIdx + 8
-    if highIdx < 16 then
-      chain(outIdx) := U32.bitwiseXor(state(outIdx), state(highIdx))
-    else ()
+    if highIdx < 16 then chain(outIdx) := U32.bitwiseXor(state(outIdx), state(highIdx)) else ()
     outIdx = outIdx + 1
-  true

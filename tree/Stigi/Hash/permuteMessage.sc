@@ -3,12 +3,7 @@ def Stigi.Hash.permuteMessage {Stigi.Mut} (wordCount: U64, msg: Array[U32](wordC
   var slot: U64 = 0
   while slot < 16 do
     @<lessOrEqual(slot, 16)>
-    val srcSlot: U64 = Stigi.Hash.scheduleSlot(slot)
-    scratch(slot) := msg(srcSlot)
+    scratch(slot) := msg(Stigi.Hash.scheduleSlot(slot))
     slot = slot + 1
-  var copyIdx: U64 = 0
-  while copyIdx < 16 do
-    @<lessOrEqual(copyIdx, 16)>
-    msg(copyIdx) := scratch(copyIdx)
-    copyIdx = copyIdx + 1
+  Stigi.Array.copy(wordCount, scratch, 0, 16, wordCount, msg, 0)
   ()

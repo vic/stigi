@@ -1,9 +1,10 @@
-// prompt: verify parsing traits, piped expressions, tests, and canonical header printing via Writer.
+// prompt: verify parsing traits, piped expressions, tests, canonical header printing, and rejection of a malformed body.
 val Stigi.Parse.Tests.parser {Stigi.Test}: Stigi.Test.Result =
   Stigi.Parse.Laws.precedenceBound(TokPipe, 6)
   val defSrc: Array[U8](55) = "// prompt: demo.\npub def Demo.calc(x: U64) = a + b |> f"
   val traitSrc: Array[U8](43) = "// prompt: eq.\npub trait Demo.Eq [A: Type]:"
   val testSrc: Array[U8](49) = "// prompt: t.\nval Demo.Tests.one {Stigi.Test} = 1"
+  val badSrc: Array[U8](35) = "// prompt: b.\ndef A.b(): U64 = (1 +"
   val parseValid: Bool =
     val Filled(toks) = Array.tryFill[Stigi.Lex.Token]{Stigi.Region}(64, Token(TokEnd, 0, 0, 0, 0)) else
       case FillFailed => false
@@ -14,7 +15,9 @@ val Stigi.Parse.Tests.parser {Stigi.Test}: Stigi.Test.Result =
       case LexSyntaxError(_, _) => false
     val ParsedUnit(header, nodeCount) = Stigi.Parse.parseUnit(55, defSrc, 64, toks, tokCount, 64, nodes) else
       case ParseFailed(_) => false
-    val UnitHeader(defKind, defPub, _, _, _, _, rootIdx) = header
+    val UnitHeader(defKind, defPub, _, _, _, _, root) = header
+    val ExprRoot(rootIdx) = root else
+      case NonExprBody => false
     val rootValid: Bool =
       if rootIdx < 64 && nodeCount >= 4 then
         val Node(rootKind, _, _, _, _, _) = nodes(rootIdx)
@@ -33,5 +36,9 @@ val Stigi.Parse.Tests.parser {Stigi.Test}: Stigi.Test.Result =
     val ParsedUnit(suiteHeader, _) = Stigi.Parse.parseUnit(49, testSrc, 64, toks, suiteTokCount, 64, nodes) else
       case ParseFailed(_) => false
     val UnitHeader(suiteKind, _, _, _, _, _, _) = suiteHeader
-    rootValid && hdrMatch && traitKind == DeclTrait && suiteKind == DeclTest
-  Stigi.Test.expect(parseValid, true, "L0 parser must parse defs with pipes, traits, tests, and print canonical headers")
+    val LexDone(badTokCount) = Stigi.Lex.scanAll(35, badSrc, 35, 64, toks) else
+      case LexOverflow => false
+      case LexSyntaxError(_, _) => false
+    val badRejected: Bool = Stigi.Parse.parseUnit(35, badSrc, 64, toks, badTokCount, 64, nodes) is ParseFailed(_)
+    rootValid && hdrMatch && traitKind == DeclTrait && suiteKind == DeclTest && badRejected
+  Stigi.Test.expect(parseValid, true, "L0 parser must parse defs with pipes, traits, tests, print canonical headers, and reject a malformed body")
