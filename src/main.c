@@ -22,7 +22,8 @@ static void print_usage(void) {
          "  stigi-seed --serve <sock> [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --cc-socks <sock> [--peer <name>] [--from-mode prompting|bypass] [--load <dir>] [--user] [--rules <all.dl>]\n"
          "  stigi-seed --mcp [--socket <sock>] [--load <dir>] [--user] [--rules <all.dl>]\n"
-         "  stigi-seed --load <dir> --emit <out.c> [--user] [--rules <all.dl>]\n");
+         "  stigi-seed --load <dir> --emit <out.c> [--user] [--rules <all.dl>]\n"
+         "  stigi-seed --load <dir> --emit-test <out.c> [--user] [--rules <all.dl>]\n");
 }
 
 int main(int argc, char **argv) {
@@ -40,6 +41,8 @@ int main(int argc, char **argv) {
   const char *mcp_sock = NULL;
   const char *load_dir = NULL;
   const char *emit_path = NULL;
+  int emit_flags = 0;
+  StigiEmitProfile emit_profile = STIGI_EMIT_RELEASE;
   bool mcp_mode = false;
   bool kernel_mode = true;
 
@@ -80,6 +83,11 @@ int main(int argc, char **argv) {
       load_dir = argv[++i];
     } else if (strcmp(argv[i], "--emit") == 0 && i + 1 < argc) {
       emit_path = argv[++i];
+      emit_flags++;
+    } else if (strcmp(argv[i], "--emit-test") == 0 && i + 1 < argc) {
+      emit_path = argv[++i];
+      emit_flags++;
+      emit_profile = STIGI_EMIT_TEST;
     } else if (strcmp(argv[i], "--user") == 0) {
       kernel_mode = false;
     } else {
@@ -90,13 +98,13 @@ int main(int argc, char **argv) {
   }
 
   int mode_count = (serve_sock != NULL ? 1 : 0) + (cc_sock != NULL ? 1 : 0) +
-                   (mcp_mode ? 1 : 0) + (emit_path != NULL ? 1 : 0);
+                   (mcp_mode ? 1 : 0) + emit_flags;
   if (mode_count == 0) {
     fprintf(stderr, "stigi-seed: no mode specified (try --help)\n");
     return 1;
   }
   if (mode_count > 1) {
-    fprintf(stderr, "stigi-seed: --serve, --cc-socks, --mcp, and --emit are mutually exclusive\n");
+    fprintf(stderr, "stigi-seed: --serve, --cc-socks, --mcp, --emit, and --emit-test are mutually exclusive\n");
     return 1;
   }
   if (mcp_sock != NULL && !mcp_mode) {
@@ -104,7 +112,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (emit_path != NULL && load_dir == NULL) {
-    fprintf(stderr, "stigi-seed: --emit requires --load <dir>\n");
+    fprintf(stderr, "stigi-seed: --emit/--emit-test requires --load <dir>\n");
     return 1;
   }
 
@@ -152,7 +160,7 @@ int main(int argc, char **argv) {
     char *c_code = NULL;
     size_t c_len = 0;
     StigiEmitStats stats;
-    st = stigi_emit_c(&door, &c_code, &c_len, &stats, &diag);
+    st = stigi_emit_c(&door, emit_profile, &c_code, &c_len, &stats, &diag);
     if (st != STIGI_OK) {
       fprintf(stderr, "stigi-seed: emit failed: %s\n", diag.msg[0] ? diag.msg : "error");
       stigi_door_free(&door);

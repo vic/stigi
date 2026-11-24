@@ -58,6 +58,22 @@ static char *read_text_file(const char *path) {
   return buf;
 }
 
+/* write emitted C to path and compile it with the strict clang line, then remove it */
+static bool clang_compiles(const char *c_src, size_t len, const char *path) {
+  FILE *f = fopen(path, "w");
+  if (f == NULL) return false;
+  bool ok = fwrite(c_src, 1, len, f) == len;
+  ok = (fclose(f) == 0) && ok;
+  char cmd[512];
+  (void)snprintf(cmd, sizeof cmd,
+                 "clang -std=c11 -Wall -Wextra -Werror -pedantic -O2 -fno-strict-aliasing -fwrapv "
+                 "-fno-delete-null-pointer-checks -c -o /dev/null %s",
+                 path);
+  ok = ok && run_cmd(cmd) == 0;
+  (void)unlink(path);
+  return ok;
+}
+
 static bool has_spectre_mask_insn(const char *asm_text) {
   if (asm_text == NULL) return false;
 #if defined(__x86_64__)
@@ -478,10 +494,95 @@ int main(void) {
   char *c1 = NULL, *c2 = NULL;
   size_t l1 = 0, l2 = 0;
   StigiEmitStats st1, st2;
-  CHECK(stigi_emit_c(&door, &c1, &l1, &st1, &d) == STIGI_OK, "emit 1");
-  CHECK(stigi_emit_c(&door, &c2, &l2, &st2, &d) == STIGI_OK, "emit 2");
+  CHECK(stigi_emit_c(&door, STIGI_EMIT_TEST, &c1, &l1, &st1, &d) == STIGI_OK, "emit 1");
+  CHECK(stigi_emit_c(&door, STIGI_EMIT_TEST, &c2, &l2, &st2, &d) == STIGI_OK, "emit 2");
   CHECK(c1 != NULL && c2 != NULL && l1 == l2 && memcmp(c1, c2, l1) == 0,
         "determinism: two emissions are byte-equal");
+  {
+    char *cr = NULL;
+    size_t lr = 0;
+    StigiEmitStats str;
+    CHECK(stigi_emit_c(&door, STIGI_EMIT_RELEASE, &cr, &lr, &str, &d) == STIGI_OK, "emit release");
+    CHECK(cr != NULL && strstr(c1, "Tests_checkAll") != NULL && strstr(cr, "Tests_checkAll") == NULL &&
+              strstr(cr, "Stigi_main") != NULL,
+          "S163: the release profile emits main and no Test unit");
+    CHECK(cr != NULL && clang_compiles(cr, lr, "/tmp/stigi-c8-rel.c"),
+          "S163: clang compiles the release C with 0 warnings");
+    free(cr);
+  }
+  {
+    /* S163: capability used by main through one handler; a second handler reached only from a Test */
+    const char *cap_srcs[6] = {
+        "// prompt: the mock counter start, reached only from a Test.\n"
+        "def Demo.mockStart(): U64 =\n"
+        "  10\n",
+        "// prompt: counter capability.\n"
+        "capability Demo.Counter:\n"
+        "  def bump(): U64\n",
+        "// prompt: counter handler used only by a Test (handler tag 0 in the test profile).\n"
+        "handler Demo.MockCounter(startVal: U64) for Demo.Counter:\n"
+        "  def bump(): U64 =\n"
+        "    startVal\n",
+        "// prompt: bump a counter once.\n"
+        "pub def Demo.useCounter {ctr: Demo.Counter} (): U64 <lessOrEqual(0, result)> =\n"
+        "  ctr.bump()\n",
+        "// prompt: the mock counter bumps by two.\n"
+        "val Demo.Tests.mockBump {Stigi.Test}: Stigi.Test.Result =\n"
+        "  handle ctr = Demo.MockCounter(Demo.mockStart())\n"
+        "  Stigi.Test.expect(Demo.useCounter{ctr}(), 10, \"mock start is 10\")\n",
+        "// prompt: counter handler used by main.\n"
+        "pub handler Demo.RisingCounter(startVal: U64) for Demo.Counter:\n"
+        "  def bump(): U64 =\n"
+        "    startVal\n"};
+    const char *main_src =
+        "// prompt: program entry bumping the up counter.\n"
+        "pub def main (): U64 <lessOrEqual(0, result)> =\n"
+        "  handle ctr = Demo.RisingCounter(0)\n"
+        "  Demo.useCounter{ctr}()\n";
+    for (int with_main = 1; with_main >= 0; with_main--) {
+      StigiDoor cd;
+      Diag cdg;
+      diag_clear(&cdg);
+      CHECK(stigi_door_init(&cd, "vic/spec/datalog/all.dl", STIGI_DEFAULT_ROW_BUDGET, true, &cdg) ==
+                STIGI_OK,
+            "cap door init");
+      /* without main: only a Test and the def it reads */
+      const char *nomain_test =
+          "// prompt: the mock start is ten.\n"
+          "val Demo.Tests.startTen {Stigi.Test}: Stigi.Test.Result =\n"
+          "  Stigi.Test.expect(Demo.mockStart(), 10, \"mock start is 10\")\n";
+      const char *srcs[7] = {cap_srcs[0], cap_srcs[1], cap_srcs[2], cap_srcs[3], cap_srcs[4], cap_srcs[5], main_src};
+      if (!with_main) srcs[1] = nomain_test;
+      size_t lens[7];
+      for (int i = 0; i < 7; i++) lens[i] = strlen(srcs[i]);
+      StigiDoorResult cr2;
+      stigi_door_result_init(&cr2);
+      CHECK(stigi_door_submit(&cd, srcs, lens, with_main ? 7U : 2U, &cr2, &cdg) == STIGI_OK &&
+                cr2.accepted,
+            "cap program admitted");
+      for (uint32_t i = 0; i < cr2.reject_count; i++) {
+        fprintf(stderr, "  reject: subj=%s code=%s msg=%s\n", cr2.rejects[i].subject,
+                cr2.rejects[i].code, cr2.rejects[i].msg);
+      }
+      stigi_door_result_free(&cr2);
+      char *cc = NULL;
+      size_t cl = 0;
+      StigiEmitStats cs;
+      Status est = stigi_emit_c(&cd, STIGI_EMIT_RELEASE, &cc, &cl, &cs, &cdg);
+      if (with_main) {
+        CHECK(est == STIGI_OK && cc != NULL && strstr(cc, "MockCounter") == NULL && strstr(cc, "Demo_mockStart") == NULL &&
+                  strstr(cc, "RisingCounter") != NULL,
+              "S163: release keeps main's handler, drops the Test-only handler and the Test-only def");
+        CHECK(cc != NULL && clang_compiles(cc, cl, "/tmp/stigi-c8-rel-cap.c"),
+              "S163: clang compiles release C with a Test-only handler shaken");
+      } else {
+        CHECK(est == STIGI_ERR_INVALID && strstr(cdg.msg, "release profile needs main") != NULL,
+              "S163: release without main is a typed error, never an empty binary");
+      }
+      free(cc);
+      stigi_door_free(&cd);
+    }
+  }
 
   /* 2. CRASH LINE, tenet gate on emitted C, zero GNU builtins, 1-word nullable-ptr, tail-tag */
   CHECK(c1 != NULL && strstr(c1, "abort(") == NULL, "CRASH LINE: zero abort(");
@@ -672,7 +773,7 @@ int main(void) {
 
   /* 5. -fstack-usage gate (positive + negative fail-closed tests for Defects 12 & 13) */
   char su_err[256] = {0};
-  Status su_st = stigi_emit_check_su("/tmp/stigi-c8-out.su", &door.image, su_err, sizeof su_err);
+  Status su_st = stigi_emit_check_su("/tmp/stigi-c8-out.su", &door.image, STIGI_EMIT_TEST, su_err, sizeof su_err);
   if (su_st != STIGI_OK) {
     fprintf(stderr, "FAIL stigi_emit_check_su: %s\n", su_err);
   }
@@ -682,7 +783,7 @@ int main(void) {
   {
     FILE *ef = fopen("/tmp/stigi-c8-empty.su", "w");
     if (ef != NULL) (void)fclose(ef);
-    CHECK(stigi_emit_check_su("/tmp/stigi-c8-empty.su", &door.image, su_err, sizeof su_err) != STIGI_OK,
+    CHECK(stigi_emit_check_su("/tmp/stigi-c8-empty.su", &door.image, STIGI_EMIT_TEST, su_err, sizeof su_err) != STIGI_OK,
           "Defect 12: empty .su file fails closed (0 matched)");
   }
   /* Negative .su test 2: strict bytes <= fb without +64 slack (Defect 13) */
@@ -692,7 +793,7 @@ int main(void) {
       fprintf(bf, "Demo/countDown.sc:1:1:Stigi_Demo_countDown\t16\tstatic\n");
       (void)fclose(bf);
     }
-    CHECK(stigi_emit_check_su("/tmp/stigi-c8-over.su", &door.image, su_err, sizeof su_err) != STIGI_OK,
+    CHECK(stigi_emit_check_su("/tmp/stigi-c8-over.su", &door.image, STIGI_EMIT_TEST, su_err, sizeof su_err) != STIGI_OK,
           "Defect 13: strict bytes > fb (16 > 8, no +64 slack) fails closed");
   }
   /* Negative .su test 3: invalid byte count fails strtoull endptr validation (Defect 13) */
@@ -702,7 +803,7 @@ int main(void) {
       fprintf(mf, "Demo/countDown.sc:1:1:Stigi_Demo_countDown\t8xyz\tstatic\n");
       (void)fclose(mf);
     }
-    CHECK(stigi_emit_check_su("/tmp/stigi-c8-badbytes.su", &door.image, su_err, sizeof su_err) != STIGI_OK,
+    CHECK(stigi_emit_check_su("/tmp/stigi-c8-badbytes.su", &door.image, STIGI_EMIT_TEST, su_err, sizeof su_err) != STIGI_OK,
           "Defect 13: invalid strtoull bytes fails closed");
   }
 

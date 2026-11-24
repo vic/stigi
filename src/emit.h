@@ -23,13 +23,17 @@ typedef struct {
   uint32_t parallel_safe_sites;
 } StigiEmitStats;
 
-/* Deterministically emit portable ISO C11 for all reached units (sorted by 32-byte runtime_id) */
-Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
+/* S163: RELEASE emits the closure of `main` only (no Test runs); TEST emits every reached
+ * unit and runs every Test in unit-id order before `main` */
+typedef enum { STIGI_EMIT_RELEASE, STIGI_EMIT_TEST } StigiEmitProfile;
+
+/* Deterministically emit portable ISO C11 for the profile's units (sorted by 32-byte runtime_id) */
+Status stigi_emit_c(const StigiDoor *door, StigiEmitProfile profile, char **out_c, size_t *out_len,
                     StigiEmitStats *stats, Diag *diag);
 
 /* Parse GCC/Clang -fstack-usage .su file and verify every emitted function is static
  * and its stack usage is within its stated frameBytes budget */
-Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
+Status stigi_emit_check_su(const char *su_path, const StigiImage *img, StigiEmitProfile profile,
                            char *err_buf, size_t err_cap);
 
 #endif

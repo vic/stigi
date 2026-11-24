@@ -646,6 +646,8 @@ static bool cap_has_runtime_handle(const StigiImage *img, uint32_t cap_uidx) {
     if (cd->u.cap_decl.members[m]->kind == STIGI_DECL_DEF) { has_ops = true; break; }
   }
   if (!has_ops) return false;
+  /* Every handler counts: a capability in main's closure is handled inside that closure, so a filter on
+   * `reachable` here can never change the answer (S163 review: that mutant is equivalent). */
   for (uint32_t i = 0; i < img->unit_count; i++) {
     const StigiDecl *hd = img->units[i].ast->decl;
     if (hd->kind != STIGI_DECL_HANDLER) continue;
@@ -659,6 +661,7 @@ static bool cap_has_runtime_handle(const StigiImage *img, uint32_t cap_uidx) {
 static int32_t find_handler_tag_for_cap(const StigiImage *img, uint32_t cap_uidx, uint32_t h_uidx) {
   int32_t tag = 0;
   for (uint32_t i = 0; i < img->unit_count; i++) {
+    if (!img->units[i].reachable) continue;
     const StigiDecl *hd = img->units[i].ast->decl;
     if (hd->kind != STIGI_DECL_HANDLER) continue;
     int32_t fc = stigi_image_resolve_name(img, i, hd->u.handler_decl.for_cap.ptr,
@@ -4446,6 +4449,7 @@ static void emit_cap_handle_typedef(EmitBuf *b, const StigiImage *img, const Sti
   eb_cstr(b, "typedef struct {\n  uint8_t tag;\n  union {\n");
   int32_t tag = 0;
   for (uint32_t i = 0; i < img->unit_count; i++) {
+    if (!img->units[i].reachable) continue;
     const StigiDecl *hd = img->units[i].ast->decl;
     if (hd->kind != STIGI_DECL_HANDLER) continue;
     int32_t fc = stigi_image_resolve_name(img, i, hd->u.handler_decl.for_cap.ptr,
@@ -4599,6 +4603,7 @@ static void emit_cap_proto_ops(EmitBuf *b, const StigiImage *img, const StigiIma
     eb_cstr(b, ") {\n");
     int32_t tag = 0;
     for (uint32_t i = 0; i < img->unit_count; i++) {
+      if (!img->units[i].reachable) continue;
       const StigiDecl *hd = img->units[i].ast->decl;
       if (hd->kind != STIGI_DECL_HANDLER) continue;
       int32_t fc = stigi_image_resolve_name(img, i, hd->u.handler_decl.for_cap.ptr,
@@ -4753,8 +4758,76 @@ static void emit_handler_unit(EmitBuf *b, const StigiImage *img, const StigiImag
   eb_cstr(b, "\n");
 }
 
-Status stigi_emit_c(const StigiDoor *door, char **out_c, size_t *out_len,
+static Status emit_c_reached(const StigiDoor *door, char **out_c, size_t *out_len,
+                             StigiEmitStats *stats, Diag *diag);
+
+/* S163 + T14: a copy of the image units whose `reachable` bit is the profile's unit set: TEST keeps
+ * every root's closure, RELEASE re-roots at `def main` alone over the image edges */
+static Status profile_units(const StigiImage *img, StigiEmitProfile profile, StigiImageUnit **out,
+                            Diag *diag) {
+  StigiImageUnit *units = malloc(((size_t)img->unit_count + 1U) * sizeof *units);
+  uint32_t *queue = malloc(((size_t)img->unit_count + 1U) * sizeof *queue);
+  if (units == NULL || queue == NULL) {
+    free(units);
+    free(queue);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+  }
+  if (img->unit_count > 0) memcpy(units, img->units, (size_t)img->unit_count * sizeof *units);
+  if (profile == STIGI_EMIT_TEST) {
+    free(queue);
+    *out = units;
+    return STIGI_OK;
+  }
+  uint32_t qh = 0, qt = 0;
+  for (uint32_t i = 0; i < img->unit_count; i++) {
+    units[i].reachable = img->units[i].reachable && units[i].ast->decl->kind == STIGI_DECL_DEF &&
+                         strcmp(units[i].name, "main") == 0;
+    if (units[i].reachable) queue[qt++] = i;
+  }
+  if (qt == 0) {
+    free(units);
+    free(queue);
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "release profile needs main");
+  }
+  while (qh < qt) {
+    uint32_t cur = queue[qh++];
+    for (uint32_t e = img->adj_head[cur]; e != UINT32_MAX; e = img->edge_next[e]) {
+      uint32_t to = img->edges[e].to;
+      if (!units[to].reachable) {
+        units[to].reachable = true;
+        queue[qt++] = to;
+      }
+    }
+  }
+  free(queue);
+  *out = units;
+  return STIGI_OK;
+}
+
+/* the emitter reads a read-only copy of the door whose units carry the profile's unit set */
+Status stigi_emit_c(const StigiDoor *door, StigiEmitProfile profile, char **out_c, size_t *out_len,
                     StigiEmitStats *stats, Diag *diag) {
+  if (door == NULL || out_c == NULL) {
+    return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_emit_c: invalid arguments");
+  }
+  StigiImageUnit *units = NULL;
+  Status st = profile_units(&door->image, profile, &units, diag);
+  if (st != STIGI_OK) return st;
+  StigiDoor *rd = malloc(sizeof *rd);
+  if (rd == NULL) {
+    free(units);
+    return diag_set(diag, STIGI_ERR_OOM, -1, "OOM");
+  }
+  *rd = *door;
+  rd->image.units = units;
+  st = emit_c_reached(rd, out_c, out_len, stats, diag);
+  free(units);
+  free(rd);
+  return st;
+}
+
+static Status emit_c_reached(const StigiDoor *door, char **out_c, size_t *out_len,
+                             StigiEmitStats *stats, Diag *diag) {
   if (door == NULL || out_c == NULL) {
     return diag_set(diag, STIGI_ERR_INVALID, -1, "stigi_emit_c: invalid arguments");
   }
@@ -5628,22 +5701,32 @@ static int read_dynamic_line(FILE *f, char **buf, size_t *cap, size_t *out_len) 
 }
 
 /* Parse GCC/Clang -fstack-usage .su file: `file:line:col:func\tbytes\tqualifier` */
-Status stigi_emit_check_su(const char *su_path, const StigiImage *img,
+Status stigi_emit_check_su(const char *su_path, const StigiImage *img, StigiEmitProfile profile,
                            char *err_buf, size_t err_cap) {
   if (su_path == NULL || img == NULL) return STIGI_ERR_INVALID;
+  /* count the same unit set the emitter emitted for this profile */
+  StigiImageUnit *units = NULL;
+  Diag pd;
+  diag_clear(&pd);
+  Status pst = profile_units(img, profile, &units, &pd);
+  if (pst != STIGI_OK) {
+    if (err_buf != NULL && err_cap > 0) (void)snprintf(err_buf, err_cap, "%s", pd.msg);
+    return pst;
+  }
+  uint32_t expected_funcs = 0;
+  for (uint32_t i = 0; i < img->unit_count; i++) {
+    if (!units[i].reachable) continue;
+    StigiDeclKind k = units[i].ast->decl->kind;
+    if (k == STIGI_DECL_DEF || k == STIGI_DECL_TEST) expected_funcs++;
+  }
+  free(units);
+
   FILE *f = fopen(su_path, "r");
   if (f == NULL) {
     if (err_buf != NULL && err_cap > 0) {
       (void)snprintf(err_buf, err_cap, "cannot open .su file '%s'", su_path);
     }
     return STIGI_ERR_IO;
-  }
-
-  uint32_t expected_funcs = 0;
-  for (uint32_t i = 0; i < img->unit_count; i++) {
-    if (!img->units[i].reachable) continue;
-    StigiDeclKind k = img->units[i].ast->decl->kind;
-    if (k == STIGI_DECL_DEF || k == STIGI_DECL_TEST) expected_funcs++;
   }
 
   char *line = NULL;

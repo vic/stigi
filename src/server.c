@@ -1292,7 +1292,7 @@ Status stigi_handle_frame(StigiServerCtx *ctx, const char *frame, size_t len,
     char *csrc = NULL;
     size_t clen = 0;
     StigiEmitStats es;
-    Status st = stigi_emit_c(ctx->door, &csrc, &clen, &es, diag);
+    Status st = stigi_emit_c(ctx->door, STIGI_EMIT_RELEASE, &csrc, &clen, &es, diag);
     if (st != STIGI_OK) {
       status_tag = "error";
       rb_fmt(&rb, "error emit: %s\n", diag != NULL ? diag->msg : "failed");
