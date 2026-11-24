@@ -50,6 +50,13 @@ typedef struct {
   bool used_outside_ns;
 } StigiImageUnit;
 
+/* One enum case of a unit: an entry of the unqualified case-name chains */
+typedef struct {
+  uint32_t uidx;
+  uint32_t cidx;
+  uint32_t next; /* older entry in the same bucket, UINT32_MAX ends the chain */
+} StigiCaseEntry;
+
 typedef struct {
   Arena arena;
   InternPool intern;
@@ -68,6 +75,12 @@ typedef struct {
   uint32_t edge_cap;
   uint32_t *adj_head;
   uint32_t adj_cap;
+  /* Unqualified enum case name -> its (unit, case) entries, newest unit first */
+  StigiCaseEntry *cases;
+  uint32_t case_count;
+  uint32_t case_cap;
+  uint32_t *case_head;
+  uint32_t case_head_cap;
 } StigiImage;
 
 void stigi_name_diags_init(StigiNameDiags *d);

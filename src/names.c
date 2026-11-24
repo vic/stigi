@@ -2718,6 +2718,8 @@ void stigi_image_free(StigiImage *img) {
   free(img->edges);
   free(img->edge_next);
   free(img->adj_head);
+  free(img->cases);
+  free(img->case_head);
   intern_free(&img->intern);
   arena_free(&img->arena);
   memset(img, 0, sizeof *img);
@@ -2765,6 +2767,73 @@ static int32_t image_find_ci(const StigiImage *img, const char *name, size_t len
     idx = (idx + 1U) & mask;
   }
   return -1;
+}
+
+static StigiStr case_entry_name(const StigiImage *img, const StigiCaseEntry *ce) {
+  return img->units[ce->uidx].ast->decl->u.enum_decl.cases[ce->cidx].name;
+}
+
+static uint32_t case_bucket_raw(const StigiImage *img, const char *name, size_t len) {
+  return (uint32_t)(hash_bytes(name, len) & (img->case_head_cap - 1U));
+}
+
+static uint32_t case_bucket(const StigiImage *img, StigiStr name) {
+  return case_bucket_raw(img, name.ptr, name.len);
+}
+
+static void case_link(StigiImage *img, uint32_t e) {
+  uint32_t b = case_bucket(img, case_entry_name(img, &img->cases[e]));
+  img->cases[e].next = img->case_head[b];
+  img->case_head[b] = e;
+}
+
+/* First size of the case index tables (a power of two: the bucket mask needs it); the bucket table grows when it
+ * would pass the load factor CASE_LOAD_NUM / CASE_LOAD_DEN. */
+enum { CASE_INDEX_FIRST_CAP = 64, CASE_LOAD_NUM = 3, CASE_LOAD_DEN = 4 };
+
+/* Index the cases of enum unit `uidx` (the newest unit); a repeated case name keeps its first case */
+static Status case_index_add_unit(StigiImage *img, uint32_t uidx, Diag *diag) {
+  const StigiDecl *d = img->units[uidx].ast->decl;
+  if (d->kind != STIGI_DECL_ENUM) return STIGI_OK;
+  for (uint32_t c = 0; c < d->u.enum_decl.case_count; c++) {
+    if ((uint64_t)(img->case_count + 1U) * CASE_LOAD_DEN >= (uint64_t)img->case_head_cap * CASE_LOAD_NUM) {
+      uint32_t ncap = img->case_head_cap == 0 ? (uint32_t)CASE_INDEX_FIRST_CAP : img->case_head_cap * 2U;
+      if (ncap <= img->case_head_cap) return diag_set(diag, STIGI_ERR_OVERFLOW, -1, "case index overflow");
+      uint32_t *nh = malloc((size_t)ncap * sizeof *nh);
+      if (nh == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "out of memory");
+      for (uint32_t i = 0; i < ncap; i++) nh[i] = UINT32_MAX;
+      free(img->case_head);
+      img->case_head = nh;
+      img->case_head_cap = ncap;
+      for (uint32_t e = 0; e < img->case_count; e++) case_link(img, e);
+    }
+    if (img->case_count == img->case_cap) {
+      uint32_t ncap = img->case_cap == 0 ? (uint32_t)CASE_INDEX_FIRST_CAP : img->case_cap * 2U;
+      if (ncap <= img->case_cap) return diag_set(diag, STIGI_ERR_OVERFLOW, -1, "case index overflow");
+      StigiCaseEntry *ne = realloc(img->cases, (size_t)ncap * sizeof *ne);
+      if (ne == NULL) return diag_set(diag, STIGI_ERR_OOM, -1, "out of memory");
+      img->cases = ne;
+      img->case_cap = ncap;
+    }
+    StigiStr cn = d->u.enum_decl.cases[c].name;
+    bool seen = false;
+    for (uint32_t e = img->case_head[case_bucket(img, cn)]; e != UINT32_MAX && img->cases[e].uidx == uidx;
+         e = img->cases[e].next) {
+      seen = seen || str_eq_ss(case_entry_name(img, &img->cases[e]), cn);
+    }
+    if (seen) continue;
+    img->cases[img->case_count] = (StigiCaseEntry){uidx, c, UINT32_MAX};
+    case_link(img, img->case_count++);
+  }
+  return STIGI_OK;
+}
+
+/* Undo case_index_add_unit for the newest unit `uidx` (its entries head their chains) */
+static void case_index_drop_unit(StigiImage *img, uint32_t uidx) {
+  while (img->case_count > 0 && img->cases[img->case_count - 1U].uidx == uidx) {
+    const StigiCaseEntry *ce = &img->cases[--img->case_count];
+    img->case_head[case_bucket(img, case_entry_name(img, ce))] = ce->next;
+  }
 }
 
 int32_t stigi_image_find(const StigiImage *img, const char *name, size_t len) {
@@ -2844,15 +2913,17 @@ Status stigi_image_add_source(StigiImage *img, const char *src, size_t len,
   /* Roots: pub def, pub val, Test, NegTest (names.md 6) */
   u->is_root = (decl->kind == STIGI_DECL_TEST || decl->kind == STIGI_DECL_NEG_TEST ||
                 (decl->is_pub && (decl->kind == STIGI_DECL_DEF || decl->kind == STIGI_DECL_VAL)));
+  st = case_index_add_unit(img, uidx, diag);
+  if (st != STIGI_OK) { case_index_drop_unit(img, uidx); img->unit_count--; return st; }
 
   /* Initial canonical BLAKE3-256 unit_id & verdict_key (recomputed in SCC order on resolve) */
   CanonBuf cb;
   st = encode_unit_canon(img, uidx, NULL, false, true, &cb, diag);
-  if (st != STIGI_OK) { img->unit_count--; return st; }
+  if (st != STIGI_OK) { case_index_drop_unit(img, uidx); img->unit_count--; return st; }
   blake3_hash(cb.buf, cb.len, u->unit_id);
   free(cb.buf);
   st = encode_unit_canon(img, uidx, NULL, false, false, &cb, diag);
-  if (st != STIGI_OK) { img->unit_count--; return st; }
+  if (st != STIGI_OK) { case_index_drop_unit(img, uidx); img->unit_count--; return st; }
   blake3_hash(cb.buf, cb.len, u->verdict_key);
   free(cb.buf);
 
@@ -2987,22 +3058,22 @@ int32_t stigi_image_resolve_enum_case(const StigiImage *img, uint32_t from_idx,
   uint32_t vis_cidx = 0;
   uint32_t vis_count = 0;
 
-  for (uint32_t i = 0; i < img->unit_count; i++) {
-    const StigiDecl *d = img->units[i].ast->decl;
-    if (d->kind != STIGI_DECL_ENUM) continue;
-    for (uint32_t c = 0; c < d->u.enum_decl.case_count; c++) {
-      StigiStr cn = d->u.enum_decl.cases[c].name;
-      if (cn.len == ref_len && memcmp(cn.ptr, ref, ref_len) == 0) {
-        if (same_namespace_or_sub(&img->units[i], &img->units[from_idx])) {
-          ns_hit = (int32_t)i;
-          ns_cidx = c;
-          ns_count++;
-        } else if (stigi_image_visible_from(img, i, from_idx)) {
-          vis_hit = (int32_t)i;
-          vis_cidx = c;
-          vis_count++;
-        }
-        break;
+  /* Chains run newest unit first: the first hit of each class is the highest unit index */
+  for (uint32_t e = img->case_head_cap == 0 ? UINT32_MAX : img->case_head[case_bucket_raw(img, ref, ref_len)];
+       e != UINT32_MAX; e = img->cases[e].next) {
+    const StigiCaseEntry *ce = &img->cases[e];
+    StigiStr cn = case_entry_name(img, ce);
+    if (cn.len != ref_len || memcmp(cn.ptr, ref, ref_len) != 0) continue;
+    uint32_t i = ce->uidx;
+    if (same_namespace_or_sub(&img->units[i], &img->units[from_idx])) {
+      if (ns_count++ == 0) {
+        ns_hit = (int32_t)i;
+        ns_cidx = ce->cidx;
+      }
+    } else if (stigi_image_visible_from(img, i, from_idx)) {
+      if (vis_count++ == 0) {
+        vis_hit = (int32_t)i;
+        vis_cidx = ce->cidx;
       }
     }
   }
