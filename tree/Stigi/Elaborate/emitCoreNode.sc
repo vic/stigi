@@ -13,12 +13,14 @@ def Stigi.Elaborate.emitCoreNode {Stigi.Mut} (tables: Stigi.Syntax.Tables, synId
                   case Text(textFirst, textEnd) =>
                     val literalValid: Bool = litKind match
                       case IntLiteral =>
-                        Stigi.Elaborate.parseSignedLiteral(Stigi.Limit.maxUnitBytes, source, textFirst, textEnd) match
-                          case BadIntLiteral => false
-                          case ParsedInt(numVal) =>
-                            if numVal < 0 then false else
-                              exprs(emitIdx) := IntExpr(emitIdx, U64.ofI64(numVal), 0, 0)
-                              true
+                        Stigi.Elaborate.parseWideLiteral(Stigi.Limit.maxUnitBytes, source, textFirst, textEnd) match
+                          case WideMalformed => false
+                          case WideOverflow =>
+                            exprs(emitIdx) := IntExpr(emitIdx, 0, 1, 0)
+                            true
+                          case WideFits(wordVal) =>
+                            exprs(emitIdx) := IntExpr(emitIdx, wordVal, 0, 0)
+                            true
                       case CharLiteral =>
                         Stigi.Syntax.charValue(Stigi.Limit.maxUnitBytes, source, textFirst, textEnd) match
                           case CharMalformed => false
@@ -82,15 +84,26 @@ def Stigi.Elaborate.emitCoreNode {Stigi.Mut} (tables: Stigi.Syntax.Tables, synId
                       else EmitFull
                     else EmitInvalid
               else EmitFull
-            case Unary(_, _, operSyn) =>
+            case Unary(_, operator, operSyn) =>
               if operSyn < capacity then
                 val operCore: U64 = mapped(operSyn)
                 if operCore < emitIdx then
                   if synIdx < capacity && emitIdx < expressionCapacity then
                     val nextCore: U64 = emitIdx + 1
-                    exprs(emitIdx) := NegateExpr(emitIdx, operCore)
-                    mapped(synIdx) := emitIdx
-                    EmitDone(CoreTables(expressionCapacity, exprs, expressionMark, nextCore, listCapacity, childLists, listMark, curList, armCapacity, arms, armMark, curArm), WorkScratch(capacity, work, top, mapped, patRes))
+                    val prefixKind: Stigi.Syntax.UnaryOperator = operator
+                    prefixKind match
+                      case LogicNot =>
+                        exprs(emitIdx) := NegateExpr(emitIdx, operCore)
+                        mapped(synIdx) := emitIdx
+                        EmitDone(CoreTables(expressionCapacity, exprs, expressionMark, nextCore, listCapacity, childLists, listMark, curList, armCapacity, arms, armMark, curArm), WorkScratch(capacity, work, top, mapped, patRes))
+                      case Negate =>
+                        if nextCore < expressionCapacity then
+                          val afterCore: U64 = nextCore + 1
+                          exprs(emitIdx) := IntExpr(emitIdx, 0, 0, 0)
+                          exprs(nextCore) := ExactExpr(nextCore, CoreSub, emitIdx, operCore, 0)
+                          mapped(synIdx) := nextCore
+                          EmitDone(CoreTables(expressionCapacity, exprs, expressionMark, afterCore, listCapacity, childLists, listMark, curList, armCapacity, arms, armMark, curArm), WorkScratch(capacity, work, top, mapped, patRes))
+                        else EmitFull
                   else EmitFull
                 else EmitInvalid
               else EmitFull
