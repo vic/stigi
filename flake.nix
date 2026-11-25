@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "https://nixos.org/channels/nixos-unstable/nixexprs.tar.xz";
     tupu = {
-      url = "path:/home/vic/hk/tupu";
+      url = "github:vic/tupu";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

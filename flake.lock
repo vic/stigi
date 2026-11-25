@@ -26,14 +26,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1795365498,
-        "narHash": "sha256-SWCctF9WUyKeAYsPNuwNSyGnVtTw554a2dJnltr63cY=",
-        "path": "/home/vic/hk/tupu",
-        "type": "path"
+        "lastModified": 1795576546,
+        "narHash": "sha256-+jRGelEwAHiZuW/2nnIuo9KwBgmqdZ5xrPnurxJf7BE=",
+        "owner": "vic",
+        "repo": "tupu",
+        "rev": "d728ae171cb7207b05d26d8d8924d4758f57e65a",
+        "type": "github"
       },
       "original": {
-        "path": "/home/vic/hk/tupu",
-        "type": "path"
+        "owner": "vic",
+        "repo": "tupu",
+        "type": "github"
       }
     }
   },
