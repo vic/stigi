@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__GLIBC__) && !defined(__FILC__) && !defined(__SANITIZE_ADDRESS__)
+#include <malloc.h>
+#endif
 
 #define STIGI_SEED_VERSION "0.1.0"
 #define STIGI_DEFAULT_RULES "vic/spec/datalog/all.dl"
@@ -128,6 +131,12 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+#if defined(__GLIBC__) && !defined(__FILC__) && !defined(__SANITIZE_ADDRESS__)
+  /* freed memory stays with the process: every Test reuses the pages the previous one freed instead of faulting fresh
+     ones in (X28-au: glibc served multi-MB evaluator blocks by mmap and gave them back to the kernel on free) */
+  (void)mallopt(M_MMAP_MAX, 0);
+  (void)mallopt(M_TRIM_THRESHOLD, -1);
+#endif
   StigiDoor door;
   Diag diag;
   diag_clear(&diag);
