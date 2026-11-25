@@ -26,11 +26,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795589524,
-        "narHash": "sha256-/hhjB5xo4vi8mgyCBHGJEjv86G5x8lHN3uO2H9uMz6w=",
+        "lastModified": 1795590599,
+        "narHash": "sha256-7HmJ32Yo3SeW1z6c7JrT/WbWqfdIfEXgTJUUcumLO7Y=",
         "owner": "vic",
         "repo": "tupu",
-        "rev": "bb7ccfb59f81b75cbb3684b9080a3ed99440eefe",
+        "rev": "e7c3f93c2a3e86e7b8cd1cd9994d664aa4f92a4a",
         "type": "github"
       },
       "original": {
